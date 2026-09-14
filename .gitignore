@@ -1,0 +1,55 @@
+# Secrets and machine access
+.env
+.env.*
+*.pem
+*.key
+id_*
+.ssh/
+
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# External model assets and checkpoints
+checkpoints/
+models/
+weights/
+*.ckpt
+*.safetensors
+*.pth
+*.pt
+
+# Large experiment outputs and temporary archives
+artifacts/
+runs/
+outputs/
+*.mp4
+*.png
+*.svg
+*.csv
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+gpu_samples.csv
+MANIFEST.sha256
+
+# Editor and operating-system files
+.DS_Store
+Thumbs.db
+
+# Small, hash-verified CPU calibration fixtures required by the analyser tests.
+!cosmos_umi_capstone/
+!cosmos_umi_capstone/experiments/
+!cosmos_umi_capstone/experiments/artifacts/
+!cosmos_umi_capstone/experiments/artifacts/umi_precision_calibration/
+!cosmos_umi_capstone/experiments/artifacts/umi_precision_calibration/calibration_report.md
+!cosmos_umi_capstone/experiments/artifacts/umi_precision_calibration/config.json
+!cosmos_umi_capstone/experiments/artifacts/umi_precision_calibration/error_plot.png
+!cosmos_umi_capstone/experiments/artifacts/umi_precision_calibration/error_plot.svg
+!cosmos_umi_capstone/experiments/artifacts/umi_precision_calibration/hashes.json
+!cosmos_umi_capstone/experiments/artifacts/umi_precision_calibration/metrics.csv
+!cosmos_umi_capstone/experiments/artifacts/umi_precision_calibration/metrics.json

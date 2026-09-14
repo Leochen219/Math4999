@@ -1,0 +1,4 @@
+# CPU test and analysis dependencies. Install a CUDA-matched PyTorch build
+# separately for full Cosmos inference; do not use this file to replace it.
+numpy>=1.26
+matplotlib>=3.8

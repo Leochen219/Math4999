@@ -1,0 +1,72 @@
+{
+  "cosmos_loaded": false,
+  "gpu_generation_started": false,
+  "h_grid": [
+    1e-07,
+    1.7782794100389227e-07,
+    3.162277660168379e-07,
+    5.62341325190349e-07,
+    1e-06,
+    1.778279410038923e-06,
+    3.162277660168379e-06,
+    5.623413251903491e-06,
+    1e-05,
+    1.778279410038923e-05,
+    3.1622776601683795e-05,
+    5.623413251903491e-05,
+    0.0001,
+    0.00017782794100389227,
+    0.00031622776601683794,
+    0.0005623413251903491,
+    0.001,
+    0.0017782794100389228,
+    0.0031622776601683794,
+    0.005623413251903491,
+    0.01,
+    0.01778279410038923,
+    0.03162277660168379,
+    0.05623413251903491,
+    0.1
+  ],
+  "h_grid_count": 25,
+  "input_quantization": "bfloat16_rounding_simulation",
+  "low_precision_compute_dtype": "float32",
+  "low_precision_execution": "rounding_simulation",
+  "matrix_seed": 20260913,
+  "matrix_shape": [
+    256,
+    128
+  ],
+  "modes": [
+    {
+      "compute_dtype": "float64",
+      "execution_kind": "fp64_reference",
+      "input_quantization": "none",
+      "name": "fp64_reference"
+    },
+    {
+      "compute_dtype": "float64",
+      "execution_kind": "input_quantization_rounding_simulation",
+      "input_quantization": "bfloat16_rounding_simulation",
+      "name": "input_quantized_bf16"
+    },
+    {
+      "compute_dtype": "float32",
+      "execution_kind": "rounding_simulation",
+      "input_quantization": "none",
+      "name": "low_precision_compute_fp32"
+    }
+  ],
+  "native_low_precision_execution": false,
+  "native_low_precision_reason": "NumPy CPU calibration uses explicit FP32 rounding; no native BF16 kernel or Cosmos runtime was loaded",
+  "schema_version": "umi-input-quantization-compute-precision-calibration-v1",
+  "v_dtype": "float64",
+  "v_l2_norm": 0.9999999999999999,
+  "v_sha256": "01b82f93ed747b132e271515b598520e0b17c4e3efb0bb2505969cbdd1e1d3b2",
+  "weight_dtype": "float32",
+  "weight_representation": "fixed_fp32_values_reused_as_fp64",
+  "weight_scale": 0.08838834764831843,
+  "weight_sha256": "ca1d40b2eb41642f2e1a5431279c63c11a393aedb89400c2599a7eac9da5dda9",
+  "x_dtype": "float64",
+  "x_sha256": "a1931283df20ded763ff6283df6e8c04c1f88ff89c1f7dfbdaf33052904c0662"
+}

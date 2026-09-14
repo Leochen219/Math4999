@@ -1,0 +1,12 @@
+{
+  "files": {
+    "calibration_report.md": "64d5f4647dc1ea99afe4106218a77fdc29ada3487c8d45fe256b4b544d544dd4",
+    "config.json": "5fc14ee648468e6171dce0307d3ebde3aaa73fb838199cf05ff899d2bf384f81",
+    "error_plot.png": "1718f954823824b279917eab1f691f20758c92397d75cdc4d47ecbbf2e98e23f",
+    "error_plot.svg": "79c101b0ac4666f568101a7db4a92dbc7c1d348de8f05256d4eca84fd2f4dd38",
+    "metrics.csv": "304c26d3af759d7691c58eb07730e95ce732948e4b642e1f7fbe0459b94d5fb1",
+    "metrics.json": "399cd525c3c397c6bc7ecdea2067ce9557d727557f0d28639a8c9ea0974d1ca2"
+  },
+  "manifest_scope": "all calibration artifact files except hashes.json itself",
+  "schema_version": "umi-input-quantization-compute-precision-calibration-v1"
+}
