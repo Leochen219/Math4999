@@ -21,12 +21,14 @@ try:
     from .umi_task6_primitives import SOURCE_COMMIT, STATE_CATALOG, parse_action, preprocess_frame
     from .umi_task6_runtime import Task6Inputs, load_frozen_directions
     from .umi_fd_post_vae_bridge import sha256_array
+    from .umi_fd_post_vae_scan import sha256_tree
     from .umi_task5_primitives import freeze_task5_directions
     from .umi_precision_storage import ProcessLock
 except ImportError:  # pragma: no cover
     from umi_task6_primitives import SOURCE_COMMIT, STATE_CATALOG, parse_action, preprocess_frame
     from umi_task6_runtime import Task6Inputs, load_frozen_directions
     from umi_fd_post_vae_bridge import sha256_array
+    from umi_fd_post_vae_scan import sha256_tree
     from umi_task5_primitives import freeze_task5_directions
     from umi_precision_storage import ProcessLock
 
@@ -66,6 +68,20 @@ def sha256_file(path: str | os.PathLike[str]) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def checkpoint_content_identity(path: str | os.PathLike[str]) -> str:
+    """Return the content hash for a regular-file or directory checkpoint."""
+    try:
+        candidate = Path(path)
+        if candidate.is_file():
+            return sha256_file(candidate)
+        if candidate.is_dir():
+            return sha256_tree(candidate)
+    except (OSError, TypeError, ValueError) as error:
+        label = str(path)
+        raise OperationalEvidenceError(f"checkpoint content identity could not be observed: {label}") from error
+    raise OperationalEvidenceError(f"checkpoint path is missing or unsupported: {path}")
 
 
 def code_bundle_sha256(source_root: str | os.PathLike[str] | None = None) -> str:
@@ -317,7 +333,7 @@ def observe_live_launch(contract: Mapping[str, Any], *, runtime: Any, inputs: An
     observation = {
         "framework_commit": _live_framework_commit(framework_root),
         "asset_source_commit": SOURCE_COMMIT,
-        "checkpoint_identity": {"sha256": sha256_file(checkpoint)},
+        "checkpoint_identity": {"sha256": checkpoint_content_identity(checkpoint)},
         "vae_sha256": sha256_file(vae),
         "code_bundle_sha256": code_bundle_sha256(),
         "torch_version": torch_version,
@@ -395,7 +411,7 @@ class OfficialRuntimeFactory:
         self.loader = import_callable(loader) if isinstance(loader, str) else loader
         if not callable(self.loader): raise OperationalEvidenceError("explicit official loader is required")
         self.framework_root, self.checkpoint, self.vae = Path(framework_root).resolve(), Path(checkpoint).resolve(), Path(vae).resolve()
-        if not self.framework_root.exists() or not self.checkpoint.is_file() or not self.vae.is_file():
+        if not self.framework_root.exists() or not self.vae.is_file():
             raise OperationalEvidenceError("framework/checkpoint/VAE path is missing")
         self.contract, self.direction_bank = dict(contract), np.asarray(direction_bank, dtype=np.float32)
         self.action, self.prompt = parse_action(action), str(prompt)
@@ -408,7 +424,7 @@ class OfficialRuntimeFactory:
             raise OperationalEvidenceError("framework checkout HEAD differs from launch contract")
         self._unload: Callable[[], Any] | None = None
         _validate_static_contract(self.contract)
-        if self.contract["checkpoint_identity"]["sha256"] != sha256_file(self.checkpoint):
+        if self.contract["checkpoint_identity"]["sha256"] != checkpoint_content_identity(self.checkpoint):
             raise OperationalEvidenceError("checkpoint identity does not match the supplied path")
         if self.contract["vae_sha256"] != sha256_file(self.vae):
             raise OperationalEvidenceError("VAE identity does not match the supplied path")
@@ -486,5 +502,5 @@ class OfficialRuntimeFactory:
 
 __all__ = ["BRIDGE0_ASSET_SHA256", "BRIDGE0_FPS", "BRIDGE0_PROMPT", "OfficialRuntimeFactory", "OperationalEvidenceError",
            "PINNED_FRAME_SIZE", "PILOT_GROUP", "extract_task5_directions", "import_callable", "prepare_bridge_upload_bundle",
-           "code_bundle_sha256", "observe_live_launch", "sha256_file", "state_asset", "validate_launch_contract",
+           "checkpoint_content_identity", "code_bundle_sha256", "observe_live_launch", "sha256_file", "state_asset", "validate_launch_contract",
            "verify_pinned_bridge_assets"]

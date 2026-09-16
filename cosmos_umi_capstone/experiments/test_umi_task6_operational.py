@@ -3,6 +3,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -11,6 +12,93 @@ class OperationalTask6Tests(unittest.TestCase):
     def setUp(self):
         import umi_task6_operational as op
         self.op = op
+
+    def test_checkpoint_content_identity_preserves_file_hash(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "checkpoint.bin"
+            path.write_bytes(b"checkpoint")
+            expected = hashlib.sha256(path.read_bytes()).hexdigest()
+            self.assertEqual(self.op.checkpoint_content_identity(path), expected)
+
+    def test_checkpoint_directory_identity_is_deterministic_and_sensitive_to_name_and_content(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "checkpoint"
+            root.mkdir()
+            (root / "weights.bin").write_bytes(b"weights")
+            first = self.op.checkpoint_content_identity(root)
+            self.assertEqual(first, self.op.checkpoint_content_identity(root))
+            (root / "renamed.bin").write_bytes((root / "weights.bin").read_bytes())
+            (root / "weights.bin").unlink()
+            renamed = self.op.checkpoint_content_identity(root)
+            self.assertNotEqual(first, renamed)
+            (root / "renamed.bin").write_bytes(b"changed")
+            self.assertNotEqual(renamed, self.op.checkpoint_content_identity(root))
+
+    def test_checkpoint_content_identity_fails_closed_for_missing_path(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaises(self.op.OperationalEvidenceError):
+                self.op.checkpoint_content_identity(Path(temp) / "missing-checkpoint")
+
+    def test_checkpoint_content_identity_fails_closed_for_unsupported_path_type(self):
+        with self.assertRaises(self.op.OperationalEvidenceError):
+            self.op.checkpoint_content_identity(object())
+
+    def test_factory_rejects_missing_checkpoint(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            checkpoint = root / "cosmos3-edge-model"
+            checkpoint.mkdir(); (checkpoint / "model.bin").write_bytes(b"model")
+            vae = root / "vae.pth"; vae.write_bytes(b"vae")
+            contract = self._valid_factory_contract(checkpoint, vae)
+            shutil_target = checkpoint
+            for child in shutil_target.iterdir(): child.unlink()
+            shutil_target.rmdir()
+            with mock.patch.object(self.op, "_live_framework_commit", return_value=contract["framework_commit"]):
+                with self.assertRaises(self.op.OperationalEvidenceError):
+                    self.op.OfficialRuntimeFactory(
+                        loader=lambda **kwargs: {}, framework_root=root, checkpoint=checkpoint, vae=vae,
+                        contract=contract, direction_bank=np.zeros((3, 1, 48, 5, 16, 16), np.float32),
+                        action=np.zeros((16, 10), np.float32), prompt=self.op.BRIDGE0_PROMPT,
+                        video=root / "video.mp4",
+                    )
+
+    def test_factory_rejects_directory_vae(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            checkpoint = root / "cosmos3-edge-model"
+            checkpoint.mkdir(); (checkpoint / "model.bin").write_bytes(b"model")
+            vae_file = root / "vae.pth"; vae_file.write_bytes(b"vae")
+            contract = self._valid_factory_contract(checkpoint, vae_file)
+            vae_file.unlink(); vae_file.mkdir(); (vae_file / "decoder.bin").write_bytes(b"vae")
+            video = root / "video.mp4"; video.write_bytes(b"video")
+            with mock.patch.object(self.op, "_live_framework_commit", return_value=contract["framework_commit"]):
+                with self.assertRaises(self.op.OperationalEvidenceError):
+                    self.op.OfficialRuntimeFactory(
+                        loader=lambda **kwargs: {}, framework_root=root, checkpoint=checkpoint, vae=vae_file,
+                        contract=contract, direction_bank=np.zeros((3, 1, 48, 5, 16, 16), np.float32),
+                        action=np.zeros((16, 10), np.float32), prompt=self.op.BRIDGE0_PROMPT, video=video,
+                    )
+
+    def test_factory_accepts_valid_checkpoint_directory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            checkpoint = root / "cosmos3-edge-model"
+            checkpoint.mkdir()
+            (checkpoint / "model.bin").write_bytes(b"model")
+            vae = root / "vae.pth"; vae.write_bytes(b"vae")
+            video = root / "video.mp4"; video.write_bytes(b"video")
+            contract = self._valid_factory_contract(checkpoint, vae)
+            with mock.patch.object(self.op, "_live_framework_commit", return_value=contract["framework_commit"]):
+                try:
+                    factory = self.op.OfficialRuntimeFactory(
+                        loader=lambda **kwargs: {}, framework_root=root, checkpoint=checkpoint, vae=vae,
+                        contract=contract, direction_bank=np.zeros((3, 1, 48, 5, 16, 16), np.float32),
+                        action=np.zeros((16, 10), np.float32), prompt=self.op.BRIDGE0_PROMPT,
+                        video=video,
+                    )
+                except self.op.OperationalEvidenceError as error:
+                    self.fail(f"valid checkpoint directory was rejected: {error}")
+                self.assertIsNotNone(factory)
 
     def test_catalog_bridge0_is_exactly_pinned(self):
         from umi_task6_primitives import STATE_CATALOG, SOURCE_COMMIT
@@ -240,6 +328,23 @@ class OperationalTask6Tests(unittest.TestCase):
                 "cache_flags": {"autocast": False, "tf32": False, "diffusion_cache": False},
                 "seed_routes": {"model": 0, "prepare": 0, "sampler": 0, "scheduler": 0},
                 "geometry": {"carrier_shape": [1, 48, 5, 16, 16], "condition_indexes": [0], "predicted_indexes": [1, 2, 3, 4], "mask_shape": [1, 48, 5, 16, 16]}}
+
+    def _valid_factory_contract(self, checkpoint, vae):
+        contract = self.contract()
+        import umi_fd_post_vae_scan as scan
+        contract.update({
+            "checkpoint_identity": {"sha256": scan.sha256_tree(checkpoint)},
+            "vae_sha256": self.op.sha256_file(vae),
+            "code_bundle_sha256": self.op.code_bundle_sha256(),
+            "bridge_asset_hashes": dict(self.op.BRIDGE0_ASSET_SHA256),
+            "task5": {
+                "manifest_sha256": "c" * 64,
+                "plan_sha256": "d" * 64,
+                "direction_file_sha256": {key: "e" * 64 for key in ("v0", "v1", "v2")},
+                "direction_sha256": {key: "f" * 64 for key in ("v0", "v1", "v2", "u01", "u12")},
+            },
+        })
+        return contract
 
 
 if __name__ == "__main__": unittest.main()
