@@ -56,6 +56,7 @@ def build_task6_hash_binding(runtime: Any, inputs: Any, config: Mapping[str, Any
     actual = runtime.actual_identity() if hasattr(runtime, "actual_identity") else {"runtime": type(runtime).__name__}
     source_root = Path(__file__).resolve().parent
     sources = [source_root / name for name in ("umi_task6_runtime.py", "run_umi_task6_experiment.py",
+        "umi_task6_primitives.py", "umi_fd_post_vae_bridge.py",
         "umi_precision_runtime.py", "umi_precision_storage.py", "umi_precision_official.py",
         "umi_task5_runtime.py", "umi_task5_primitives.py") if (source_root / name).is_file()]
     code_digest = hashlib.sha256()
@@ -73,10 +74,6 @@ def task6_binding_config(inputs: Any) -> dict[str, Any]:
                          "tf32": False, "diffusion_cache": False, "batch_size": 1}}
 
 
-def build_task6_authorization(runtime: Any, inputs: Any) -> dict[str, Any]:
-    """Test/controller helper for an accepted smoke decision binding."""
-    return {"status": "AWAITING_RESOURCE_REVIEW", "smoke_decision_accepted": True,
-            "hashes": build_task6_hash_binding(runtime, inputs, task6_binding_config(inputs))}
 
 
 def load_frozen_directions(direction_bank: Any, mask: Any, *, expected_hashes: Mapping[str, str] | None = None) -> dict[str, np.ndarray]:
@@ -101,13 +98,21 @@ def load_frozen_directions(direction_bank: Any, mask: Any, *, expected_hashes: M
         raise ValueError("Task 5 direction bank must contain exactly three arrays matching the runtime mask")
     frozen = freeze_task5_directions(bank, mask_array)
     result = {key: np.ascontiguousarray(frozen["directions"][key], dtype=np.float32) for key in DIRECTION_IDS}
-    if expected_hashes is not None:
-        if set(expected_hashes) != set(DIRECTION_IDS):
-            raise ValueError("direction hash manifest must contain exactly the five frozen direction ids")
-        for key, value in result.items():
-            if _array_sha(value) != str(expected_hashes[key]):
-                raise ValueError(f"direction hash mismatch: {key}")
+    if expected_hashes is None or set(expected_hashes) != set(DIRECTION_IDS):
+        raise ValueError("direction hash manifest must contain exactly the five frozen direction ids")
+    for key, value in result.items():
+        if _array_sha(value) != str(expected_hashes[key]):
+            raise ValueError(f"direction hash mismatch: {key}")
     return result
+
+
+def _derive_frozen_directions_unpinned(direction_bank: Any, mask: Any) -> dict[str, np.ndarray]:
+    """Test-fixture-only derivation; operational callers must use a manifest."""
+    if isinstance(direction_bank, Mapping):
+        direction_bank = np.stack([direction_bank[key] for key in ("v0", "v1", "v2")])
+    bank = np.asarray(direction_bank)
+    frozen = freeze_task5_directions(bank, np.asarray(mask, dtype=bool))
+    return {key: np.ascontiguousarray(frozen["directions"][key], dtype=np.float32) for key in DIRECTION_IDS}
 
 
 class Task6Inputs:
@@ -135,8 +140,8 @@ class Task6Inputs:
         self.direction_bank_hash = _array_sha(np.stack([self.directions[key] for key in ("v0", "v1", "v2")]))
         if action is None: raise ValueError("Task 6 action is required")
         self.action = parse_action(action)
-        self.prompt = str(prompt)
-        if not self.prompt.strip(): raise ValueError("Task 6 prompt must be nonempty")
+        if not isinstance(prompt, str) or not prompt.strip(): raise ValueError("Task 6 prompt must be a nonempty string")
+        self.prompt = prompt
         if state not in STATE_IDS or isinstance(seed, bool) or not isinstance(seed, numbers.Integral) or int(seed) not in SEEDS:
             raise ValueError("Task 6 inputs require an approved state and seed 0 or 1")
         self.state = str(state); self.seed = int(seed)
@@ -241,12 +246,18 @@ def preflight_task6(config: Mapping[str, Any], *, strict: bool = False, runtime:
         if config.get("prompt") is not None and config.get("prompt") != getattr(inputs, "prompt", None): failures.append("prompt")
         if config.get("action_hash") is not None and config.get("action_hash") != observed_inputs.get("action"): failures.append("action_hash")
         if config.get("direction_hashes") is not None and config.get("direction_hashes") != observed_inputs.get("directions"): failures.append("direction_hashes")
+        if config.get("carrier_hash") is not None and config.get("carrier_hash") != observed_inputs.get("z0"): failures.append("carrier_hash")
+        if config.get("z_bar_hash") is not None and config.get("z_bar_hash") != observed_inputs.get("z_bar"): failures.append("z_bar_hash")
+        if config.get("mask_hash") is not None and config.get("mask_hash") != inputs.geometry.metadata().get("mask_sha256"): failures.append("mask_hash")
+        if strict and config.get("action_hash") != observed_inputs.get("action"): failures.append("action_hash")
+        if strict and config.get("seed_config", {}).get("seed") != observed_inputs.get("seed"): failures.append("seed_config")
     required = ("environment", "provenance", "asset_hashes", "carrier_shape", "condition_indexes",
                 "predicted_indexes", "mask_shape", "action_shape", "direction_hashes", "settings", "seed_config")
     if strict:
         failures.extend(key for key in required if key not in config)
         failures.extend(key for key in ("asset_paths",
                                          "observed_runtime_identity", "observed_input_identity") if key not in config)
+        if "direction_bank_path" not in config: failures.append("direction_bank_path")
     shape = config.get("carrier_shape")
     if "carrier" in config:
         try:
@@ -258,6 +269,7 @@ def preflight_task6(config: Mapping[str, Any], *, strict: bool = False, runtime:
     if "condition_indexes" in config and list(config["condition_indexes"]) != [0]: failures.append("condition_indexes")
     if "predicted_indexes" in config and list(config["predicted_indexes"]) != [1, 2, 3, 4]: failures.append("predicted_indexes")
     if "mask_shape" in config and shape is not None and list(config["mask_shape"]) != list(shape): failures.append("mask_shape")
+    if strict and "mask_hash" not in config: failures.append("mask_hash")
     if "action_shape" in config and list(config["action_shape"]) != [16, 10]: failures.append("action_shape")
     if "action" in config:
         try:
@@ -288,10 +300,12 @@ def preflight_task6(config: Mapping[str, Any], *, strict: bool = False, runtime:
     # such as ``task5_reuse`` is provenance for umi_reference, not a substitute
     # for the pinned Bridge video/action hashes.
     assets = config.get("asset_hashes")
+    if strict and (not isinstance(assets, Mapping) or not assets): failures.append("asset_hashes")
     if isinstance(assets, Mapping):
         for key, value in assets.items():
             if not isinstance(value, str) or len(value) != 64: failures.append(f"asset_hashes.{key}")
     asset_paths = config.get("asset_paths", config.get("actual_asset_paths"))
+    if strict and (not isinstance(asset_paths, Mapping) or not asset_paths): failures.append("asset_paths")
     if isinstance(asset_paths, Mapping):
         if not isinstance(assets, Mapping): failures.append("asset_hashes")
         for key, raw_path in asset_paths.items():
@@ -308,7 +322,14 @@ def preflight_task6(config: Mapping[str, Any], *, strict: bool = False, runtime:
         try:
             expected = config.get("direction_hashes")
             if expected is None: failures.append("direction_hashes")
-            else: load_frozen_directions(config["direction_bank_path"], config["mask"], expected_hashes=expected)
+            else:
+                bank_path = Path(config["direction_bank_path"])
+                if not bank_path.is_file(): raise ValueError("direction bank missing")
+                file_hash = config.get("direction_bank_file_hash", config.get("direction_bank_hash"))
+                if strict and (not isinstance(file_hash, str) or _file_sha(bank_path) != file_hash): raise ValueError("direction bank file hash mismatch")
+                if "mask" not in config and inputs is not None: mask = inputs.geometry.mask
+                else: mask = config["mask"]
+                load_frozen_directions(bank_path, mask, expected_hashes=expected)
         except Exception: failures.append("direction_bank")
     provenance = config.get("provenance")
     if isinstance(provenance, Mapping) and provenance.get("source_commit") is not None:
@@ -323,8 +344,8 @@ def preflight_task6(config: Mapping[str, Any], *, strict: bool = False, runtime:
     return {"status": "PASS", "generation_started": False, "checked": sorted(set(config.keys()))}
 
 
-def verify_reference_reuse(runtime: Any, inputs: Any, *, reference_artifacts: Mapping[str, Any] | None = None,
-                           reference_manifest: Mapping[str, str] | None = None, execute: bool = True) -> dict[str, Any]:
+def verify_reference_reuse(runtime: Any, inputs: Any, *, reference_artifacts: str | os.PathLike[str] | Mapping[str, Any] | None = None,
+                           reference_manifest: str | os.PathLike[str] | Mapping[str, str] | None = None, execute: bool = True) -> dict[str, Any]:
     """Perform exactly four engineering-equivalence calls for reference reuse."""
     specs = [
         {"sample_id": "baseline_pre", "kind": "baseline", "alpha": 0.0, "sign": 0, "direction_id": None},
@@ -332,66 +353,61 @@ def verify_reference_reuse(runtime: Any, inputs: Any, *, reference_artifacts: Ma
         {"sample_id": "v0_alpha_00_plus", "kind": "perturbation", "alpha": 0.001, "sign": 1, "direction_id": "v0"},
         {"sample_id": "v0_alpha_00_minus", "kind": "perturbation", "alpha": 0.001, "sign": -1, "direction_id": "v0"},
     ]
-    if not isinstance(reference_artifacts, Mapping) or set(reference_artifacts) != {item["sample_id"] for item in specs}:
-        raise ValueError("four corresponding Task 5 reference artifacts are required")
+    if isinstance(reference_artifacts, Mapping) or not isinstance(reference_artifacts, (str, os.PathLike)):
+        raise ValueError("reference artifacts must be one on-disk Task 5 sample root")
+    reference_root = Path(reference_artifacts)
+    if not reference_root.is_dir(): raise ValueError("Task 5 reference sample root is missing")
     if isinstance(reference_manifest, (str, os.PathLike)):
         manifest_path = Path(reference_manifest)
         if not manifest_path.is_file(): raise ValueError("Task 5 reference manifest is missing")
         entries = {}
         for line in manifest_path.read_text(encoding="ascii").splitlines():
             parts = line.split(None, 1)
-            if len(parts) == 2: entries[parts[1]] = parts[0]
+            if len(parts) != 2 or len(parts[0]) != 64: raise ValueError("malformed Task 5 reference manifest")
+            entries[parts[1]] = parts[0]
         reference_manifest = entries
     if not isinstance(reference_manifest, Mapping):
         raise ValueError("Task 5 reference manifest hashes are required")
     saved: dict[str, Any] = {}
     for spec in specs:
-        source = reference_artifacts[spec["sample_id"]]
-        if isinstance(source, Mapping):
-            saved[spec["sample_id"]] = source
-            continue
-        path = Path(source)
+        path = reference_root / spec["sample_id"]
         if path.is_dir():
             record = json.loads((path / "sample.json").read_text(encoding="utf-8"))
             state = json.loads((path / "status.json").read_text(encoding="utf-8"))
+            if state.get("status") != "success": raise ValueError(f"reference sample is not successful: {spec['sample_id']}")
             for filename, digest in state.get("artifact_sha256", {}).items():
                 artifact = path / filename
                 if not artifact.is_file() or _file_sha(artifact) != digest: raise ValueError(f"reference artifact hash mismatch: {spec['sample_id']}")
-                expected_digest = reference_manifest.get(str(artifact), reference_manifest.get(artifact.as_posix()))
+                rel = str(artifact.relative_to(reference_root)).replace("\\", "/")
+                expected_digest = reference_manifest.get(rel, reference_manifest.get(str(artifact), reference_manifest.get(artifact.as_posix())))
                 if expected_digest is None or expected_digest != digest: raise ValueError(f"reference manifest hash mismatch: {spec['sample_id']}")
-            decoded = {}
-            for key, value in record.items():
-                if isinstance(value, Mapping) and isinstance(value.get("artifact"), str): decoded[key] = np.load(path / value["artifact"], allow_pickle=False)
-                else: decoded[key] = value
+            def decode(value):
+                if isinstance(value, Mapping) and isinstance(value.get("artifact"), str):
+                    return np.load(path / value["artifact"], allow_pickle=False)
+                if isinstance(value, Mapping): return {key: decode(item) for key, item in value.items()}
+                if isinstance(value, list): return [decode(item) for item in value]
+                return value
+            decoded = decode(record)
             decoded.update({p.stem: np.load(p, allow_pickle=False) for p in path.glob("*.npy")})
             saved[spec["sample_id"]] = decoded
         else:
-            if not path.is_file(): raise ValueError(f"reference artifact is missing: {path}")
-            digest = _file_sha(path)
-            expected_digest = reference_manifest.get(str(path), reference_manifest.get(spec["sample_id"]))
-            if expected_digest != digest: raise ValueError(f"reference manifest hash mismatch: {spec['sample_id']}")
-            if path.suffix == ".npy": saved[spec["sample_id"]] = np.load(path, allow_pickle=False)
-            elif path.suffix == ".json": saved[spec["sample_id"]] = json.loads(path.read_text(encoding="utf-8"))
-            else: raise ValueError(f"unsupported reference artifact: {path}")
+            raise ValueError(f"reference sample directory is missing: {path}")
     records = []
     for spec in specs:
         if not execute: raise ValueError("reference reuse verification requires execution of all four calls")
         records.append(runtime.execute({**spec, "group": "C", "model_seed": spec.get("seed", 0)}, inputs, scope="full"))
     def bits(record):
         if isinstance(record, Mapping):
-            known = ("common_input_fp32", "initial_state", "consumed_initial_state", "sampler_input_state", "output_full", "decoded_final", "raw_outputs", "raw")
-            present = [key for key in known if key in record]
-            if not present: return ("MISSING_REQUIRED_RAW_FIELDS",)
             required = {"common_input_fp32", "initial_state", "consumed_initial_state", "sampler_input_state", "output_full"}
-            if any(key in record for key in required) and not required.issubset(record): return ("MISSING_REQUIRED_RAW_FIELDS", tuple(sorted(required - set(record))))
-            if present == ["raw"]:
-                array = np.asarray(record["raw"]); return (array.dtype.str, array.shape, array.tobytes())
-            raw = tuple((key, np.asarray(record[key]).dtype.str, np.asarray(record[key]).shape, np.asarray(record[key]).tobytes()) for key in present)
+            if not required.issubset(record):
+                nested = [value for value in record.values() if isinstance(value, Mapping)]
+                for candidate in nested:
+                    if required.issubset(candidate): return bits(candidate)
+            if not required.issubset(record): return ("MISSING_REQUIRED_RAW_FIELDS", tuple(sorted(required - set(record))))
+            optional = ["decoded_final"] if "decoded_final" in record else []
+            raw = tuple((key, np.asarray(record[key]).dtype.str, np.asarray(record[key]).shape, np.asarray(record[key]).tobytes()) for key in sorted(required | set(optional)))
             return raw
-        raw = record
-        if isinstance(raw, Mapping): return tuple((str(k), np.asarray(v).dtype.str, np.asarray(v).shape, np.asarray(v).tobytes()) for k, v in sorted(raw.items()))
-        array = np.asarray(raw)
-        return (array.dtype.str, array.shape, array.tobytes())
+        return ("MISSING_REQUIRED_RAW_FIELDS",)
     evidence = {}
     for spec, record in zip(specs, records):
         current = bits(record); reference = bits(saved[spec["sample_id"]])
@@ -414,6 +430,20 @@ def _write_manifest(root: Path) -> None:
     (root / "MANIFEST.sha256").write_text("\n".join(lines) + "\n", encoding="ascii")
 
 
+def _validate_immutable_manifest(root: Path) -> None:
+    manifest = root / "MANIFEST.sha256"
+    if not manifest.is_file(): return
+    mutable = {"run_status.json", "invocation_history.jsonl", "gpu_samples.csv", "ram_samples.csv", "disk_samples.csv", "sample_resource_snapshots.csv", "sample_resource_snapshots.jsonl"}
+    for line in manifest.read_text(encoding="ascii").splitlines():
+        parts = line.split(None, 1)
+        if len(parts) != 2: raise ValueError("malformed immutable manifest")
+        digest, rel = parts
+        rel = rel.strip()
+        if Path(rel).name in mutable: continue
+        path = root / rel
+        if not path.is_file() or _file_sha(path) != digest: raise ValueError(f"immutable manifest mismatch: {rel}")
+
+
 def _file_sha(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -432,7 +462,7 @@ def _atomic_text(path: Path, text: str) -> None:
         if os.path.exists(temporary): os.unlink(temporary)
 
 
-def run_task6_group(runtime: Any, inputs: Task6Inputs, run_dir: str | Path, *, resume: bool = False,
+def _run_task6_group(runtime: Any, inputs: Task6Inputs, run_dir: str | Path, *, resume: bool = False,
                     authorization: Mapping[str, Any], monitor: Any) -> dict[str, Any]:
     """Execute one exact 32-call group serially with immutable samples."""
     root = Path(run_dir); root.mkdir(parents=True, exist_ok=True)
@@ -478,7 +508,7 @@ def run_task6_group(runtime: Any, inputs: Task6Inputs, run_dir: str | Path, *, r
                                    last_resource_snapshots=last_resources)
         _atomic_text(status_path, canonical_json(payload) + "\n"); return payload
     with ProcessLock(root / ".runner.lock"):
-        if monitor is not None and hasattr(monitor, "start"): monitor.start()
+        _validate_immutable_manifest(root)
         # Successful samples are immutable and must match this run's strict
         # identity before any resume call is skipped.
         if (root / "samples").exists():
@@ -492,6 +522,7 @@ def run_task6_group(runtime: Any, inputs: Task6Inputs, run_dir: str | Path, *, r
                         if not record_file.is_file(): raise ValueError("successful Task 6 sample is missing sample.json")
                         record = json.loads(record_file.read_text(encoding="utf-8"))
                         if record.get("identity") != identity: raise ValueError("strict Task 6 resume identity mismatch")
+        if monitor is not None and hasattr(monitor, "start"): monitor.start()
         for ordinal, spec in enumerate(plan):
             # Give incomplete prior attempts deterministic, reviewable names.
             sample_path = root / "samples" / spec["sample_id"]
@@ -501,7 +532,11 @@ def run_task6_group(runtime: Any, inputs: Task6Inputs, run_dir: str | Path, *, r
                     attempt_no = 1
                     while (sample_path.parent / f"{sample_path.name}.attempt.{attempt_no}").exists(): attempt_no += 1
                     sample_path.rename(sample_path.parent / f"{sample_path.name}.attempt.{attempt_no}")
-            disposition = samples.prepare(spec["sample_id"], resume=resume, required_files=("sample.json",))
+            try:
+                disposition = samples.prepare(spec["sample_id"], resume=resume, required_files=("sample.json",))
+            except Exception as error:
+                failed.append(spec["sample_id"])
+                payload = write_status("FAILED", type(error).__name__, str(error)); _write_manifest(root); return payload
             if disposition == "skip":
                 skipped.append(spec["sample_id"]); completed.append(spec["sample_id"]); continue
             if monitor is not None and getattr(monitor, "failure", None) is not None:
@@ -511,6 +546,8 @@ def run_task6_group(runtime: Any, inputs: Task6Inputs, run_dir: str | Path, *, r
                                          remaining_samples=32 - len(completed), run_dir=root)
                 if decision.get("status") == "HARD_STOP":
                     payload = write_status("RESOURCE_STOP", decision.get("reason_code"), decision.get("reason")); _write_manifest(root); return payload
+            if monitor is not None and hasattr(monitor, "capture_sample"):
+                monitor.capture_sample(spec["sample_id"], "pre_sample", 32 - len(completed), root)
             with history.open("a", encoding="utf-8") as stream:
                 stream.write(canonical_json({"sample_id": spec["sample_id"], "identity": identity, "started_at_unix": time.time()}) + "\n")
             try:
@@ -520,6 +557,10 @@ def run_task6_group(runtime: Any, inputs: Task6Inputs, run_dir: str | Path, *, r
                 arrays = {key + ".npy": value for key, value in record.items() if isinstance(value, np.ndarray)}
                 samples.write_success(spec["sample_id"], {key: value for key, value in record.items() if not isinstance(value, np.ndarray)}, artifacts=arrays)
                 completed.append(spec["sample_id"])
+                cleanup = getattr(runtime, "cleanup", None) or getattr(runtime, "reset_cache", None)
+                if callable(cleanup): cleanup()
+                if monitor is not None and hasattr(monitor, "capture_sample"):
+                    monitor.capture_sample(spec["sample_id"], "post_cleanup", 32 - len(completed), root)
                 if monitor is not None and hasattr(monitor, "check"):
                     decision = monitor.check(phase="pilot", starting_new_sample=False,
                                              remaining_samples=32 - len(completed), run_dir=root)
@@ -553,6 +594,6 @@ validate_task6_preflight = preflight_task6
 load_task5_direction_bank = load_frozen_directions
 verify_umi_reference_reuse = verify_reference_reuse
 
-__all__ = ["PreflightError", "ResourceStop", "Task6Inputs", "Task6Runtime", "Task6RuntimeAdapter", "build_task6_authorization", "build_task6_hash_binding", "task6_binding_config",
+__all__ = ["PreflightError", "ResourceStop", "Task6Inputs", "Task6Runtime", "Task6RuntimeAdapter", "build_task6_hash_binding", "task6_binding_config",
            "load_frozen_directions", "load_task5_direction_bank", "preflight_task6",
-           "run_task6_group", "validate_task6_preflight", "verify_reference_reuse", "verify_umi_reference_reuse"]
+           "validate_task6_preflight", "verify_reference_reuse", "verify_umi_reference_reuse"]

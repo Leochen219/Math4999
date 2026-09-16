@@ -21,11 +21,13 @@ import numpy as np
 
 try:
     from .umi_task6_primitives import build_run_status, evaluate_resources
-    from .umi_task6_runtime import (PreflightError, Task6Inputs, build_task6_hash_binding, task6_binding_config, preflight_task6, run_task6_group,
+    from .umi_precision_storage import PrecisionSampleStore
+    from .umi_task6_runtime import (PreflightError, Task6Inputs, build_task6_hash_binding, task6_binding_config, preflight_task6, _run_task6_group,
                                     verify_reference_reuse)
 except ImportError:
     from umi_task6_primitives import build_run_status, evaluate_resources
-    from umi_task6_runtime import PreflightError, Task6Inputs, build_task6_hash_binding, task6_binding_config, preflight_task6, run_task6_group, verify_reference_reuse
+    from umi_precision_storage import PrecisionSampleStore
+    from umi_task6_runtime import PreflightError, Task6Inputs, build_task6_hash_binding, task6_binding_config, preflight_task6, _run_task6_group, verify_reference_reuse
 
 
 def _sha_file(path: Path) -> str:
@@ -38,6 +40,12 @@ def _sha_file(path: Path) -> str:
 def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
     stage = path.with_name("." + path.name + ".stage")
     stage.write_text(json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8")
+    os.replace(stage, path)
+
+
+def _atomic_text(path: Path, value: str) -> None:
+    stage = path.with_name("." + path.name + ".stage")
+    stage.write_text(value, encoding="utf-8")
     os.replace(stage, path)
 
 
@@ -107,6 +115,9 @@ class ResourceMonitor:
         self.cadence_seconds = {"gpu": 1.0, "ram": 5.0, "disk": 5.0}
         self.clock = clock; self.sleep = sleep; self._stop = threading.Event(); self.failure: Exception | None = None
         self._thread: threading.Thread | None = None; self._gpu: list[dict[str, Any]] = []; self._ram: list[dict[str, Any]] = []; self._disk: list[dict[str, Any]] = []
+        self._sample_rows: list[dict[str, Any]] = []
+        self._cleanup_gpu_baseline: float | None = None; self._cleanup_rss_baseline: float | None = None
+        self._cleanup_gpu_consecutive = 0; self._cleanup_ram_consecutive = 0
 
     def _poll(self):
         next_gpu = self.clock(); next_ram = next_gpu
@@ -123,6 +134,15 @@ class ResourceMonitor:
 
     def start(self):
         if self._thread is not None: raise RuntimeError("monitor already started")
+        # Establish a synchronous baseline so a fast pilot cannot start a
+        # sample before the background cadence has produced evidence.
+        try:
+            now = self.clock()
+            self._gpu.append({"timestamp": now, **dict(self.gpu_sampler())})
+            self._ram.append({"timestamp": now, **dict(self.ram_sampler())})
+            self._disk.append({"timestamp": now, **dict(self.disk_sampler())})
+        except Exception as error:
+            self.failure = error
         self._thread = threading.Thread(target=self._poll, name="task6-resource-monitor", daemon=True); self._thread.start(); return self
 
     def stop(self):
@@ -131,6 +151,8 @@ class ResourceMonitor:
             self._thread.join(timeout=5)
             if self._thread.is_alive(): self.failure = RuntimeError("resource monitor did not terminate")
         self._write("gpu_samples.csv", self._gpu); self._write("ram_samples.csv", self._ram); self._write("disk_samples.csv", self._disk)
+        self._write("sample_resource_snapshots.csv", self._sample_rows)
+        _atomic_text(self.root / "sample_resource_snapshots.jsonl", "".join(json.dumps(row, sort_keys=True, allow_nan=False) + "\n" for row in self._sample_rows))
         if self.failure is not None: raise RuntimeError("resource monitor failed") from self.failure
 
     @property
@@ -148,9 +170,49 @@ class ResourceMonitor:
         snapshot = dict(self.last_resources)
         if remaining_samples is not None: snapshot["remaining_samples"] = int(remaining_samples)
         if run_dir is not None:
-            sizes = [path.stat().st_size for path in (run_dir / "samples").glob("*") if path.is_dir()]
+            sizes = []
+            sample_root = run_dir / "samples"
+            if sample_root.is_dir():
+                for path in sorted(sample_root.iterdir()):
+                    status_path = path / "status.json"
+                    if not path.is_dir() or not status_path.is_file():
+                        continue
+                    try:
+                        state = json.loads(status_path.read_text(encoding="utf-8"))
+                        if state.get("status") != "success":
+                            continue
+                        hashes = state.get("artifact_sha256", {})
+                        if any(not (path / name).is_file() or _sha_file(path / name) != digest for name, digest in hashes.items()):
+                            continue
+                        sizes.append(sum(item.stat().st_size for item in path.rglob("*") if item.is_file()))
+                    except (OSError, ValueError, json.JSONDecodeError):
+                        continue
             if sizes: snapshot["mean_success_sample_bytes"] = float(sum(sizes) / len(sizes))
         return evaluate_resources(snapshot, phase=phase, starting_new_sample=starting_new_sample)
+
+    def capture_sample(self, sample_id: str, phase: str, remaining: int, run_dir: Path | None = None) -> dict[str, Any]:
+        """Synchronously persist per-sample resource evidence from all samplers."""
+        row = {"sample_id": str(sample_id), "phase": str(phase), "remaining_samples": int(remaining),
+               "timestamp": float(self.clock())}
+        row.update(dict(self.gpu_sampler())); row.update(dict(self.ram_sampler())); row.update(dict(self.disk_sampler()))
+        if phase == "post_cleanup":
+            gpu = row.get("gpu_used_gib", row.get("gpu_allocated_gib")); rss = row.get("rss_gib", row.get("process_rss_gib"))
+            if gpu is not None:
+                if self._cleanup_gpu_baseline is None: self._cleanup_gpu_baseline = float(gpu)
+                growth = float(gpu) - self._cleanup_gpu_baseline; row["gpu_cleanup_growth_gib"] = growth
+                self._cleanup_gpu_consecutive = self._cleanup_gpu_consecutive + 1 if growth > 1.0 else 0
+                row["gpu_consecutive_growth_samples"] = self._cleanup_gpu_consecutive
+            if rss is not None:
+                if self._cleanup_rss_baseline is None: self._cleanup_rss_baseline = float(rss)
+                growth = float(rss) - self._cleanup_rss_baseline; row["ram_cleanup_growth_gib"] = growth
+                self._cleanup_ram_consecutive = self._cleanup_ram_consecutive + 1 if growth > 1.0 else 0
+                row["ram_consecutive_growth_samples"] = self._cleanup_ram_consecutive
+        if run_dir is not None:
+            decision = self.check(phase="pilot", starting_new_sample=(phase == "pre_sample"),
+                                  remaining_samples=remaining, run_dir=run_dir)
+            row.update({"decision_status": decision.get("status"), "reason_code": decision.get("reason_code")})
+        self._sample_rows.append(row)
+        return row
 
     def _write(self, filename: str, rows: list[dict[str, Any]]):
         path = self.root / filename
@@ -186,7 +248,7 @@ class Task6StateMachine:
 
 def run_resource_smoke(run_dir: str | Path, *, lifecycle: Mapping[str, Callable[[], Any]] | None = None,
                        samplers: Mapping[str, Callable[[], Mapping[str, Any]]] | None = None) -> dict[str, Any]:
-    """Record baseline-only smoke evidence and stop for explicit review."""
+    """Run exactly one baseline through the real preload/load/call/cleanup lifecycle."""
     if not isinstance(samplers, Mapping) or set(samplers) != {"gpu", "ram", "disk"} or not isinstance(lifecycle, Mapping) or set(lifecycle) != {"pre_load", "load", "cleanup", "unload"}:
         raise BlockedExecution("resource smoke requires lifecycle factory and GPU/RAM/disk samplers")
     if not all(callable(samplers[key]) for key in samplers): raise BlockedExecution("resource smoke samplers must be callable")
@@ -195,67 +257,97 @@ def run_resource_smoke(run_dir: str | Path, *, lifecycle: Mapping[str, Callable[
     if not prior_path.is_file(): raise BlockedExecution("resource smoke requires prior PREFLIGHT_COMPLETE status")
     prior = json.loads(prior_path.read_text(encoding="utf-8"))
     if prior.get("status") != "PREFLIGHT_COMPLETE" or prior.get("phase") != "RESOURCE_SMOKE": raise BlockedExecution("resource smoke requires matching preflight")
-    prior_hashes = prior.get("hashes", {})
+    prior_hashes = prior.get("hashes")
+    if not isinstance(prior_hashes, Mapping) or set(prior_hashes) != {"code", "model", "config", "direction", "input", "noise"}:
+        raise BlockedExecution("preflight status has incomplete hash binding")
     background = ResourceMonitor(root, gpu_sampler=samplers["gpu"], ram_sampler=samplers["ram"], disk_sampler=samplers["disk"])
     background.start()
     rows: list[dict[str, Any]] = []
-    stages = ["pre-load", "loaded"]
-    def sample(stage):
+    stages = ("pre-load", "loaded", "call", "post-call", "post-cleanup", "unloaded")
+    by_stage: dict[str, dict[str, Any]] = {}
+    errors: list[dict[str, str]] = []
+    def sample(stage, phase="resource-smoke"):
         try:
-            row = {"stage": stage, **dict(samplers["gpu"]()), **dict(samplers["ram"]()), **dict(samplers["disk"]())}
-        except Exception as error:
-            row = {"stage": stage, "monitor_failure": str(error)}
-        rows.append(row); return row
-    runtime = inputs = None; baseline = {}; baseline_error = None; lifecycle_error = None; loaded_ok = False; cleanup_error = None; unload_error = None
-    hashes = prior_hashes; baseline_calls = 0
+            row = {"stage": stage, "phase": phase, **dict(samplers["gpu"]()), **dict(samplers["ram"]()), **dict(samplers["disk"]())}
+        except BaseException as error:
+            row = {"stage": stage, "phase": phase, "status": "ERROR", "error": str(error)}
+            errors.append({"stage": stage, "type": type(error).__name__, "message": str(error)})
+        by_stage[stage] = row; rows.append(row); return row
+    runtime = inputs = None; baseline: Mapping[str, Any] = {}; loaded_ok = False; baseline_calls = 0; hashes = prior_hashes; stopped = False
+    def status_payload(status, reason_code, reason):
+        payload = build_run_status(status, reason_code=reason_code, reason=reason, completed=[], failed=[], skipped=[],
+            resource_snapshots={"by_stage": by_stage, "background_gpu": background._gpu, "background_ram": background._ram, "background_disk": background._disk, "last": background.last_resources},
+            hashes=dict(hashes), smoke_decision={"status": status, "reason_code": reason_code}, baseline_calls=baseline_calls,
+            disk_size_forecast={"mean_success_sample_bytes": 0, "remaining_samples": 31, "forecast_bytes": 0, "forecast_free_gib": None}, errors=errors)
+        _atomic_json(root / "smoke_stage_snapshots.json", {"stages": list(stages), "by_stage": by_stage})
+        _atomic_json(root / "run_status.json", payload); return payload
     try:
-        lifecycle["pre_load"](); pre = sample("pre-load")
+        lifecycle["pre_load"](); pre = sample("pre-load", "preload")
         pre_decision = evaluate_resources(pre, phase="preload")
-        if pre_decision["status"] == "HARD_STOP": raise ResourceStop(pre_decision["reason"])
+        if pre_decision["status"] == "HARD_STOP":
+            errors.append({"stage": "pre-load", "type": "ResourceStop", "message": pre_decision.get("reason", "unsafe preload")})
+            return status_payload("RESOURCE_STOP", pre_decision.get("reason_code", "RESOURCE_STOP"), pre_decision.get("reason", "unsafe preload"))
         loaded = lifecycle["load"]()
-        if not isinstance(loaded, (tuple, list)) or len(loaded) != 2: raise BlockedExecution("lifecycle load must return (runtime, inputs)")
+        if not isinstance(loaded, (tuple, list)) or len(loaded) != 2 or loaded[0] is None or loaded[1] is None: raise RuntimeError("lifecycle load must return non-None (runtime, inputs)")
         runtime, inputs = loaded; loaded_ok = True; sample("loaded")
-        binding_config = {"schema_version": "umi-task6-v1", "group": {"state": inputs.state, "seed": inputs.seed}, "settings": {"num_steps": 30, "guidance": 1.0, "shift": 10.0, "autocast": False, "tf32": False, "diffusion_cache": False, "batch_size": 1}}
+        binding_config = task6_binding_config(inputs)
         hashes = build_task6_hash_binding(runtime, inputs, binding_config)
-        if hashes != prior_hashes: raise BlockedExecution("loaded runtime/input binding differs from preflight")
+        if dict(hashes) != dict(prior_hashes): raise RuntimeError("loaded runtime/input binding differs from preflight")
         baseline_calls = 1
         baseline = runtime.execute({"sample_id": "baseline_smoke", "kind": "baseline", "alpha": 0.0, "sign": 0,
-                                   "group": "C", "model_seed": getattr(inputs, "seed", 0)}, inputs, scope="full")
+                                   "group": "C", "model_seed": inputs.seed}, inputs, scope="full")
+        sample("call"); sample("post-call")
+        try: lifecycle["cleanup"]()
+        except BaseException as error: errors.append({"stage": "cleanup", "type": type(error).__name__, "message": str(error)})
+        sample("post-cleanup")
+        try: lifecycle["unload"]()
+        except BaseException as error: errors.append({"stage": "unload", "type": type(error).__name__, "message": str(error)})
+        sample("unloaded")
+    except KeyboardInterrupt as error:
+        errors.append({"stage": "lifecycle", "type": "KeyboardInterrupt", "message": str(error)})
     except BaseException as error:
-        lifecycle_error = error
+        errors.append({"stage": "lifecycle", "type": type(error).__name__, "message": str(error)})
     finally:
-        if loaded_ok:
+        if loaded_ok and "post-cleanup" not in by_stage:
             try: lifecycle["cleanup"]()
-            except BaseException as error: cleanup_error = error
+            except BaseException as error: errors.append({"stage": "cleanup", "type": type(error).__name__, "message": str(error)})
+            sample("post-cleanup")
+        if loaded_ok and "unloaded" not in by_stage:
             try: lifecycle["unload"]()
-            except BaseException as error: unload_error = error
-    stages += ["call", "post-call", "post-cleanup", "unloaded"]
-    sample("call"); sample("post-call"); sample("post-cleanup"); sample("unloaded")
-    try: background.stop()
-    except RuntimeError: rows.append({"monitor_failure": "resource monitor failed"})
-    if background.failure is not None: rows.append({"monitor_failure": str(background.failure)})
-    decisions = [evaluate_resources(row, phase="resource-smoke") for row in rows]
-    hard = next((item for item in decisions if item["status"] == "HARD_STOP"), None)
-    status = "RESOURCE_STOP" if hard or baseline_error or lifecycle_error or cleanup_error or unload_error else "AWAITING_RESOURCE_REVIEW"
-    if lifecycle_error: hard = {"reason_code": type(lifecycle_error).__name__, "reason": str(lifecycle_error)}
-    if cleanup_error: hard = {"reason_code": "CLEANUP_FAILURE", "reason": str(cleanup_error)}
-    if unload_error: hard = {"reason_code": "UNLOAD_FAILURE", "reason": str(unload_error)}
-    if baseline_error: hard = {"reason_code": type(baseline_error).__name__, "reason": str(baseline_error)}
-    stage_snapshots = {stage: dict(rows[index]) for index, stage in enumerate(stages)}
-    output = baseline.get("output_full") if isinstance(baseline, Mapping) else None
-    smoke_store = AtomicSampleStore(root / "smoke_samples")
+            except BaseException as error: errors.append({"stage": "unload", "type": type(error).__name__, "message": str(error)})
+            sample("unloaded")
+        for stage in stages: by_stage.setdefault(stage, {"stage": stage, "status": "N/A", "reason": "not reached"})
+        try: background.stop()
+        except BaseException as error: errors.append({"stage": "monitor", "type": type(error).__name__, "message": str(error)})
+        stopped = True
+    if baseline and not errors and isinstance(baseline, Mapping):
+        smoke_store = PrecisionSampleStore(root / "smoke_samples")
+        sample_dir = root / "smoke_samples" / "baseline_smoke"
+        if not sample_dir.exists(): smoke_store.write_success("baseline_smoke", {"scope": "resource-smoke", "binding": dict(hashes), "record": baseline})
     sample_dir = root / "smoke_samples" / "baseline_smoke"
-    if output is not None and not sample_dir.exists():
-        values = {key: value for key, value in baseline.items() if isinstance(value, np.ndarray)} if isinstance(baseline, Mapping) else {"output_full": output}
-        smoke_store.publish("baseline_smoke", values, {"scope": "resource-smoke"})
-    sample_bytes = sum(path.stat().st_size for path in sample_dir.rglob("*") if path.is_file()) if sample_dir.exists() else 0
-    binding_config = {"schema_version": "umi-task6-v1", "group": {"state": getattr(inputs, "state", "bridge_0"), "seed": getattr(inputs, "seed", 0)},
-                      "settings": {"num_steps": 30, "guidance": 1.0, "shift": 10.0, "autocast": False, "tf32": False, "diffusion_cache": False, "batch_size": 1}}
-    hashes = build_task6_hash_binding(runtime, inputs, binding_config)
-    payload = build_run_status(status, reason_code=hard["reason_code"] if hard else "SMOKE_REVIEW_REQUIRED",
-                               reason=hard["reason"] if hard else "baseline smoke complete; explicit review required",
-                               completed=[], failed=[], skipped=[], resource_snapshots={"stages": stages, "snapshots": rows, "by_stage": stage_snapshots}, hashes=hashes, smoke_decision=decisions[-1], baseline_calls=baseline_calls, disk_size_forecast={"mean_success_sample_bytes": sample_bytes, "remaining_samples": 31, "forecast_bytes": sample_bytes * 31 * 1.3})
-    _atomic_json(root / "smoke_stage_snapshots.json", {"stages": stages, "snapshots": rows})
+    sample_bytes = sum(path.stat().st_size for path in sample_dir.rglob("*") if path.is_file()) if sample_dir.is_dir() else 0
+    forecast = sample_bytes * 31 * 1.3
+    disk_free = by_stage.get("unloaded", {}).get("disk_free_gib")
+    peak_rows = list(getattr(background, "_gpu", [])) + rows
+    peak_alloc = max((float(row.get("gpu_peak_allocated_gib", row.get("gpu_allocated_gib", 0))) for row in peak_rows), default=0.0)
+    peak_reserved = max((float(row.get("gpu_peak_reserved_gib", row.get("gpu_reserved_gib", 0))) for row in peak_rows), default=0.0)
+    peak_nvml = max((float(row.get("gpu_peak_nvml_used_gib", row.get("gpu_used_gib", row.get("nvml_used_gib", 0)))) for row in peak_rows), default=0.0)
+    by_stage.setdefault("call", {"stage": "call", "status": "N/A"})
+    by_stage["call"].update({"gpu_peak_allocated_gib": peak_alloc, "gpu_peak_reserved_gib": peak_reserved, "gpu_peak_nvml_used_gib": peak_nvml})
+    gate = evaluate_resources({"gpu_used_gib": peak_nvml, "gpu_free_gib": 100, "ram_available_gib": 600,
+                               "disk_free_gib": disk_free if disk_free is not None else 20,
+                               "gpu_peak_allocated_gib": peak_alloc, "gpu_peak_nvml_used_gib": peak_nvml}, phase="resource-smoke")
+    if gate.get("status") == "HARD_STOP":
+        errors.append({"stage": "call", "type": gate.get("reason_code", "RESOURCE_STOP"), "message": gate.get("reason", "smoke peak gate failed")})
+    status = "AWAITING_RESOURCE_REVIEW" if not errors else "RESOURCE_STOP"
+    reason_code = "SMOKE_REVIEW_REQUIRED" if not errors else errors[0]["type"]
+    reason = "baseline smoke complete; explicit review required" if not errors else errors[0]["message"]
+    payload = build_run_status(status, reason_code=reason_code, reason=reason, completed=[], failed=[], skipped=[],
+        resource_snapshots={"by_stage": by_stage, "background_gpu": background._gpu, "background_ram": background._ram, "background_disk": background._disk, "last": background.last_resources},
+        hashes=dict(hashes), smoke_decision={"status": status, "reason_code": reason_code}, baseline_calls=baseline_calls,
+        disk_size_forecast={"mean_success_sample_bytes": sample_bytes, "remaining_samples": 31, "forecast_bytes": forecast,
+                            "forecast_free_gib": None if disk_free is None else float(disk_free) - forecast / 2**30}, errors=errors)
+    _atomic_json(root / "smoke_stage_snapshots.json", {"stages": list(stages), "by_stage": by_stage})
     _atomic_json(root / "run_status.json", payload)
     return payload
 
@@ -273,7 +365,9 @@ class BlockedExecution(RuntimeError):
     """User-facing fail-closed launcher refusal."""
 
 
-def execute_task6(args: argparse.Namespace, *, runtime: Any | None = None, inputs: Task6Inputs | None = None, monitor: ResourceMonitor | None = None) -> dict[str, Any]:
+def execute_task6(args: argparse.Namespace, *, runtime: Any | None = None, inputs: Task6Inputs | None = None,
+                  monitor: ResourceMonitor | None = None, lifecycle: Mapping[str, Callable[[], Any]] | None = None,
+                  samplers: Mapping[str, Callable[[], Mapping[str, Any]]] | None = None) -> dict[str, Any]:
     """Execute only the explicitly requested phase; pilot needs injected runtime inputs."""
     if args.phase == "preflight":
         if runtime is None or inputs is None: raise BlockedExecution("preflight requires injected runtime and validated inputs")
@@ -283,9 +377,6 @@ def execute_task6(args: argparse.Namespace, *, runtime: Any | None = None, input
             try: config = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as error: raise BlockedExecution(f"invalid preflight JSON: {error}") from error
         if not args.preflight_json: raise BlockedExecution("explicit preflight evidence JSON is required")
-        config.setdefault("observed_runtime_identity", runtime.actual_identity() if hasattr(runtime, "actual_identity") else None)
-        config.setdefault("observed_input_identity", inputs.identity())
-        config.setdefault("carrier_shape", list(inputs.z0.shape)); config.setdefault("condition_indexes", list(inputs.geometry.condition_indexes)); config.setdefault("predicted_indexes", list(inputs.geometry.predicted_indexes)); config.setdefault("mask_shape", list(inputs.geometry.mask.shape)); config.setdefault("action_shape", list(inputs.action.shape)); config.setdefault("prompt", inputs.prompt); config.setdefault("direction_hashes", inputs.identity()["directions"])
         result = preflight_task6(config, strict=True, runtime=runtime, inputs=inputs)
         if args.run_dir:
             root = Path(args.run_dir); root.mkdir(parents=True, exist_ok=True)
@@ -297,7 +388,9 @@ def execute_task6(args: argparse.Namespace, *, runtime: Any | None = None, input
             result["run_status"] = payload
         return result
     if not args.run_dir: raise BlockedExecution("--run-dir is required for resource-smoke or pilot")
-    if args.phase == "resource-smoke": raise BlockedExecution("resource smoke requires injected runtime, inputs, and samplers")
+    if args.phase == "resource-smoke":
+        if lifecycle is None or samplers is None: raise BlockedExecution("resource smoke requires injected lifecycle and samplers")
+        return run_resource_smoke(args.run_dir, lifecycle=lifecycle, samplers=samplers)
     if args.state != "bridge_0" or args.seed != 0: raise BlockedExecution("pilot is restricted to bridge_0 / seed 0")
     if runtime is None or inputs is None: raise BlockedExecution("pilot runtime and validated inputs must be injected after review")
     return run_pilot(runtime, inputs, args.run_dir, resume=bool(args.resume), monitor=monitor)
@@ -311,7 +404,9 @@ def run_pilot(runtime: Any, inputs: Task6Inputs, run_dir: str | Path, *, resume:
     binding_config = {"schema_version": "umi-task6-v1", "group": {"state": inputs.state, "seed": inputs.seed},
                       "settings": {"num_steps": 30, "guidance": 1.0, "shift": 10.0, "autocast": False, "tf32": False, "diffusion_cache": False, "batch_size": 1}}
     authorization = authorize_pilot(run_dir, expected_hashes=build_task6_hash_binding(runtime, inputs, binding_config))
-    return run_task6_group(runtime, inputs, run_dir, resume=resume, authorization=authorization, monitor=monitor)
+    if not isinstance(monitor, ResourceMonitor):
+        raise BlockedExecution("pilot requires a ResourceMonitor instance")
+    return _run_task6_group(runtime, inputs, run_dir, resume=resume, authorization=authorization, monitor=monitor)
 
 
 def authorize_pilot(run_dir: str | Path, *, expected_hashes: Mapping[str, str] | None = None) -> dict[str, Any]:
