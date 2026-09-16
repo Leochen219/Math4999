@@ -548,7 +548,11 @@ def _run_task6_group(runtime: Any, inputs: Task6Inputs, run_dir: str | Path, *, 
                         if not record_file.is_file(): raise ValueError("successful Task 6 sample is missing sample.json")
                         record = json.loads(record_file.read_text(encoding="utf-8"))
                         if record.get("identity") != identity: raise ValueError("strict Task 6 resume identity mismatch")
-        if monitor is not None and hasattr(monitor, "start"): monitor.start()
+        if monitor is not None and hasattr(monitor, "start"):
+            try:
+                monitor.start()
+            except Exception as error:
+                payload = write_status("RESOURCE_STOP", "MONITOR_FAILURE", str(error)); _write_manifest(root); return payload
         for ordinal, spec in enumerate(plan):
             # Give incomplete prior attempts deterministic, reviewable names.
             sample_path = root / "samples" / spec["sample_id"]
@@ -617,38 +621,46 @@ def _run_task6_group(runtime: Any, inputs: Task6Inputs, run_dir: str | Path, *, 
                         payload = write_status("RESOURCE_STOP", "MONITOR_FAILURE", str(error)); _write_manifest(root); return payload
                     if decision.get("status") == "HARD_STOP":
                         payload = write_status("RESOURCE_STOP", decision.get("reason_code"), decision.get("reason")); _write_manifest(root); return payload
-            except KeyboardInterrupt:
+            except KeyboardInterrupt as primary_error:
+                secondary_errors = []
                 if not cleanup_attempted:
                     cleanup = getattr(runtime, "cleanup", None) or getattr(runtime, "reset_cache", None)
                     if callable(cleanup):
                         cleanup_attempted = True
                         try: cleanup()
-                        except Exception as cleanup_error: failed.append(spec["sample_id"]); error = cleanup_error
+                        except Exception as cleanup_error: secondary_errors.append({"type": type(cleanup_error).__name__, "message": str(cleanup_error), "kind": "cleanup"})
                     if cleanup_attempted and monitor is not None and hasattr(monitor, "capture_sample"):
                         try: monitor.capture_sample(spec["sample_id"], "post_cleanup", 32 - len(completed), root)
-                        except Exception: pass
+                        except Exception as capture_error: secondary_errors.append({"type": type(capture_error).__name__, "message": str(capture_error), "kind": "monitor"})
+                failed.append(spec["sample_id"])
                 payload = write_status("INTERRUPTED", "SIGNAL_INTERRUPTED", "interrupt received"); _write_manifest(root); return payload
-            except Exception as error:
+            except Exception as primary_error:
+                secondary_errors = []
                 if not cleanup_attempted:
                     cleanup = getattr(runtime, "cleanup", None) or getattr(runtime, "reset_cache", None)
                     if callable(cleanup):
                         cleanup_attempted = True
                         try: cleanup()
-                        except Exception as cleanup_error: error = cleanup_error
+                        except Exception as cleanup_error: secondary_errors.append({"type": type(cleanup_error).__name__, "message": str(cleanup_error), "kind": "cleanup"})
                     if cleanup_attempted and monitor is not None and hasattr(monitor, "capture_sample"):
                         try: monitor.capture_sample(spec["sample_id"], "post_cleanup", 32 - len(completed), root)
-                        except Exception as capture_error: error = capture_error
+                        except Exception as capture_error: secondary_errors.append({"type": type(capture_error).__name__, "message": str(capture_error), "kind": "monitor"})
                 failed.append(spec["sample_id"])
                 try:
                     samples.write_failure(spec["sample_id"], {"status": "fail", "identity": identity,
-                        "spec": spec, "error": {"type": type(error).__name__, "message": str(error)}})
+                        "spec": spec, "error": {"type": type(primary_error).__name__, "message": str(primary_error), "secondary": secondary_errors}})
                 except Exception:
                     # The terminal status remains authoritative even if a
                     # failure record cannot be published after a hard stop.
                     pass
-                message = str(error); lower = (type(error).__name__ + " " + message).lower()
-                terminal_status = "RESOURCE_STOP" if cleanup_failure is not None or "outofmemory" in lower or "cuda oom" in lower else "FAILED"
-                reason_code = "RESOURCE_CLEANUP_FAILURE" if cleanup_failure is not None else ("CUDA_OOM" if terminal_status == "RESOURCE_STOP" else type(error).__name__)
+                message = str(primary_error); lower = (type(primary_error).__name__ + " " + message).lower()
+                oom = "outofmemory" in lower or "out of memory" in lower or "cuda oom" in lower
+                monitor_secondary = any(item["kind"] == "monitor" for item in secondary_errors)
+                cleanup_secondary = any(item["kind"] == "cleanup" for item in secondary_errors)
+                cleanup_primary = cleanup_failure is not None
+                terminal_status = "RESOURCE_STOP" if oom or cleanup_primary or cleanup_secondary or monitor_secondary else "FAILED"
+                reason_code = "CUDA_OOM" if oom else ("MONITOR_FAILURE" if monitor_secondary else ("RESOURCE_CLEANUP_FAILURE" if cleanup_primary or cleanup_secondary else type(primary_error).__name__))
+                if secondary_errors: message += "; secondary=" + json.dumps(secondary_errors, sort_keys=True)
                 payload = write_status(terminal_status, reason_code, message); _write_manifest(root); return payload
         if len(completed) != 32:
             payload = write_status("FAILED", "INCOMPLETE_GROUP", "group did not produce exactly 32 successes"); _write_manifest(root); return payload

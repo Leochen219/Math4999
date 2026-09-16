@@ -252,6 +252,34 @@ class Task6RunnerTests(unittest.TestCase):
             self.assertEqual(result["status"], "RESOURCE_STOP"); self.assertEqual(result["reason_code"], "RESOURCE_CLEANUP_FAILURE")
             self.assertEqual(counts["cleanup"], 1); self.assertFalse(set(result["completed_samples"]) & set(result["failed_samples"]))
 
+    def test_public_pilot_monitor_start_failure_is_canonical_and_no_execute(self):
+        with tempfile.TemporaryDirectory() as temp:
+            api, runtime, inputs, counts, _ = self.public_chain(temp)
+            safe = lambda: {"gpu_used_gib":0,"gpu_free_gib":100,"gpu_reserved_gib":0,"ram_available_gib":600,"rss_gib":0,"swap_used_gib":0,"disk_free_gib":20}
+            class BrokenMonitor(api.ResourceMonitor):
+                def start(self): raise RuntimeError("monitor start")
+            result = api.run_pilot(runtime, inputs, temp, monitor=BrokenMonitor(temp, gpu_sampler=safe, ram_sampler=safe, disk_sampler=safe))
+            self.assertEqual(result["status"], "RESOURCE_STOP"); self.assertEqual(result["reason_code"], "MONITOR_FAILURE")
+            self.assertEqual(counts["pilot_execute"], 0); self.assertTrue(Path(temp, "MANIFEST.sha256").is_file())
+
+    def test_public_pilot_oom_preserves_primary_classification_over_cleanup(self):
+        with tempfile.TemporaryDirectory() as temp:
+            api, runtime, inputs, counts, _ = self.public_chain(temp, execute_error=MemoryError("CUDA out of memory"), cleanup_error=RuntimeError("cleanup"))
+            safe = lambda: {"gpu_used_gib":0,"gpu_free_gib":100,"gpu_reserved_gib":0,"ram_available_gib":600,"rss_gib":0,"swap_used_gib":0,"disk_free_gib":20}
+            result = api.run_pilot(runtime, inputs, temp, monitor=api.ResourceMonitor(temp, gpu_sampler=safe, ram_sampler=safe, disk_sampler=safe))
+            self.assertEqual(result["status"], "RESOURCE_STOP"); self.assertEqual(result["reason_code"], "CUDA_OOM"); self.assertEqual(counts["cleanup"], 1)
+
+    def test_public_pilot_post_cleanup_monitor_failure_is_monitor_stop(self):
+        with tempfile.TemporaryDirectory() as temp:
+            api, runtime, inputs, counts, _ = self.public_chain(temp)
+            safe = lambda: {"gpu_used_gib":0,"gpu_free_gib":100,"gpu_reserved_gib":0,"ram_available_gib":600,"rss_gib":0,"swap_used_gib":0,"disk_free_gib":20}
+            class BrokenCapture(api.ResourceMonitor):
+                def capture_sample(self, sample_id, phase, remaining, run_dir=None):
+                    if phase == "post_cleanup": raise RuntimeError("post sampler")
+                    return super().capture_sample(sample_id, phase, remaining, run_dir)
+            result = api.run_pilot(runtime, inputs, temp, monitor=BrokenCapture(temp, gpu_sampler=safe, ram_sampler=safe, disk_sampler=safe))
+            self.assertEqual(result["status"], "RESOURCE_STOP"); self.assertEqual(result["reason_code"], "MONITOR_FAILURE"); self.assertEqual(counts["pilot_execute"], 1)
+
     def test_public_pilot_two_success_stop_and_resume_preserves_samples(self):
         with tempfile.TemporaryDirectory() as temp:
             api, runtime, inputs, counts, _ = self.public_chain(temp)
