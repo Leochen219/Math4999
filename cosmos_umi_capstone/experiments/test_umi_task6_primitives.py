@@ -154,7 +154,9 @@ class InputAndResourceTests(unittest.TestCase):
                                   ("disk_free_gib", 4.99, "DISK_FREE_LOW")):
             with self.subTest(key=key):
                 sample = dict(base); sample[key] = value
-                self.assertEqual(evaluate_resources(sample)["reason_code"], code)
+                phase = "resource-smoke" if "peak" in key else "pilot"
+                starting = key in ("disk_free_gib", "free_disk_gib")
+                self.assertEqual(evaluate_resources(sample, phase=phase, starting_new_sample=starting)["reason_code"], code)
         self.assertEqual(evaluate_resources({**base, "gpu_used_gib": 1.01}, phase="start")["reason_code"], "GPU_START_USED_HIGH")
         self.assertEqual(evaluate_resources({**base, "ram_available_gib": 499.99}, phase="start")["reason_code"], "RAM_START_AVAILABLE_LOW")
         self.assertEqual(evaluate_resources({**base, "disk_free_gib": 9.99}, phase="start")["reason_code"], "DISK_START_FREE_LOW")
@@ -173,6 +175,81 @@ class InputAndResourceTests(unittest.TestCase):
         full = evaluate_resources({**base, "disk_free_gib": 20,
                                    "remaining_matrix_estimate_gib": 12, "full_matrix_launch": True})
         self.assertEqual(full["reason_code"], "DISK_FULL_MATRIX_INSUFFICIENT")
+
+    def test_disk_stop_only_applies_when_starting_a_new_sample_and_forecast_aliases_match(self):
+        base = {"gpu_used_gib": 0, "gpu_free_gib": 100, "gpu_reserved_gib": 0,
+                "ram_available_gib": 600, "rss_gib": 1, "swap_used_gib": 0}
+        for key in ("disk_free_gib", "free_disk_gib"):
+            with self.subTest(key=key):
+                snapshot = {**base, key: 4.99, "mean_success_sample_bytes": 1 * 1024**3, "remaining_samples": 1}
+                self.assertEqual(evaluate_resources(snapshot, starting_new_sample=True)["reason_code"], "DISK_FREE_LOW")
+                self.assertEqual(evaluate_resources(snapshot, starting_new_sample=False)["status"], "WARNING")
+                self.assertNotEqual(evaluate_resources(snapshot, starting_new_sample=False)["reason_code"], "DISK_FREE_LOW")
+        for count in (1.5, -1, "3", True, None, float("inf")):
+            with self.subTest(count=count):
+                result = evaluate_resources({**base, "disk_free_gib": 20, "remaining_samples": count})
+                self.assertEqual(result["reason_code"], "RESOURCE_SNAPSHOT_NONFINITE")
+        for mean in (-1, "x", None, float("inf"), float("nan")):
+            with self.subTest(mean=mean):
+                result = evaluate_resources({**base, "disk_free_gib": 20, "remaining_samples": 1, "mean_success_sample_bytes": mean})
+                self.assertEqual(result["reason_code"], "RESOURCE_SNAPSHOT_NONFINITE")
+
+    def test_exact_resource_boundaries_and_independent_growth_counters(self):
+        safe = {"gpu_used_gib": 75, "gpu_free_gib": 20, "gpu_reserved_gib": 65,
+                "gpu_peak_allocated_gib": 35, "gpu_peak_nvml_used_gib": 45,
+                "ram_available_gib": 300, "rss_gib": 160, "swap_used_gib": 0,
+                "disk_free_gib": 5, "forecast_free_gib": 6}
+        safe_result = evaluate_resources(safe, starting_new_sample=True)
+        self.assertNotIn("DISK_FREE_LOW", {x["code"] for x in safe_result["hard_stop_reasons"]})
+        self.assertEqual(evaluate_resources({**safe, "gpu_used_gib": 60, "gpu_free_gib": 35,
+                                              "ram_available_gib": 400, "rss_gib": 100,
+                                              "disk_free_gib": 8, "forecast_free_gib": 6})["status"], "OK")
+        gpu_only = evaluate_resources({**safe, "gpu_cleanup_growth_gib": 2.01,
+                                       "gpu_consecutive_growth_samples": 2,
+                                       "ram_cleanup_growth_gib": 11,
+                                       "ram_consecutive_growth_samples": 1})
+        self.assertEqual(gpu_only["reason_code"], "GPU_CLEANUP_GROWTH")
+        ram_only = evaluate_resources({**safe, "gpu_cleanup_growth_gib": 2.01,
+                                       "gpu_consecutive_growth_samples": 1,
+                                       "ram_cleanup_growth_gib": 11,
+                                       "ram_consecutive_growth_samples": 2})
+        self.assertEqual(ram_only["reason_code"], "RAM_CLEANUP_GROWTH")
+
+    def test_phase_specific_start_smoke_and_pilot_gates(self):
+        loaded = {"gpu_used_gib": 20, "gpu_free_gib": 80, "gpu_reserved_gib": 20,
+                  "ram_available_gib": 600, "rss_gib": 1, "swap_used_gib": 0,
+                  "disk_free_gib": 20, "forecast_free_gib": 20,
+                  "gpu_peak_allocated_gib": 35.01, "gpu_peak_nvml_used_gib": 45.01}
+        self.assertEqual(evaluate_resources(loaded, phase="resource-smoke")["reason_code"], "GPU_SMOKE_PEAK_ALLOCATED_HIGH")
+        self.assertEqual(evaluate_resources(loaded, phase="pilot")["status"], "OK")
+        self.assertEqual(evaluate_resources({**loaded, "gpu_used_gib": 1.01}, phase="startup")["reason_code"], "GPU_START_USED_HIGH")
+        self.assertEqual(evaluate_resources({**loaded, "gpu_used_gib": 0, "ram_available_gib": 499.99}, phase="preload")["reason_code"], "RAM_START_AVAILABLE_LOW")
+        self.assertEqual(evaluate_resources({**loaded, "gpu_used_gib": 0, "disk_free_gib": 9.99}, phase="startup")["reason_code"], "DISK_START_FREE_LOW")
+
+    def test_resize_failure_is_explicit_and_not_silently_nearest(self):
+        frame = np.zeros((8, 8, 1), dtype=np.float32)
+        with self.assertRaisesRegex(RuntimeError, "official.*resize"):
+            preprocess_frame(frame, size=4)
+        with self.assertRaisesRegex(RuntimeError, "official.*resize"):
+            preprocess_frame(frame, size=4, resize_backend=lambda *_: (_ for _ in ()).throw(RuntimeError("official resize failed")))
+        def internal_type_error(*_args):
+            raise TypeError("backend computation failed")
+        with self.assertRaisesRegex(TypeError, "backend computation failed"):
+            preprocess_frame(frame, size=4, resize_backend=internal_type_error)
+
+    def test_full_matrix_requires_estimate_and_equality_fails(self):
+        base = {"gpu_used_gib": 0, "gpu_free_gib": 100, "gpu_reserved_gib": 0,
+                "ram_available_gib": 600, "rss_gib": 1, "swap_used_gib": 0,
+                "disk_free_gib": 18, "forecast_free_gib": 20}
+        for estimate in (None, -1, "bad", float("inf")):
+            sample = dict(base)
+            if estimate is not None: sample["remaining_matrix_estimate_gib"] = estimate
+            result = evaluate_resources(sample, phase="full-matrix")
+            self.assertEqual(result["reason_code"], "DISK_FULL_MATRIX_INSUFFICIENT")
+        self.assertEqual(evaluate_resources({**base, "disk_free_gib": 18,
+                                             "remaining_matrix_estimate_gib": 10}, phase="full-matrix")["reason_code"], "DISK_FULL_MATRIX_INSUFFICIENT")
+        self.assertEqual(evaluate_resources({**base, "disk_free_gib": 18.001,
+                                             "remaining_matrix_estimate_gib": 10}, phase="full-matrix")["status"], "OK")
 
     def test_run_status_is_canonical_and_contains_terminal_evidence(self):
         payload = build_run_status("AWAITING_REVIEW", reason_code="PILOT_COMPLETE",

@@ -177,10 +177,7 @@ def preprocess_frame(frame: Any, *, size: int | tuple[int, int] = 256, resize_ba
     if (resized_h, resized_w) == (height, width):
         resized = source.copy()
     elif resize_backend is not None:
-        try:
-            resized = np.asarray(resize_backend(source, resized_w, resized_h))
-        except TypeError:
-            resized = np.asarray(resize_backend(source, (resized_h, resized_w)))
+        resized = np.asarray(resize_backend(source, resized_w, resized_h))
         if resized.shape != (resized_h, resized_w, source.shape[2]):
             raise ValueError("resize backend returned the wrong HWC shape")
         if resized.dtype != source.dtype:
@@ -192,10 +189,8 @@ def preprocess_frame(frame: Any, *, size: int | tuple[int, int] = 256, resize_ba
             tensor = torch.from_numpy(np.ascontiguousarray(source)).permute(2, 0, 1)
             resized_tensor = tv_resize(tensor, [resized_h, resized_w], interpolation=InterpolationMode.BICUBIC, antialias=True)
             resized = resized_tensor.permute(1, 2, 0).cpu().numpy().astype(source.dtype, copy=False)
-        except (ImportError, ModuleNotFoundError, RuntimeError):
-            rows = np.minimum((np.arange(resized_h) + 0.5) * height / resized_h, height - 1).astype(int)
-            cols = np.minimum((np.arange(resized_w) + 0.5) * width / resized_w, width - 1).astype(int)
-            resized = source[rows[:, None], cols[None, :], :]
+        except Exception as error:
+            raise RuntimeError("official Torchvision resize unavailable or failed; bind resize_backend") from error
     pad_h = target_h - resized_h
     pad_w = target_w - resized_w
     if pad_h < 0 or pad_w < 0:
@@ -316,30 +311,34 @@ def evaluate_resources(snapshot: Mapping[str, Any] | ResourceSnapshot, *, phase:
         hard.append(("MONITOR_FAILURE", "resource monitor reported a failure"))
     mean_bytes = _number(snapshot, "mean_success_sample_bytes", default=0.0)
     remaining_samples = _number(snapshot, "remaining_samples", default=0.0)
-    if mean_bytes < 0 or remaining_samples < 0 or not np.isfinite(mean_bytes + remaining_samples):
+    raw_mean = snapshot.get("mean_success_sample_bytes")
+    raw_remaining = snapshot.get("remaining_samples")
+    valid_mean = "mean_success_sample_bytes" not in snapshot or (not isinstance(raw_mean, bool) and isinstance(raw_mean, numbers.Real) and np.isfinite(mean_bytes) and mean_bytes >= 0)
+    valid_remaining = "remaining_samples" not in snapshot or (not isinstance(raw_remaining, bool) and isinstance(raw_remaining, numbers.Integral) and int(raw_remaining) >= 0)
+    if not valid_mean or not valid_remaining:
         hard.append(("RESOURCE_SNAPSHOT_NONFINITE", "disk forecast inputs are malformed"))
-    elif "disk_free_gib" in snapshot and (mean_bytes or remaining_samples):
+    elif ("disk_free_gib" in snapshot or "free_disk_gib" in snapshot) and (mean_bytes or remaining_samples):
         forecast = disk - (mean_bytes * remaining_samples * 1.3) / (1024 ** 3)
     matrix_estimate = _number(snapshot, "remaining_matrix_estimate_gib", default=0.0)
     full_matrix = bool(snapshot.get("full_matrix_launch", False)) or phase == "full-matrix"
-    if full_matrix and (not np.isfinite(matrix_estimate) or disk <= 1.3 * matrix_estimate + 5.0):
+    if full_matrix and ("remaining_matrix_estimate_gib" not in snapshot or not np.isfinite(matrix_estimate) or matrix_estimate < 0 or disk <= 1.3 * matrix_estimate + 5.0):
         hard.append(("DISK_FULL_MATRIX_INSUFFICIENT", "free disk must exceed 1.3 times remaining matrix estimate plus 5 GiB"))
 
-    if phase in ("start", "resource-smoke") and gpu_used > 1:
+    if phase in ("start", "startup", "preload") and gpu_used > 1:
         hard.append(("GPU_START_USED_HIGH", "GPU start used memory exceeds 1 GiB"))
     if gpu_used > 75: hard.append(("GPU_USED_HIGH", "NVML GPU used memory exceeds 75 GiB"))
     if gpu_free < 20: hard.append(("GPU_FREE_LOW", "NVML GPU free memory is below 20 GiB"))
     if gpu_reserved > 65: hard.append(("GPU_RESERVED_HIGH", "PyTorch reserved memory exceeds 65 GiB"))
-    if _number(snapshot, "gpu_peak_allocated_gib") > 35: hard.append(("GPU_SMOKE_PEAK_ALLOCATED_HIGH", "GPU smoke peak allocated exceeds 35 GiB"))
-    if _number(snapshot, "gpu_peak_nvml_used_gib") > 45: hard.append(("GPU_SMOKE_PEAK_USED_HIGH", "GPU smoke peak NVML used exceeds 45 GiB"))
-    if phase in ("start", "resource-smoke") and ram_available < 500:
+    if phase == "resource-smoke" and _number(snapshot, "gpu_peak_allocated_gib") > 35: hard.append(("GPU_SMOKE_PEAK_ALLOCATED_HIGH", "GPU smoke peak allocated exceeds 35 GiB"))
+    if phase == "resource-smoke" and _number(snapshot, "gpu_peak_nvml_used_gib") > 45: hard.append(("GPU_SMOKE_PEAK_USED_HIGH", "GPU smoke peak NVML used exceeds 45 GiB"))
+    if phase in ("start", "startup", "preload") and ram_available < 500:
         hard.append(("RAM_START_AVAILABLE_LOW", "RAM start availability is below 500 GiB"))
     if ram_available < 300: hard.append(("RAM_AVAILABLE_LOW", "available RAM is below 300 GiB"))
     if rss > 160: hard.append(("RAM_RSS_HIGH", "process RSS exceeds 160 GiB"))
     if swap > 0: hard.append(("SWAP_IN_USE", "swap is in use"))
-    if phase in ("start", "resource-smoke") and disk < 10:
+    if phase in ("start", "startup", "preload") and disk < 10:
         hard.append(("DISK_START_FREE_LOW", "disk start free space is below 10 GiB"))
-    if disk < 5: hard.append(("DISK_FREE_LOW", "disk free space is below 5 GiB"))
+    if starting_new_sample and disk < 5: hard.append(("DISK_FREE_LOW", "disk free space is below 5 GiB"))
     if gpu_consecutive >= 2 and gpu_growth > 2: hard.append(("GPU_CLEANUP_GROWTH", "GPU cleanup-baseline growth exceeds 2 GiB twice consecutively"))
     if ram_consecutive >= 2 and ram_growth > 10: hard.append(("RAM_CLEANUP_GROWTH", "RAM cleanup-baseline growth exceeds 10 GiB twice consecutively"))
 
