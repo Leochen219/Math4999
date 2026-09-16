@@ -506,13 +506,16 @@ def _run_task6_group(runtime: Any, inputs: Task6Inputs, run_dir: str | Path, *, 
     status_path = root / "run_status.json"
     hashes = _status_hashes(runtime, inputs, config_binding)
     monitor_stopped = False
+    failure_evidence: list[dict[str, Any]] = []
     def write_status(status, reason_code=None, reason=None):
         nonlocal monitor_stopped
         if monitor is not None and not monitor_stopped and hasattr(monitor, "stop"):
             try: monitor.stop()
             except Exception as error:
                 monitor_stopped = True
-                status, reason_code, reason = "RESOURCE_STOP", "MONITOR_FAILURE", str(error)
+                failure_evidence.append({"kind": "monitor_stop", "type": type(error).__name__, "message": str(error)})
+                if not (status == "RESOURCE_STOP" and reason_code == "CUDA_OOM"):
+                    status, reason_code, reason = "RESOURCE_STOP", "MONITOR_FAILURE", str(error)
             else: monitor_stopped = True
         last_resources = {}
         if monitor is not None:
@@ -529,7 +532,8 @@ def _run_task6_group(runtime: Any, inputs: Task6Inputs, run_dir: str | Path, *, 
         payload = build_run_status(status, reason_code=reason_code, reason=reason, completed=completed,
                                    failed=failed, skipped=skipped, hashes=hashes,
                                    group={"state": inputs.state, "seed": inputs.seed}, successful_samples=len(completed),
-                                   last_resource_snapshots=last_resources, smoke_run_id=smoke_run_id)
+                                   last_resource_snapshots=last_resources, smoke_run_id=smoke_run_id,
+                                   secondary_errors=failure_evidence)
         _atomic_text(status_path, canonical_json(payload) + "\n"); return payload
     with ProcessLock(root / ".runner.lock"):
         if resume and (root / "task6_plan.json").is_file() and not (root / "MANIFEST.sha256").is_file():
@@ -633,6 +637,7 @@ def _run_task6_group(runtime: Any, inputs: Task6Inputs, run_dir: str | Path, *, 
                         try: monitor.capture_sample(spec["sample_id"], "post_cleanup", 32 - len(completed), root)
                         except Exception as capture_error: secondary_errors.append({"type": type(capture_error).__name__, "message": str(capture_error), "kind": "monitor"})
                 failed.append(spec["sample_id"])
+                failure_evidence.extend({"sample_id": spec["sample_id"], **item} for item in secondary_errors)
                 payload = write_status("INTERRUPTED", "SIGNAL_INTERRUPTED", "interrupt received"); _write_manifest(root); return payload
             except Exception as primary_error:
                 secondary_errors = []
@@ -646,6 +651,7 @@ def _run_task6_group(runtime: Any, inputs: Task6Inputs, run_dir: str | Path, *, 
                         try: monitor.capture_sample(spec["sample_id"], "post_cleanup", 32 - len(completed), root)
                         except Exception as capture_error: secondary_errors.append({"type": type(capture_error).__name__, "message": str(capture_error), "kind": "monitor"})
                 failed.append(spec["sample_id"])
+                failure_evidence.append({"sample_id": spec["sample_id"], "primary": {"type": type(primary_error).__name__, "message": str(primary_error)}, "secondary": secondary_errors})
                 try:
                     samples.write_failure(spec["sample_id"], {"status": "fail", "identity": identity,
                         "spec": spec, "error": {"type": type(primary_error).__name__, "message": str(primary_error), "secondary": secondary_errors}})

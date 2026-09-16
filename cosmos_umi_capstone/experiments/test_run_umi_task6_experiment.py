@@ -252,6 +252,14 @@ class Task6RunnerTests(unittest.TestCase):
             self.assertEqual(result["status"], "RESOURCE_STOP"); self.assertEqual(result["reason_code"], "RESOURCE_CLEANUP_FAILURE")
             self.assertEqual(counts["cleanup"], 1); self.assertFalse(set(result["completed_samples"]) & set(result["failed_samples"]))
 
+    def test_public_pilot_execute_and_cleanup_failures_preserve_both_errors(self):
+        with tempfile.TemporaryDirectory() as temp:
+            api, runtime, inputs, counts, _ = self.public_chain(temp, execute_error=RuntimeError("execute primary"), cleanup_error=RuntimeError("cleanup secondary"))
+            safe = lambda: {"gpu_used_gib":0,"gpu_free_gib":100,"gpu_reserved_gib":0,"ram_available_gib":600,"rss_gib":0,"swap_used_gib":0,"disk_free_gib":20}
+            result = api.run_pilot(runtime, inputs, temp, monitor=api.ResourceMonitor(temp, gpu_sampler=safe, ram_sampler=safe, disk_sampler=safe))
+            self.assertEqual(result["status"], "RESOURCE_STOP"); self.assertEqual(result["reason_code"], "RESOURCE_CLEANUP_FAILURE"); self.assertEqual(counts["cleanup"], 1)
+            self.assertTrue(any(item.get("primary", {}).get("message") == "execute primary" and any(sec.get("message") == "cleanup secondary" for sec in item.get("secondary", [])) for item in result["secondary_errors"]))
+
     def test_public_pilot_monitor_start_failure_is_canonical_and_no_execute(self):
         with tempfile.TemporaryDirectory() as temp:
             api, runtime, inputs, counts, _ = self.public_chain(temp)
@@ -266,8 +274,15 @@ class Task6RunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             api, runtime, inputs, counts, _ = self.public_chain(temp, execute_error=MemoryError("CUDA out of memory"), cleanup_error=RuntimeError("cleanup"))
             safe = lambda: {"gpu_used_gib":0,"gpu_free_gib":100,"gpu_reserved_gib":0,"ram_available_gib":600,"rss_gib":0,"swap_used_gib":0,"disk_free_gib":20}
-            result = api.run_pilot(runtime, inputs, temp, monitor=api.ResourceMonitor(temp, gpu_sampler=safe, ram_sampler=safe, disk_sampler=safe))
+            class BrokenStop(api.ResourceMonitor):
+                def stop(self):
+                    super().stop(); raise RuntimeError("monitor stop")
+            result = api.run_pilot(runtime, inputs, temp, monitor=BrokenStop(temp, gpu_sampler=safe, ram_sampler=safe, disk_sampler=safe))
             self.assertEqual(result["status"], "RESOURCE_STOP"); self.assertEqual(result["reason_code"], "CUDA_OOM"); self.assertEqual(counts["cleanup"], 1)
+            self.assertTrue(any(item.get("kind") == "monitor_stop" for item in result["secondary_errors"]))
+            failure = next(Path(temp, "samples").glob("*/sample.json"))
+            self.assertIn("CUDA out of memory", failure.read_text())
+            self.assertIn("cleanup", failure.read_text())
 
     def test_public_pilot_post_cleanup_monitor_failure_is_monitor_stop(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -294,7 +309,7 @@ class Task6RunnerTests(unittest.TestCase):
             for sample in sorted((Path(temp) / "samples").iterdir()):
                 state = json.loads((sample / "status.json").read_text())
                 if state.get("status") == "success":
-                    first_samples[sample.name] = ([(str(p.relative_to(sample)), hashlib.sha256(p.read_bytes()).hexdigest()) for p in sorted(sample.rglob("*")) if p.is_file()], sample.stat().st_mtime_ns)
+                    first_samples[sample.name] = ([(str(p.relative_to(sample)), hashlib.sha256(p.read_bytes()).hexdigest(), p.stat().st_mtime_ns) for p in sorted(sample.rglob("*")) if p.is_file()], sample.stat().st_mtime_ns)
             self.assertEqual(len(first_samples), 2); self.assertTrue(first.get("smoke_run_id")); self.assertTrue(Path(temp, "MANIFEST.sha256").is_file())
             second = api.run_pilot(runtime, inputs, temp, resume=True,
                                    monitor=api.ResourceMonitor(temp, gpu_sampler=safe, ram_sampler=safe, disk_sampler=safe))
@@ -302,7 +317,7 @@ class Task6RunnerTests(unittest.TestCase):
             for name, (hashes, mtime) in first_samples.items():
                 sample = Path(temp, "samples", name)
                 self.assertEqual(mtime, sample.stat().st_mtime_ns)
-                self.assertEqual(hashes, [(str(p.relative_to(sample)), hashlib.sha256(p.read_bytes()).hexdigest()) for p in sorted(sample.rglob("*")) if p.is_file()])
+                self.assertEqual(hashes, [(str(p.relative_to(sample)), hashlib.sha256(p.read_bytes()).hexdigest(), p.stat().st_mtime_ns) for p in sorted(sample.rglob("*")) if p.is_file()])
 
 
 if __name__ == "__main__": unittest.main()
