@@ -104,6 +104,14 @@ class Task6RuntimeTests(unittest.TestCase):
         self.assertIn("output_full", result); self.assertEqual(runtime.seen[0]["group"], "C")
         self.assertTrue(np.array_equal(result["output_full"], inputs.for_spec(runtime.seen[0])))
 
+    def test_adapter_cleanup_uses_runtime_seam(self):
+        inputs = self.inputs(); calls = []
+        class StrictRuntime:
+            def __init__(self): self.inputs = inputs; self.request_cache = {}
+            def cleanup(self): calls.append("cleanup")
+        adapter = self.api.Task6RuntimeAdapter(StrictRuntime(), inputs); adapter.cleanup()
+        self.assertEqual(calls, ["cleanup"])
+
     def test_direction_bank_is_frozen_and_extra_direction_rejected(self):
         carrier, indexes, mask, bank = self.fixture()
         with self.assertRaises(ValueError):
@@ -210,6 +218,17 @@ class Task6RuntimeTests(unittest.TestCase):
             runtime = Runtime(); self.api._run_task6_group(runtime, inputs, temp, authorization=self.authorization(runtime, inputs), monitor=self.Monitor())
             artifact = Path(temp, "samples", "bridge_0__seed_0__baseline_pre", "raw.npy")
             artifact.write_bytes(artifact.read_bytes() + b"tampered")
+            with self.assertRaises(ValueError): self.api._run_task6_group(runtime, inputs, temp, resume=True, authorization=self.authorization(runtime, inputs), monitor=self.Monitor())
+
+    def test_resume_requires_root_manifest(self):
+        inputs = self.inputs()
+        class Runtime:
+            provenance = {"seed": 0}
+            def actual_identity(self): return {"fixture": "manifest"}
+            def execute(self, spec, inputs, *, scope="full"): return {"output_full": inputs.for_spec(spec)}
+        with tempfile.TemporaryDirectory() as temp:
+            runtime = Runtime(); self.api._run_task6_group(runtime, inputs, temp, authorization=self.authorization(runtime, inputs), monitor=self.Monitor())
+            Path(temp, "MANIFEST.sha256").unlink()
             with self.assertRaises(ValueError): self.api._run_task6_group(runtime, inputs, temp, resume=True, authorization=self.authorization(runtime, inputs), monitor=self.Monitor())
 
 

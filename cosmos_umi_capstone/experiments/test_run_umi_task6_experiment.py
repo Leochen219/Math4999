@@ -129,5 +129,32 @@ class Task6RunnerTests(unittest.TestCase):
             monitor = api.ResourceMonitor(temp, gpu_sampler=lambda: {}, ram_sampler=lambda: {}, disk_sampler=lambda: {})
             monitor.start(); monitor.stop(); self.assertFalse(monitor._thread.is_alive()); self.assertTrue(Path(temp, "gpu_samples.csv").is_file())
 
+    def test_capture_sample_evaluates_row_and_two_cleanup_growth_stop(self):
+        import run_umi_task6_experiment as api
+        values = [0]
+        def gpu(): values[0] += 3; return {"gpu_used_gib": values[0], "gpu_free_gib": 100}
+        ram = lambda: {"ram_available_gib": 600, "rss_gib": 0, "swap_used_gib": 0}
+        disk = lambda: {"disk_free_gib": 20}
+        with tempfile.TemporaryDirectory() as temp:
+            monitor = api.ResourceMonitor(temp, gpu_sampler=gpu, ram_sampler=ram, disk_sampler=disk)
+            monitor.start()
+            monitor.capture_sample("s0", "post_cleanup", 31)
+            monitor.capture_sample("s1", "post_cleanup", 30)
+            row = monitor.capture_sample("s2", "post_cleanup", 29, Path(temp))
+            self.assertEqual(row["decision_status"], "HARD_STOP")
+            monitor.stop()
+
+    def test_synchronous_sampler_failure_writes_terminal_status(self):
+        import run_umi_task6_experiment as api
+        with tempfile.TemporaryDirectory() as temp:
+            runtime = type("Runtime", (), {"actual_identity": lambda self: {"fixture": "r"}, "execute": lambda self, spec, inputs, *, scope: {"output_full": np.zeros(8, np.float32)}})()
+            inputs = type("Inputs", (), {"state": "bridge_0", "seed": 0, "identity": lambda self: {"fixture": "i"}})()
+            binding = api.build_task6_hash_binding(runtime, inputs, api.task6_binding_config(inputs))
+            Path(temp, "run_status.json").write_text(json.dumps({"status": "PREFLIGHT_COMPLETE", "phase": "RESOURCE_SMOKE", "hashes": binding}))
+            bad = lambda: (_ for _ in ()).throw(RuntimeError("sampler"))
+            good = lambda: {"gpu_used_gib": 0, "gpu_free_gib": 100, "ram_available_gib": 600, "disk_free_gib": 20}
+            result = api.run_resource_smoke(temp, lifecycle={"pre_load": lambda: None, "load": lambda: (runtime, inputs), "cleanup": lambda: None, "unload": lambda: None}, samplers={"gpu": bad, "ram": good, "disk": good})
+            self.assertEqual(result["status"], "RESOURCE_STOP")
+
 
 if __name__ == "__main__": unittest.main()

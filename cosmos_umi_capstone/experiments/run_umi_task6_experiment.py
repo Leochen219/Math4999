@@ -22,12 +22,12 @@ import numpy as np
 try:
     from .umi_task6_primitives import build_run_status, evaluate_resources
     from .umi_precision_storage import PrecisionSampleStore
-    from .umi_task6_runtime import (PreflightError, Task6Inputs, build_task6_hash_binding, task6_binding_config, preflight_task6, _run_task6_group,
+    from .umi_task6_runtime import (PreflightError, ResourceStop, Task6Inputs, build_task6_hash_binding, task6_binding_config, preflight_task6, _run_task6_group,
                                     verify_reference_reuse)
 except ImportError:
     from umi_task6_primitives import build_run_status, evaluate_resources
     from umi_precision_storage import PrecisionSampleStore
-    from umi_task6_runtime import PreflightError, Task6Inputs, build_task6_hash_binding, task6_binding_config, preflight_task6, _run_task6_group, verify_reference_reuse
+    from umi_task6_runtime import PreflightError, ResourceStop, Task6Inputs, build_task6_hash_binding, task6_binding_config, preflight_task6, _run_task6_group, verify_reference_reuse
 
 
 def _sha_file(path: Path) -> str:
@@ -148,7 +148,7 @@ class ResourceMonitor:
     def stop(self):
         self._stop.set()
         if self._thread is not None:
-            self._thread.join(timeout=5)
+            self._thread.join()
             if self._thread.is_alive(): self.failure = RuntimeError("resource monitor did not terminate")
         self._write("gpu_samples.csv", self._gpu); self._write("ram_samples.csv", self._ram); self._write("disk_samples.csv", self._disk)
         self._write("sample_resource_snapshots.csv", self._sample_rows)
@@ -170,23 +170,7 @@ class ResourceMonitor:
         snapshot = dict(self.last_resources)
         if remaining_samples is not None: snapshot["remaining_samples"] = int(remaining_samples)
         if run_dir is not None:
-            sizes = []
-            sample_root = run_dir / "samples"
-            if sample_root.is_dir():
-                for path in sorted(sample_root.iterdir()):
-                    status_path = path / "status.json"
-                    if not path.is_dir() or not status_path.is_file():
-                        continue
-                    try:
-                        state = json.loads(status_path.read_text(encoding="utf-8"))
-                        if state.get("status") != "success":
-                            continue
-                        hashes = state.get("artifact_sha256", {})
-                        if any(not (path / name).is_file() or _sha_file(path / name) != digest for name, digest in hashes.items()):
-                            continue
-                        sizes.append(sum(item.stat().st_size for item in path.rglob("*") if item.is_file()))
-                    except (OSError, ValueError, json.JSONDecodeError):
-                        continue
+            sizes = self._validated_sample_sizes(run_dir)
             if sizes: snapshot["mean_success_sample_bytes"] = float(sum(sizes) / len(sizes))
         return evaluate_resources(snapshot, phase=phase, starting_new_sample=starting_new_sample)
 
@@ -200,19 +184,37 @@ class ResourceMonitor:
             if gpu is not None:
                 if self._cleanup_gpu_baseline is None: self._cleanup_gpu_baseline = float(gpu)
                 growth = float(gpu) - self._cleanup_gpu_baseline; row["gpu_cleanup_growth_gib"] = growth
-                self._cleanup_gpu_consecutive = self._cleanup_gpu_consecutive + 1 if growth > 1.0 else 0
+                self._cleanup_gpu_consecutive = self._cleanup_gpu_consecutive + 1 if growth > 2.0 else 0
                 row["gpu_consecutive_growth_samples"] = self._cleanup_gpu_consecutive
             if rss is not None:
                 if self._cleanup_rss_baseline is None: self._cleanup_rss_baseline = float(rss)
                 growth = float(rss) - self._cleanup_rss_baseline; row["ram_cleanup_growth_gib"] = growth
-                self._cleanup_ram_consecutive = self._cleanup_ram_consecutive + 1 if growth > 1.0 else 0
+                self._cleanup_ram_consecutive = self._cleanup_ram_consecutive + 1 if growth > 10.0 else 0
                 row["ram_consecutive_growth_samples"] = self._cleanup_ram_consecutive
         if run_dir is not None:
-            decision = self.check(phase="pilot", starting_new_sample=(phase == "pre_sample"),
-                                  remaining_samples=remaining, run_dir=run_dir)
+            sizes = self._validated_sample_sizes(run_dir)
+            if sizes: row["mean_success_sample_bytes"] = float(sum(sizes) / len(sizes))
+            row["remaining_samples"] = int(remaining)
+            row["consecutive_growth_samples"] = max(row.get("gpu_consecutive_growth_samples", 0), row.get("ram_consecutive_growth_samples", 0))
+            decision = evaluate_resources(row, phase="pilot", starting_new_sample=(phase == "pre_sample"))
             row.update({"decision_status": decision.get("status"), "reason_code": decision.get("reason_code")})
         self._sample_rows.append(row)
         return row
+
+    def _validated_sample_sizes(self, run_dir: Path) -> list[int]:
+        sizes = []
+        sample_root = Path(run_dir) / "samples"
+        if not sample_root.is_dir(): return sizes
+        for path in sorted(sample_root.iterdir()):
+            status_path = path / "status.json"
+            if not path.is_dir() or not status_path.is_file(): continue
+            try:
+                state = json.loads(status_path.read_text(encoding="utf-8"))
+                hashes = state.get("artifact_sha256", {})
+                if state.get("status") == "success" and all((path / name).is_file() and _sha_file(path / name) == digest for name, digest in hashes.items()):
+                    sizes.append(sum(item.stat().st_size for item in path.rglob("*") if item.is_file()))
+            except (OSError, ValueError, json.JSONDecodeError): continue
+        return sizes
 
     def _write(self, filename: str, rows: list[dict[str, Any]]):
         path = self.root / filename
@@ -273,20 +275,14 @@ def run_resource_smoke(run_dir: str | Path, *, lifecycle: Mapping[str, Callable[
             row = {"stage": stage, "phase": phase, "status": "ERROR", "error": str(error)}
             errors.append({"stage": stage, "type": type(error).__name__, "message": str(error)})
         by_stage[stage] = row; rows.append(row); return row
-    runtime = inputs = None; baseline: Mapping[str, Any] = {}; loaded_ok = False; baseline_calls = 0; hashes = prior_hashes; stopped = False
-    def status_payload(status, reason_code, reason):
-        payload = build_run_status(status, reason_code=reason_code, reason=reason, completed=[], failed=[], skipped=[],
-            resource_snapshots={"by_stage": by_stage, "background_gpu": background._gpu, "background_ram": background._ram, "background_disk": background._disk, "last": background.last_resources},
-            hashes=dict(hashes), smoke_decision={"status": status, "reason_code": reason_code}, baseline_calls=baseline_calls,
-            disk_size_forecast={"mean_success_sample_bytes": 0, "remaining_samples": 31, "forecast_bytes": 0, "forecast_free_gib": None}, errors=errors)
-        _atomic_json(root / "smoke_stage_snapshots.json", {"stages": list(stages), "by_stage": by_stage})
-        _atomic_json(root / "run_status.json", payload); return payload
+    runtime = inputs = None; baseline: Mapping[str, Any] = {}; loaded_ok = False; load_attempted = False; baseline_calls = 0; hashes = prior_hashes; stopped = False
     try:
         lifecycle["pre_load"](); pre = sample("pre-load", "preload")
         pre_decision = evaluate_resources(pre, phase="preload")
         if pre_decision["status"] == "HARD_STOP":
             errors.append({"stage": "pre-load", "type": "ResourceStop", "message": pre_decision.get("reason", "unsafe preload")})
-            return status_payload("RESOURCE_STOP", pre_decision.get("reason_code", "RESOURCE_STOP"), pre_decision.get("reason", "unsafe preload"))
+            raise ResourceStop(pre_decision.get("reason", "unsafe preload"))
+        load_attempted = True
         loaded = lifecycle["load"]()
         if not isinstance(loaded, (tuple, list)) or len(loaded) != 2 or loaded[0] is None or loaded[1] is None: raise RuntimeError("lifecycle load must return non-None (runtime, inputs)")
         runtime, inputs = loaded; loaded_ok = True; sample("loaded")
@@ -308,11 +304,11 @@ def run_resource_smoke(run_dir: str | Path, *, lifecycle: Mapping[str, Callable[
     except BaseException as error:
         errors.append({"stage": "lifecycle", "type": type(error).__name__, "message": str(error)})
     finally:
-        if loaded_ok and "post-cleanup" not in by_stage:
+        if load_attempted and "post-cleanup" not in by_stage:
             try: lifecycle["cleanup"]()
             except BaseException as error: errors.append({"stage": "cleanup", "type": type(error).__name__, "message": str(error)})
             sample("post-cleanup")
-        if loaded_ok and "unloaded" not in by_stage:
+        if load_attempted and "unloaded" not in by_stage:
             try: lifecycle["unload"]()
             except BaseException as error: errors.append({"stage": "unload", "type": type(error).__name__, "message": str(error)})
             sample("unloaded")
@@ -334,9 +330,16 @@ def run_resource_smoke(run_dir: str | Path, *, lifecycle: Mapping[str, Callable[
     peak_nvml = max((float(row.get("gpu_peak_nvml_used_gib", row.get("gpu_used_gib", row.get("nvml_used_gib", 0)))) for row in peak_rows), default=0.0)
     by_stage.setdefault("call", {"stage": "call", "status": "N/A"})
     by_stage["call"].update({"gpu_peak_allocated_gib": peak_alloc, "gpu_peak_reserved_gib": peak_reserved, "gpu_peak_nvml_used_gib": peak_nvml})
-    gate = evaluate_resources({"gpu_used_gib": peak_nvml, "gpu_free_gib": 100, "ram_available_gib": 600,
-                               "disk_free_gib": disk_free if disk_free is not None else 20,
-                               "gpu_peak_allocated_gib": peak_alloc, "gpu_peak_nvml_used_gib": peak_nvml}, phase="resource-smoke")
+    actual_rows = [row for row in peak_rows if row.get("status") != "N/A"]
+    worst = dict(max(actual_rows, key=lambda row: float(row.get("gpu_used_gib", row.get("nvml_used_gib", 0)))) if actual_rows else {})
+    if actual_rows:
+        for key in ("gpu_free_gib", "ram_available_gib", "rss_gib", "swap_used_gib", "disk_free_gib"):
+            vals = [float(row[key]) for row in actual_rows if row.get(key) is not None]
+            if vals: worst[key] = min(vals)
+    worst.update({"gpu_used_gib": peak_nvml, "gpu_peak_allocated_gib": peak_alloc, "gpu_peak_nvml_used_gib": peak_nvml})
+    if disk_free is not None: worst["disk_free_gib"] = float(disk_free)
+    worst["mean_success_sample_bytes"] = sample_bytes; worst["remaining_samples"] = 31
+    gate = evaluate_resources(worst, phase="resource-smoke")
     if gate.get("status") == "HARD_STOP":
         errors.append({"stage": "call", "type": gate.get("reason_code", "RESOURCE_STOP"), "message": gate.get("reason", "smoke peak gate failed")})
     status = "AWAITING_RESOURCE_REVIEW" if not errors else "RESOURCE_STOP"
@@ -414,14 +417,18 @@ def authorize_pilot(run_dir: str | Path, *, expected_hashes: Mapping[str, str] |
     path = Path(run_dir) / "run_status.json"
     if not path.is_file(): raise BlockedExecution("pilot requires a prior resource-smoke status")
     status = json.loads(path.read_text(encoding="utf-8"))
-    if status.get("status") != "AWAITING_RESOURCE_REVIEW" or status.get("smoke_decision_accepted") is not True:
+    acceptance_path = Path(run_dir) / "smoke_acceptance.json"
+    acceptance = json.loads(acceptance_path.read_text(encoding="utf-8")) if acceptance_path.is_file() else status
+    if acceptance.get("status") != "AWAITING_RESOURCE_REVIEW" or acceptance.get("smoke_decision_accepted") is not True:
         raise BlockedExecution("pilot requires an explicit accepted resource-smoke decision")
-    hashes = status.get("hashes", {})
+    hashes = acceptance.get("hashes", {})
     if set(hashes) != {"code", "model", "config", "direction", "input", "noise"}:
         raise BlockedExecution("resource-smoke status has incomplete hash binding")
     if expected_hashes is not None and dict(expected_hashes) != hashes:
         raise BlockedExecution("pilot hashes do not match accepted resource smoke")
-    return status
+    if status.get("status") not in {"AWAITING_RESOURCE_REVIEW", "RESOURCE_STOP"}:
+        raise BlockedExecution("pilot status is not resumable")
+    return {**status, **acceptance, "status": "AWAITING_RESOURCE_REVIEW"}
 
 
 def accept_resource_smoke(run_dir: str | Path, *, hashes: Mapping[str, str] | None = None) -> dict[str, Any]:
@@ -434,6 +441,9 @@ def accept_resource_smoke(run_dir: str | Path, *, hashes: Mapping[str, str] | No
     if dict(hashes) != status.get("hashes", {}): raise BlockedExecution("smoke acceptance hashes do not match status")
     status["smoke_decision_accepted"] = True
     status["smoke_accepted_at_unix"] = time.time()
+    acceptance_path = path.with_name("smoke_acceptance.json")
+    _atomic_json(acceptance_path, {"status": "AWAITING_RESOURCE_REVIEW", "smoke_decision_accepted": True,
+                                   "smoke_accepted_at_unix": status["smoke_accepted_at_unix"], "hashes": dict(hashes)})
     stage = path.with_name("." + path.name + ".accept")
     stage.write_text(json.dumps(status, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(stage, path)

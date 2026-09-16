@@ -12,6 +12,7 @@ import numbers
 import os
 import tempfile
 import time
+import gc
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -225,6 +226,20 @@ class Task6RuntimeAdapter:
             raise ValueError("official runtime supports only full or module scope")
         return self.runtime.execute(request, target, scope=scope)
 
+    def cleanup(self) -> None:
+        """Release per-call state while retaining the resident validated model."""
+        method = getattr(self.runtime, "cleanup", None) or getattr(self.runtime, "reset_cache", None)
+        if callable(method): method()
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available(): torch.cuda.empty_cache()
+        except (ImportError, AttributeError):
+            pass
+        cache = getattr(self.runtime, "request_cache", None)
+        if cache:
+            raise RuntimeError("runtime request cache remains after cleanup")
+
 
 Task6Runtime = Task6RuntimeAdapter
 
@@ -427,7 +442,7 @@ def _write_manifest(root: Path) -> None:
     for path in sorted(root.rglob("*")):
         if path.is_file() and path.name not in {"MANIFEST.sha256", ".runner.lock"}:
             lines.append(f"{_file_sha(path)}  {path.relative_to(root).as_posix()}")
-    (root / "MANIFEST.sha256").write_text("\n".join(lines) + "\n", encoding="ascii")
+    _atomic_text(root / "MANIFEST.sha256", "\n".join(lines) + "\n")
 
 
 def _validate_immutable_manifest(root: Path) -> None:
@@ -508,6 +523,8 @@ def _run_task6_group(runtime: Any, inputs: Task6Inputs, run_dir: str | Path, *, 
                                    last_resource_snapshots=last_resources)
         _atomic_text(status_path, canonical_json(payload) + "\n"); return payload
     with ProcessLock(root / ".runner.lock"):
+        if resume and (root / "task6_plan.json").is_file() and not (root / "MANIFEST.sha256").is_file():
+            raise ValueError("Task 6 resume requires the immutable root MANIFEST.sha256")
         _validate_immutable_manifest(root)
         # Successful samples are immutable and must match this run's strict
         # identity before any resume call is skipped.
@@ -526,12 +543,15 @@ def _run_task6_group(runtime: Any, inputs: Task6Inputs, run_dir: str | Path, *, 
         for ordinal, spec in enumerate(plan):
             # Give incomplete prior attempts deterministic, reviewable names.
             sample_path = root / "samples" / spec["sample_id"]
-            if resume and sample_path.is_dir() and (sample_path / "status.json").is_file():
-                existing_state = json.loads((sample_path / "status.json").read_text(encoding="utf-8"))
-                if existing_state.get("status") != "success":
-                    attempt_no = 1
-                    while (sample_path.parent / f"{sample_path.name}.attempt.{attempt_no}").exists(): attempt_no += 1
-                    sample_path.rename(sample_path.parent / f"{sample_path.name}.attempt.{attempt_no}")
+            try:
+                if resume and sample_path.is_dir() and (sample_path / "status.json").is_file():
+                    existing_state = json.loads((sample_path / "status.json").read_text(encoding="utf-8"))
+                    if existing_state.get("status") != "success":
+                        attempt_no = 1
+                        while (sample_path.parent / f"{sample_path.name}.attempt.{attempt_no}").exists(): attempt_no += 1
+                        sample_path.rename(sample_path.parent / f"{sample_path.name}.attempt.{attempt_no}")
+            except Exception as error:
+                payload = write_status("FAILED", type(error).__name__, str(error)); _write_manifest(root); return payload
             try:
                 disposition = samples.prepare(spec["sample_id"], resume=resume, required_files=("sample.json",))
             except Exception as error:
@@ -542,14 +562,24 @@ def _run_task6_group(runtime: Any, inputs: Task6Inputs, run_dir: str | Path, *, 
             if monitor is not None and getattr(monitor, "failure", None) is not None:
                 payload = write_status("RESOURCE_STOP", "MONITOR_FAILURE", "resource monitor failed"); _write_manifest(root); return payload
             if monitor is not None and hasattr(monitor, "check"):
-                decision = monitor.check(phase="pilot", starting_new_sample=True,
-                                         remaining_samples=32 - len(completed), run_dir=root)
+                try:
+                    decision = monitor.check(phase="pilot", starting_new_sample=True,
+                                             remaining_samples=32 - len(completed), run_dir=root)
+                except Exception as error:
+                    payload = write_status("RESOURCE_STOP", "MONITOR_FAILURE", str(error)); _write_manifest(root); return payload
                 if decision.get("status") == "HARD_STOP":
                     payload = write_status("RESOURCE_STOP", decision.get("reason_code"), decision.get("reason")); _write_manifest(root); return payload
             if monitor is not None and hasattr(monitor, "capture_sample"):
-                monitor.capture_sample(spec["sample_id"], "pre_sample", 32 - len(completed), root)
-            with history.open("a", encoding="utf-8") as stream:
-                stream.write(canonical_json({"sample_id": spec["sample_id"], "identity": identity, "started_at_unix": time.time()}) + "\n")
+                try: capture_decision = monitor.capture_sample(spec["sample_id"], "pre_sample", 32 - len(completed), root)
+                except Exception as error:
+                    payload = write_status("RESOURCE_STOP", "MONITOR_FAILURE", str(error)); _write_manifest(root); return payload
+                if capture_decision.get("decision_status") == "HARD_STOP":
+                    payload = write_status("RESOURCE_STOP", capture_decision.get("reason_code"), "resource gate stopped before sample"); _write_manifest(root); return payload
+            try:
+                with history.open("a", encoding="utf-8") as stream:
+                    stream.write(canonical_json({"sample_id": spec["sample_id"], "identity": identity, "started_at_unix": time.time()}) + "\n")
+            except Exception as error:
+                payload = write_status("FAILED", type(error).__name__, str(error)); _write_manifest(root); return payload
             try:
                 record = dict(runtime.execute(spec, inputs, scope="full"))
                 if "output_full" not in record: raise ValueError("runtime did not return output_full")
@@ -560,10 +590,17 @@ def _run_task6_group(runtime: Any, inputs: Task6Inputs, run_dir: str | Path, *, 
                 cleanup = getattr(runtime, "cleanup", None) or getattr(runtime, "reset_cache", None)
                 if callable(cleanup): cleanup()
                 if monitor is not None and hasattr(monitor, "capture_sample"):
-                    monitor.capture_sample(spec["sample_id"], "post_cleanup", 32 - len(completed), root)
+                    try: capture_decision = monitor.capture_sample(spec["sample_id"], "post_cleanup", 32 - len(completed), root)
+                    except Exception as error:
+                        payload = write_status("RESOURCE_STOP", "MONITOR_FAILURE", str(error)); _write_manifest(root); return payload
+                    if capture_decision.get("decision_status") == "HARD_STOP":
+                        payload = write_status("RESOURCE_STOP", capture_decision.get("reason_code"), "resource cleanup growth exceeded gate"); _write_manifest(root); return payload
                 if monitor is not None and hasattr(monitor, "check"):
-                    decision = monitor.check(phase="pilot", starting_new_sample=False,
-                                             remaining_samples=32 - len(completed), run_dir=root)
+                    try:
+                        decision = monitor.check(phase="pilot", starting_new_sample=False,
+                                                 remaining_samples=32 - len(completed), run_dir=root)
+                    except Exception as error:
+                        payload = write_status("RESOURCE_STOP", "MONITOR_FAILURE", str(error)); _write_manifest(root); return payload
                     if decision.get("status") == "HARD_STOP":
                         payload = write_status("RESOURCE_STOP", decision.get("reason_code"), decision.get("reason")); _write_manifest(root); return payload
             except KeyboardInterrupt:
