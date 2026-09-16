@@ -237,7 +237,7 @@ class Task6RuntimeAdapter:
             expected_delta[~target.geometry.mask] = 0.0
         fields = {"z_bar": np.array(target.z_bar, dtype=np.float32, copy=True), "mask": np.array(target.geometry.mask, dtype=bool, copy=True),
                   "direction": direction, "actual_delta_fp32": actual_delta, "target_delta_fp32": expected_delta,
-                  "consumed_input_fp32": np.array(consumed, dtype=np.float32, copy=True), "s_z": float(target.s_z), "spec": dict(spec), "group": {"state": target.state, "seed": target.seed}, "seed": target.seed, "model_seed": target.seed}
+                  "consumed_input_fp32": np.array(consumed, dtype=np.float32, copy=True), "s_z": float(target.s_z), "spec": dict(request), "group": {"state": target.state, "seed": target.seed}, "seed": target.seed, "model_seed": target.seed}
         for name, value in fields.items():
             if name in record:
                 existing = record[name]

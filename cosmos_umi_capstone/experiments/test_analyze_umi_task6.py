@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -21,7 +22,7 @@ def _linear_records():
     z_bar = np.ones(shape, np.float32); rgb0 = np.zeros((3,2,2), np.float32)
     def evidence(sample_id, *, direction, delta, kind, alpha, sign, output, rgb):
         consumed = np.add(z_bar, delta, dtype=np.float32)
-        return {"output_full": output, "predicted_latent": np.asarray(output, np.float32).copy(), "decoded_final": rgb, "z_bar": z_bar.copy(), "mask": mask.copy(), "direction": direction.copy(), "actual_delta_fp32": np.subtract(consumed, z_bar, dtype=np.float32), "target_delta_fp32": delta.copy(), "consumed_input_fp32": consumed, "s_z": 1.0, "spec": {"sample_id": sample_id, "kind": kind, "state": "bridge_0", "seed": 0, "alpha": alpha, "sign": sign, **({"direction_id": sample_id.split("_alpha", 1)[0]} if kind == "perturbation" else {})}, "group": {"state": "bridge_0", "seed": 0}, "seed": 0, "model_seed": 0}
+        return {"output_full": output, "predicted_latent": np.asarray(output, np.float32).copy(), "decoded_final": rgb, "z_bar": z_bar.copy(), "mask": mask.copy(), "direction": direction.copy(), "actual_delta_fp32": np.subtract(consumed, z_bar, dtype=np.float32), "target_delta_fp32": delta.copy(), "consumed_input_fp32": consumed, "s_z": 1.0, "spec": {"sample_id": sample_id, "kind": kind, "state": "bridge_0", "seed": 0, "model_seed": 0, "alpha": alpha, "sign": sign, **({"direction_id": sample_id.split("_alpha", 1)[0]} if kind == "perturbation" else {})}, "group": {"state": "bridge_0", "seed": 0}, "seed": 0, "model_seed": 0}
     records = {}
     for name in ("baseline_pre", "baseline_post"):
         records[f"bridge_0__seed_0__{name}"] = evidence(name, direction=np.zeros(shape,np.float32), delta=np.zeros(shape,np.float32), kind="baseline", alpha=0.0, sign=0, output=y0.copy(), rgb=rgb0.copy())
@@ -61,6 +62,13 @@ class AnalysisTests(unittest.TestCase):
     def test_core_requires_consumed_input_evidence(self):
         records, frozen = _linear_records()
         del records["bridge_0__seed_0__v0_alpha_00_plus"]["consumed_input_fp32"]
+        with self.assertRaises(ValueError): api.analyze_task6_records(records, strict=True)
+
+    def test_normalized_id_collision_and_missing_spec_model_seed_fail_closed(self):
+        records, frozen = _linear_records()
+        with self.assertRaises(ValueError):
+            api._normalize_records({"baseline_pre": records["bridge_0__seed_0__baseline_pre"], "x__baseline_pre": records["bridge_0__seed_0__baseline_pre"]})
+        records["bridge_0__seed_0__baseline_pre"]["spec"].pop("model_seed")
         with self.assertRaises(ValueError): api.analyze_task6_records(records, strict=True)
 
     def test_missing_and_stopped_are_not_reported_as_scientific_failures(self):
@@ -183,6 +191,19 @@ class AnalysisTests(unittest.TestCase):
             result = api.analyze_decoder_replays(raw, dec)
             self.assertEqual(result["status"], "COMPLETE"); self.assertEqual(result["decoder_calls"], 16); self.assertEqual(set(result["metrics_spaces"]), {"prediction_latent", "native_rgb", "fp32_rgb", "direct_float_condition_latent", "uint8_sim_condition_latent"}); self.assertTrue(result["tensors"])
             summaries = [row for row in result["space_metrics"] if row.get("status") == "SUMMARY"]; self.assertTrue(summaries); self.assertTrue(all("plus_slope" in row and "next_secant_cosine" not in row for row in summaries))
+            # A partial decoder evidence tree remains analyzable only as an
+            # explicit field-level N/A; it must not silently lose its summary.
+            missing = root / "decoder_missing"
+            shutil.copytree(dec, missing)
+            next(missing.glob("*baseline_pre__native_bf16/decoded_final_float32.npy")).unlink()
+            entries = []
+            for path in sorted(missing.rglob("*")):
+                if path.is_file() and path.name != "MANIFEST.sha256":
+                    entries.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.relative_to(missing).as_posix()}\n")
+            (missing / "MANIFEST.sha256").write_text("".join(entries), encoding="ascii")
+            partial = api.analyze_decoder_replays(raw, missing)
+            self.assertEqual(partial["status"], "COMPLETE")
+            self.assertTrue(any(row.get("status") == "N/A" and row.get("reason") == "missing_pair" and row.get("candidate_status") == "N/A" for row in partial["space_metrics"]))
 
 
 if __name__ == "__main__": unittest.main()

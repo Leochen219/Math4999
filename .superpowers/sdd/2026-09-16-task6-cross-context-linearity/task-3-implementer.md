@@ -166,3 +166,33 @@ Ran 132 tests in 35.034s ... OK
 
 Latest implementation commit before this report-only update:
 `cf2e674480dd1291042291ff06e917d66c2833bc`.
+
+## Review round 4 evidence boundary
+
+The public schema now requires every exact logical sample to carry complete
+spec, group, seed, model-seed, `z_bar`, mask, frozen direction, target delta,
+consumed input, and realized delta evidence. Missing consumed input, duplicate
+normalized IDs, extra IDs, or mismatched identities fail closed. Predicted
+latent fallback is now restricted to an exact four-frame block; carrier-shaped
+outputs are sliced only by the validated runtime prediction indexes. The
+adapter exposes a decoder seam that delegates to the resident runtime, and the
+decoder persists the four-frame `predicted_latent` separately from any full
+decode carrier. A public end-to-end test now performs real preflight, resource
+smoke, pilot runner/store publication of all 32 records, reload, and strict
+coefficient analysis. A real 16-record decoder tree test covers all five named
+spaces, realized input steps, derivative tensors, slopes/R2, adjacent secant
+metrics, and summary gates.
+
+Bundled interpreter verification after these changes:
+
+```text
+py_compile all experiments/*.py: PASS
+Task6 decoder + analysis + runtime focused suite: Ran 46 tests in 25.560s ... OK
+Focused Task6/Task5/precision runtime regression: Ran 138 tests in 51.871s ... OK
+```
+
+Latest implementation commit: `16d2fb26a63e2fc6b394e3ab76485173171a01a5`.
+
+The focused decoder fixture also verifies that removing a required baseline
+field produces a field-specific `N/A` summary (`reason=missing_pair`) rather
+than dropping the scientific space or fabricating a slope.

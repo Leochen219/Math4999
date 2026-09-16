@@ -89,7 +89,7 @@ def _normalize_records(records: Mapping[str, Mapping[str, Any]]) -> dict[str, di
     result: dict[str, dict[str, Any]] = {}
     for key, original in records.items():
         short = str(key).split("__")[-1]
-        if short in result and str(key) != short:
+        if short in result:
             raise ValueError(f"duplicate normalized Task 6 sample id: {short}")
         record = dict(original)
         result[short] = record
@@ -273,14 +273,14 @@ def _validate_record_identity(records: Mapping[str, Mapping[str, Any]], group: M
         if not isinstance(spec, Mapping): raise ValueError(f"sample {sample_id} spec evidence is missing")
         spec_sample = spec.get("sample_id")
         if spec_sample is None or str(spec_sample).split("__")[-1] != sample_id: raise ValueError(f"sample {sample_id} spec identity mismatch")
-        required_spec = {"sample_id", "kind", "state", "seed", "alpha", "sign"}
+        required_spec = {"sample_id", "kind", "state", "seed", "model_seed", "alpha", "sign"}
         if sample_id.startswith("baseline_"):
             if set(spec) < required_spec or spec.get("kind") != "baseline" or float(spec.get("alpha")) != 0.0 or int(spec.get("sign")) != 0: raise ValueError(f"sample {sample_id} baseline spec is incomplete")
         else:
             required_spec.add("direction_id")
             expected_direction = sample_id.split("_alpha", 1)[0]
             if set(spec) < required_spec or spec.get("kind") != "perturbation" or spec.get("direction_id") != expected_direction or float(spec.get("alpha")) not in ALPHAS or int(spec.get("sign")) not in (-1, 1): raise ValueError(f"sample {sample_id} perturbation spec is incomplete")
-        if spec.get("state") is None or int(spec.get("seed")) not in SEEDS: raise ValueError(f"sample {sample_id} spec group is invalid")
+        if spec.get("state") is None or int(spec.get("seed")) not in SEEDS or int(spec.get("model_seed")) != int(spec.get("seed")): raise ValueError(f"sample {sample_id} spec group/seed is invalid")
         item_group = record.get("group")
         if isinstance(item_group, Mapping):
             current = dict(item_group)
@@ -291,7 +291,7 @@ def _validate_record_identity(records: Mapping[str, Mapping[str, Any]], group: M
         if "seed" not in record or "model_seed" not in record: raise ValueError(f"sample {sample_id} seed evidence is missing")
         if int(record["seed"]) != int(observed_group.get("seed")) or int(record["model_seed"]) != int(observed_group.get("seed")):
             raise ValueError(f"sample {sample_id} seed/model_seed differs from group")
-        if spec.get("state") != observed_group.get("state") or int(spec.get("seed")) != int(observed_group.get("seed")):
+        if spec.get("state") != observed_group.get("state") or int(spec.get("seed")) != int(observed_group.get("seed")) or int(spec.get("model_seed")) != int(observed_group.get("seed")):
             raise ValueError(f"sample {sample_id} spec differs from group")
 
 
@@ -489,7 +489,7 @@ def analyze_decoder_replays(run_root: str | Path, decoder_root: str | Path | Non
         for space, key in values.items():
             source = source_records[precision]
             if any(item not in source or key not in source[item] for item in ("baseline_pre", "baseline_post")):
-                space_rows.append({"space": space, "precision": precision, "direction_id": "v0", "status": "N/A", "reason": "missing_pair"})
+                space_rows.append({"space": space, "precision": precision, "direction_id": "v0", "status": "N/A", "candidate_status": "N/A", "reason": "missing_pair", "failure_reasons": "baseline pre/post pair unavailable"})
                 continue
             base = source["baseline_pre"][key]; post = source["baseline_post"][key]; floor = difference_metrics(post, base)
             alpha_rows = []
@@ -526,6 +526,16 @@ def analyze_decoder_replays(run_root: str | Path, decoder_root: str | Path | Non
                 if pfit["r2"] is None or pfit["r2"] < .98: reasons.append("plus R2 below 0.98")
                 if mfit["r2"] is None or mfit["r2"] < .98: reasons.append("minus R2 below 0.98")
                 space_rows.append({"space": space, "precision": precision, "direction_id": "v0", "status": "SUMMARY", "baseline_floor_rms": floor["rms"], "plus_slope": pfit["slope"], "plus_r2": pfit["r2"], "minus_slope": mfit["slope"], "minus_r2": mfit["r2"], "candidate_status": "PASS" if not reasons else "FAIL", "failure_reasons": " | ".join(reasons)})
+            else:
+                # Keep the summary explicit when a replay is stopped or a
+                # required pair is absent.  A missing alpha must never look
+                # like a failed scientific gate, and it must not silently
+                # remove the space from the report.
+                missing = len(ALPHAS) - len(valid_rows)
+                space_rows.append({"space": space, "precision": precision, "direction_id": "v0",
+                                   "status": "N/A", "candidate_status": "N/A",
+                                   "reason": "missing_pair",
+                                   "failure_reasons": f"{missing} of {len(ALPHAS)} alpha pairs unavailable; slopes and secants are N/A"})
             space_rows.extend(alpha_rows)
     # Native-vs-FP32 RGB and direct-float-vs-uint8 condition latent contrasts.
     for logical in sorted(set(source_records["native_bf16"]) & set(source_records["temporary_fp32"])):
