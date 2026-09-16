@@ -26,11 +26,11 @@ import numpy as np
 try:
     from .umi_task5_primitives import ALPHAS, DIRECTION_IDS
     from .umi_task6_primitives import STATE_IDS, SEEDS
-    from .umi_task6_decoder import sha256_file
+    from .umi_task6_decoder import sha256_file, decoder_replay_plan, _decoder_code_sha256
 except ImportError:  # pragma: no cover
     from umi_task5_primitives import ALPHAS, DIRECTION_IDS
     from umi_task6_primitives import STATE_IDS, SEEDS
-    from umi_task6_decoder import sha256_file
+    from umi_task6_decoder import sha256_file, decoder_replay_plan, _decoder_code_sha256
 
 
 def _safe(value: Any) -> Any:
@@ -275,11 +275,18 @@ def _validate_record_identity(records: Mapping[str, Mapping[str, Any]], group: M
         if spec_sample is None or str(spec_sample).split("__")[-1] != sample_id: raise ValueError(f"sample {sample_id} spec identity mismatch")
         required_spec = {"sample_id", "kind", "state", "seed", "model_seed", "alpha", "sign"}
         if sample_id.startswith("baseline_"):
-            if set(spec) < required_spec or spec.get("kind") != "baseline" or float(spec.get("alpha")) != 0.0 or int(spec.get("sign")) != 0: raise ValueError(f"sample {sample_id} baseline spec is incomplete")
+            if not required_spec.issubset(spec) or spec.get("kind") != "baseline" or float(spec.get("alpha")) != 0.0 or int(spec.get("sign")) != 0: raise ValueError(f"sample {sample_id} baseline spec is incomplete")
         else:
             required_spec.add("direction_id")
-            expected_direction = sample_id.split("_alpha", 1)[0]
-            if set(spec) < required_spec or spec.get("kind") != "perturbation" or spec.get("direction_id") != expected_direction or float(spec.get("alpha")) not in ALPHAS or int(spec.get("sign")) not in (-1, 1): raise ValueError(f"sample {sample_id} perturbation spec is incomplete")
+            expected_direction, suffix = sample_id.split("_alpha", 1) if "_alpha" in sample_id else ("", "")
+            tokens = suffix.lstrip("_").split("_")
+            try: ordinal = int(tokens[0]); expected_sign = 1 if tokens[1] == "plus" else -1 if tokens[1] == "minus" else None
+            except (IndexError, TypeError, ValueError): ordinal, expected_sign = -1, None
+            expected_alpha = ALPHAS[ordinal] if 0 <= ordinal < len(ALPHAS) else None
+            if (not required_spec.issubset(spec) or spec.get("kind") != "perturbation" or
+                    spec.get("direction_id") != expected_direction or expected_alpha is None or
+                    float(spec.get("alpha")) != float(expected_alpha) or int(spec.get("sign")) != expected_sign):
+                raise ValueError(f"sample {sample_id} perturbation spec is incomplete or misbound")
         if spec.get("state") is None or int(spec.get("seed")) not in SEEDS or int(spec.get("model_seed")) != int(spec.get("seed")): raise ValueError(f"sample {sample_id} spec group/seed is invalid")
         item_group = record.get("group")
         if isinstance(item_group, Mapping):
@@ -379,13 +386,18 @@ def analyze_task6_records(records: Mapping[str, Mapping[str, Any]], *, plan_deta
 def _manifest_entries(root: Path, *, exclude: set[str] | None = None, include_bundle: bool = False) -> dict[str, str]:
     excluded = set(exclude or ()) | {"MANIFEST.sha256", ".runner.lock"}
     if not include_bundle: excluded.add("review_bundle.zip")
-    return {path.relative_to(root).as_posix(): sha256_file(path)
-            for path in sorted(root.rglob("*")) if path.is_file() and path.name not in excluded}
+    entries = {}
+    for path in sorted(root.rglob("*")):
+        if not path.is_file(): continue
+        relative = path.relative_to(root).as_posix()
+        if relative in excluded: continue
+        entries[relative] = sha256_file(path)
+    return entries
 
 
 def _analysis_source_sha() -> str:
     digest = hashlib.sha256(); source_root = Path(__file__).parent
-    for name in ("umi_task6_decoder.py", "analyze_umi_task6.py", "umi_task6_runtime.py", "run_umi_task6_experiment.py", "umi_task6_primitives.py", "umi_task5_primitives.py", "umi_task5_runtime.py", "umi_precision_runtime.py", "umi_precision_official.py", "umi_precision_storage.py"):
+    for name in ("umi_task6_decoder.py", "umi_task5_decoder.py", "analyze_umi_task6.py", "umi_task6_runtime.py", "run_umi_task6_experiment.py", "umi_task6_primitives.py", "umi_task5_primitives.py", "umi_task5_runtime.py", "umi_precision_runtime.py", "umi_precision_official.py", "umi_precision_storage.py"):
         path = source_root / name
         if path.is_file(): digest.update(name.encode()); digest.update(path.read_bytes())
     return digest.hexdigest()
@@ -440,16 +452,45 @@ def analyze_decoder_replays(run_root: str | Path, decoder_root: str | Path | Non
     if not status_path.is_file(): return {"status": "NOT_RUN", "metrics": [], "reason": "decoder status is absent"}
     status = json.loads(status_path.read_text(encoding="utf-8"))
     if status.get("status") != "COMPLETE": return {"status": "NOT_RUN", "metrics": [], "reason": "decoder stopped or incomplete", "status_record": status}
+    try:
+        raw_snapshot = verify_raw_manifest(raw)
+        raw_status_path = raw / "run_status.json"
+        if not raw_status_path.is_file(): raise ValueError("raw status is missing")
+        raw_status = json.loads(raw_status_path.read_text(encoding="utf-8"))
+        raw_group = raw_status.get("group")
+        if raw_status.get("status") not in {"AWAITING_REVIEW", "COMPLETE"} or not isinstance(raw_group, Mapping):
+            raise ValueError("raw run is not complete")
+        raw_records = _normalize_records(_load_records(raw))
+        if set(raw_records) != _required_ids() or len(raw_records) != 32:
+            raise ValueError("raw run does not contain the exact 32 Task 6 samples")
+        if expected_group is not None and dict(raw_group) != dict(expected_group):
+            raise ValueError("raw group identity mismatch")
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        return {"status": "INVALID", "metrics": [], "reason": f"raw evidence binding failed: {error}"}
     try: decoder_manifest_sha = _verify_decoder_manifest_for_analysis(root)
     except ValueError as error: return {"status": "INVALID", "metrics": [], "reason": str(error)}
     config_path = root / "decoder_config.json"
     if not config_path.is_file(): return {"status": "INVALID", "metrics": [], "reason": "decoder config is missing"}
     config = json.loads(config_path.read_text(encoding="utf-8"))
+    try:
+        state = str(config["state"]); seed = int(config["seed"])
+        expected_plan = decoder_replay_plan(state, seed)
+    except (KeyError, TypeError, ValueError) as error:
+        return {"status": "INVALID", "metrics": [], "reason": f"decoder config is incomplete: {error}"}
+    if config.get("schema_version") != "umi-task6-decoder-v2" or config.get("plan") != expected_plan:
+        return {"status": "INVALID", "metrics": [], "reason": "decoder config plan/schema mismatch"}
+    if not config.get("runtime_identity") or not config.get("encoder_identity"):
+        return {"status": "INVALID", "metrics": [], "reason": "decoder config identities are missing"}
+    if config.get("decoder_code_sha256") != _decoder_code_sha256():
+        return {"status": "INVALID", "metrics": [], "reason": "decoder code identity mismatch"}
+    if config.get("raw_manifest_sha256") != raw_snapshot["sha256"]:
+        return {"status": "INVALID", "metrics": [], "reason": "decoder is bound to a different raw manifest"}
+    if config.get("raw_group") != raw_status.get("group"):
+        return {"status": "INVALID", "metrics": [], "reason": "decoder raw group binding mismatch"}
     if expected_raw_manifest_sha is not None and config.get("raw_manifest_sha256") != expected_raw_manifest_sha:
         return {"status": "INVALID", "metrics": [], "reason": "decoder is bound to a different raw manifest"}
     if expected_group is not None and config.get("raw_group") != dict(expected_group):
         return {"status": "INVALID", "metrics": [], "reason": "decoder group identity mismatch"}
-    raw_records = _normalize_records(_load_records(raw))
     records: dict[str, dict[str, Any]] = {}
     for path in sorted(root.iterdir()):
         if not path.is_dir() or not (path / "record.json").is_file(): continue
@@ -457,6 +498,20 @@ def analyze_decoder_replays(run_root: str | Path, decoder_root: str | Path | Non
         for array_path in path.glob("*.npy"): record[array_path.stem] = np.load(array_path, allow_pickle=False)
         records[path.name] = record
     if len(records) != 16: return {"status": "INCOMPLETE", "metrics": [], "reason": f"expected 16 decoder records, found {len(records)}"}
+    expected_replays = {item["replay_id"]: item for item in expected_plan}
+    if status.get("decoder_calls") != 16 or set(status.get("records", [])) != set(expected_replays):
+        return {"status": "INVALID", "metrics": [], "reason": "decoder terminal status does not prove the exact 16-call plan"}
+    if set(records) != set(expected_replays): return {"status": "INVALID", "metrics": [], "reason": "decoder replay inventory does not match plan"}
+    for replay_id, record in records.items():
+        if record.get("status") != "success" or record.get("spec") != expected_replays[replay_id]:
+            return {"status": "INVALID", "metrics": [], "reason": f"decoder replay evidence mismatch: {replay_id}"}
+        required_arrays = ("decoder_input_full_latent", "predicted_latent", "decoded_full_float32", "decoded_final_float32", "direct_float_input", "uint8_simulated_input", "direct_condition_latent_float32", "uint8_condition_latent_float32")
+        artifact_hashes = record.get("artifact_sha256", {})
+        replay_path = root / replay_id
+        if any(name not in record for name in required_arrays) or set(artifact_hashes) != {name + ".npy" for name in required_arrays}:
+            return {"status": "INVALID", "metrics": [], "reason": f"decoder replay artifacts missing: {replay_id}"}
+        if any(not (replay_path / name).is_file() or sha256_file(replay_path / name) != digest for name, digest in artifact_hashes.items()):
+            return {"status": "INVALID", "metrics": [], "reason": f"decoder replay artifact hash mismatch: {replay_id}"}
     rows = []; space_rows: list[dict[str, Any]] = []; decoder_tensors: dict[str, np.ndarray] = {}
     for name, record in sorted(records.items()):
         arrays = [value for key, value in record.items() if key.endswith("float32") and isinstance(value, np.ndarray)]
@@ -560,7 +615,7 @@ def _verify_decoder_manifest_for_analysis(root: Path) -> str:
         target = root / parts[1]
         if not target.is_file() or sha256_file(target) != parts[0]: raise ValueError(f"decoder artifact mismatch: {parts[1]}")
         seen[parts[1]] = parts[0]
-    actual = {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file() and p.name not in {"MANIFEST.sha256", ".decoder.lock"}}
+    actual = {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file() and p.relative_to(root).as_posix() not in {"MANIFEST.sha256", ".decoder.lock"}}
     if set(seen) != actual: raise ValueError("decoder manifest inventory mismatch")
     return sha256_file(path)
 
@@ -656,7 +711,7 @@ def verify_analysis_manifest(root: str | Path) -> dict[str, Any]:
         parts = line.split("  ", 1)
         if len(parts) != 2 or len(parts[0]) != 64 or parts[1] in entries: raise ValueError("malformed analysis manifest")
         relative = Path(parts[1])
-        if relative.is_absolute() or ".." in relative.parts or relative.name == "MANIFEST.sha256": raise ValueError("unsafe analysis manifest entry")
+        if relative.is_absolute() or ".." in relative.parts or relative.as_posix() in {"MANIFEST.sha256", ".runner.lock"}: raise ValueError("unsafe analysis manifest entry")
         target = root / relative
         if not target.is_file() or sha256_file(target) != parts[0]: raise ValueError(f"analysis artifact mismatch: {parts[1]}")
         entries[parts[1]] = parts[0]

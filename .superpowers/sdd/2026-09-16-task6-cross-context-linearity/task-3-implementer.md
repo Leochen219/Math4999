@@ -196,3 +196,31 @@ Latest implementation commit: `16d2fb26a63e2fc6b394e3ab76485173171a01a5`.
 The focused decoder fixture also verifies that removing a required baseline
 field produces a field-specific `N/A` summary (`reason=missing_pair`) rather
 than dropping the scientific space or fabricating a slope.
+
+## Review round 5 evidence boundary
+
+The adapter now routes runtimes exposing only the official `model`/`ops`
+surface through the validated Task 5 `replay_decode` seam, while retaining
+the existing direct seam for testable resident runtimes. Decoder analysis
+requires the exact v2 replay schema and 16 IDs/specs, terminal call count,
+artifact hashes, decoder code identity (including `umi_task5_decoder.py`),
+and a hash-validated complete 32-sample raw run. Runtime and encoder resume
+bindings are rejected when absent or class-only. Sample IDs now bind alpha
+ordinal/value and sign, and manifest exclusions are root-relative so nested
+MANIFEST/lock files are evidence rather than silently ignored. The decoder
+fixture uses realized alpha-linear responses and asserts five named spaces,
+unit slopes/R2, near-unit secant cosine, and near-zero secant change; missing
+raw input evidence yields explicit `N/A/missing_pair` rows.
+
+Bundled interpreter verification after round 5:
+
+```text
+py_compile changed experiments: PASS
+Task6 decoder + analysis + runtime focused suite: Ran 48 tests ... OK
+Focused Task6/Task5/precision runtime regression: Ran 140 tests ... OK
+```
+
+Round 5 also adds an OfficialPrecisionRuntime-like adapter test (model/ops
+only) proving delegation to Task 5 `replay_decode`, forged decoder-plan
+rejection, exact realized-alpha linear decoder evidence, and raw-manifest
+binding before decoder analysis. No remote/model execution was performed.

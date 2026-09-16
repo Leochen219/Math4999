@@ -214,6 +214,19 @@ class Task6RuntimeAdapter:
         method = getattr(self.runtime, "actual_identity", None)
         return method() if callable(method) else {"runtime": type(self.runtime).__name__}
 
+    def decoder_state_identity(self):
+        """Expose the resident runtime identity to decoder config binding."""
+        for name in ("decoder_state_identity", "decoder_identity", "state_identity"):
+            method = getattr(self.runtime, name, None)
+            if callable(method):
+                value = method()
+                if value is not None: return value
+        model, ops = getattr(self.runtime, "model", None), getattr(self.runtime, "ops", None)
+        return {"runtime_type": f"{type(self.runtime).__module__}.{type(self.runtime).__qualname__}",
+                "model_type": None if model is None else f"{type(model).__module__}.{type(model).__qualname__}",
+                "ops_type": None if ops is None else f"{type(ops).__module__}.{type(ops).__qualname__}",
+                "actual": self.actual_identity()}
+
     def execute(self, spec: Mapping[str, Any], inputs: Task6Inputs | None = None, *, scope: str = "full"):
         target = inputs or self.inputs
         if target is not self.inputs and target.identity() != self.inputs.identity():
@@ -269,9 +282,20 @@ class Task6RuntimeAdapter:
     def decode_prediction_latent(self, latent: Any, *, precision: str):
         """Public decoder seam for Task 3 replays on the resident runtime."""
         method = getattr(self.runtime, "decode_prediction_latent", None) or getattr(self.runtime, "decode", None)
-        if not callable(method):
-            raise RuntimeError("bound runtime does not expose a validated decoder seam")
-        return method(latent, precision=precision)
+        if callable(method):
+            return method(latent, precision=precision)
+        # OfficialPrecisionRuntime intentionally exposes only its validated
+        # model/ops surface.  Reuse the Task 5 decoder implementation against
+        # that resident object instead of inventing a second decode path.
+        try:
+            from .umi_task5_decoder import replay_decode
+        except ImportError:  # pragma: no cover
+            from umi_task5_decoder import replay_decode
+        replay = replay_decode(self.runtime, latent,
+                               precision="native" if precision == "native_bf16" else "fp32")
+        if "decoder_normalized_full_output" not in replay:
+            raise RuntimeError("validated Task 5 decoder did not return normalized output")
+        return replay["decoder_normalized_full_output"]
 
     def restore_decoder_state(self) -> None:
         method = getattr(self.runtime, "restore_decoder_state", None) or getattr(self.runtime, "clear_decoder_cache", None) or getattr(self.runtime, "cleanup", None)
@@ -491,7 +515,7 @@ def _write_manifest(root: Path) -> None:
     """Write the root raw-evidence manifest without self-reference."""
     lines = []
     for path in sorted(root.rglob("*")):
-        if path.is_file() and path.name not in {"MANIFEST.sha256", ".runner.lock"}:
+        if path.is_file() and path.relative_to(root).as_posix() not in {"MANIFEST.sha256", ".runner.lock"}:
             lines.append(f"{_file_sha(path)}  {path.relative_to(root).as_posix()}")
     _atomic_text(root / "MANIFEST.sha256", "\n".join(lines) + "\n")
 

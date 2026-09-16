@@ -62,6 +62,37 @@ def sha256_file(path: str | Path) -> str:
     return digest.hexdigest()
 
 
+def _decoder_code_sha256() -> str:
+    """Bind both decoder implementations used by the public adapter seam."""
+    digest = hashlib.sha256()
+    for path in (Path(__file__), Path(__file__).with_name("umi_task5_decoder.py")):
+        digest.update(path.name.encode("utf-8")); digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def _bound_identity(value: Any) -> bool:
+    """Reject absent or class-only runtime/encoder identities."""
+    if value is None: return False
+    if isinstance(value, Mapping):
+        return len(value) > 1 or any(key not in {"type", "runtime", "class"} for key in value)
+    return False
+
+
+def _runtime_binding_identity(runtime: Any) -> Any:
+    """Return a stable, non-class-only identity for config/resume binding."""
+    value = _decoder_identity(runtime)
+    if isinstance(value, Mapping): return value
+    if value is not None:
+        typ = type(runtime)
+        return {"runtime_type": f"{typ.__module__}.{typ.__qualname__}", "decoder_state": value}
+    model, ops = getattr(runtime, "model", None), getattr(runtime, "ops", None)
+    if model is not None or ops is not None:
+        return {"runtime_type": f"{type(runtime).__module__}.{type(runtime).__qualname__}",
+                "model_type": None if model is None else f"{type(model).__module__}.{type(model).__qualname__}",
+                "ops_type": None if ops is None else f"{type(ops).__module__}.{type(ops).__qualname__}"}
+    return None
+
+
 def select_decoder_latents(state: str = "bridge_0", seed: int = 0) -> list[dict[str, Any]]:
     """Return eight and only eight logical replay selections."""
     plan = build_decoder_replay_plan(state, seed)
@@ -208,7 +239,7 @@ def _decoder_identity(runtime: Any) -> Any:
         value = getattr(runtime, name, None)
         if callable(value): return value()
     value = getattr(runtime, "decoder_state", None)
-    if isinstance(value, (str, int, float, bool, type(None))): return value
+    if isinstance(value, (str, int, float, bool)): return value
     return None
 
 
@@ -216,7 +247,11 @@ def _encoder_identity(encoder: Any) -> Any:
     for name in ("identity", "state_identity", "encoder_identity"):
         value = getattr(encoder, name, None)
         if callable(value): return value()
-    return {"type": type(encoder).__name__}
+    typ = type(encoder)
+    value = {"type": typ.__name__, "module": typ.__module__, "qualname": typ.__qualname__}
+    for name in ("dtype", "device", "model_seed"):
+        if hasattr(encoder, name): value[name] = str(getattr(encoder, name))
+    return value
 
 
 def _load_sample(root: Path, sample_id: str) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
@@ -256,12 +291,12 @@ def _verify_raw_task6(root: Path) -> tuple[str, Mapping[str, Any]]:
         if len(parts) != 2 or len(parts[0]) != 64 or parts[1] in seen:
             raise EvidenceError("malformed raw manifest")
         relative = Path(parts[1])
-        if relative.is_absolute() or ".." in relative.parts or relative.name in {"MANIFEST.sha256", ".runner.lock"}:
+        if relative.is_absolute() or ".." in relative.parts or relative.as_posix() in {"MANIFEST.sha256", ".runner.lock"}:
             raise EvidenceError("unsafe raw manifest path")
         target = root / relative
         if not target.is_file() or sha256_file(target) != parts[0]: raise EvidenceError(f"raw manifest mismatch: {parts[1]}")
         seen.add(parts[1])
-    actual = {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file() and p.name not in {"MANIFEST.sha256", ".runner.lock"}}
+    actual = {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file() and p.relative_to(root).as_posix() not in {"MANIFEST.sha256", ".runner.lock"}}
     if seen != actual: raise EvidenceError("raw manifest inventory mismatch")
     for sample_id in expected:
         sample = root / "samples" / sample_id; state_path = sample / "status.json"
@@ -280,7 +315,7 @@ def _verify_raw_task6(root: Path) -> tuple[str, Mapping[str, Any]]:
 def _decoder_manifest(root: Path) -> Path:
     entries = []
     for path in sorted(root.rglob("*")):
-        if path.is_file() and path.name not in {"MANIFEST.sha256", ".decoder.lock"}:
+        if path.is_file() and path.relative_to(root).as_posix() not in {"MANIFEST.sha256", ".decoder.lock"}:
             entries.append(f"{sha256_file(path)}  {path.relative_to(root).as_posix()}\n")
     path = root / "MANIFEST.sha256"; _atomic_text(path, "".join(entries)); return path
 
@@ -295,7 +330,7 @@ def _verify_decoder_manifest(root: Path) -> str:
             raise EvidenceError("malformed decoder manifest")
         seen.add(parts[1]); target = root / relative
         if not target.is_file() or sha256_file(target) != parts[0]: raise EvidenceError(f"decoder manifest mismatch: {parts[1]}")
-    actual = {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file() and p.name not in {"MANIFEST.sha256", ".decoder.lock"}}
+    actual = {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file() and p.relative_to(root).as_posix() not in {"MANIFEST.sha256", ".decoder.lock"}}
     if actual != seen: raise EvidenceError("decoder manifest inventory mismatch")
     return sha256_file(path)
 
@@ -310,10 +345,13 @@ def run_task6_decoder_replays(runtime: Any, run_root: str | Path, *, state: str 
     root = Path(decoder_root).resolve() if decoder_root is not None else raw_root.parent / (raw_root.name + "_decoder")
     root.mkdir(parents=True, exist_ok=True)
     plan = decoder_replay_plan(state, seed); status_path = root / "status.json"
+    runtime_identity = _runtime_binding_identity(runtime); encoder_identity = _encoder_identity(encoder)
+    if not _bound_identity(runtime_identity): raise EvidenceError("decoder runtime identity is absent or class-only")
+    if not _bound_identity(encoder_identity): raise EvidenceError("condition encoder identity is absent or class-only")
     config = {"schema_version": "umi-task6-decoder-v2", "state": state, "seed": seed, "plan": plan,
-              "runtime_identity": _decoder_identity(runtime), "encoder_identity": _encoder_identity(encoder), "raw_manifest_sha256": raw_manifest_sha,
+              "runtime_identity": runtime_identity, "encoder_identity": encoder_identity, "raw_manifest_sha256": raw_manifest_sha,
               "raw_group": raw_status.get("group"),
-              "decoder_code_sha256": sha256_file(Path(__file__)),
+              "decoder_code_sha256": _decoder_code_sha256(),
               "source": str(Path(__file__).resolve())}
     config_text = json.dumps(config, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
     config_path = root / "decoder_config.json"

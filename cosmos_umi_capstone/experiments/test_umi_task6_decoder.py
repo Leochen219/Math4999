@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import hashlib
 import json
 import tempfile
+from unittest import mock
 from pathlib import Path
 
 import numpy as np
@@ -163,6 +164,25 @@ class DecoderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             raw = Path(temporary) / "raw"; self._raw(raw); result = api.run_task6_decoder_replays(adapter, raw, encoder=Encoder(), decoder_root=Path(temporary)/"decoder")
             self.assertEqual(result["status"], "COMPLETE"); self.assertEqual(resident.decoder_state, "bf16")
+
+    def test_adapter_falls_back_to_validated_task5_replay_for_model_ops_runtime(self):
+        import umi_task6_runtime as runtime_api
+        carrier = np.ones((1, 48, 5, 16, 16), np.float32); mask = np.zeros_like(carrier, bool); mask[:, :, 0] = True
+        bank = np.zeros((3,) + carrier.shape, np.float32); bank[:, mask] = 1.0
+        directions = runtime_api._derive_frozen_directions_unpinned(bank, mask); hashes = {key: runtime_api._array_sha(value) for key, value in directions.items()}
+        inputs = runtime_api.Task6Inputs(carrier, [0], mask, bank, action=np.zeros((16, 10), np.float32), prompt="decoder", direction_hashes=hashes)
+        class OfficialLike:
+            def __init__(self):
+                self.inputs = inputs; self.model = object(); self.ops = object()
+        resident = OfficialLike(); adapter = runtime_api.Task6RuntimeAdapter(resident, inputs)
+        observed = {}
+        def validated(runtime, latent, *, precision):
+            observed["runtime"] = runtime; observed["latent"] = latent; observed["precision"] = precision
+            return {"decoder_normalized_full_output": np.zeros((3, 2, 2, 2), np.float32)}
+        with mock.patch("umi_task5_decoder.replay_decode", side_effect=validated):
+            decoded = adapter.decode_prediction_latent(np.ones((1, 48, 5, 16, 16), np.float32), precision="temporary_fp32")
+        self.assertIs(observed["runtime"], resident); self.assertEqual(observed["precision"], "fp32")
+        self.assertEqual(decoded.shape, (3, 2, 2, 2))
 
 
 if __name__ == "__main__": unittest.main()

@@ -71,6 +71,15 @@ class AnalysisTests(unittest.TestCase):
         records["bridge_0__seed_0__baseline_pre"]["spec"].pop("model_seed")
         with self.assertRaises(ValueError): api.analyze_task6_records(records, strict=True)
 
+    def test_spec_alpha_ordinal_and_sign_are_bound_to_sample_id(self):
+        records, frozen = _linear_records()
+        spec = records["bridge_0__seed_0__v0_alpha_00_plus"]["spec"]
+        spec["alpha"] = 1e-2  # extra keys cannot mask a wrong ordinal
+        with self.assertRaises(ValueError): api.analyze_task6_records(records, strict=True)
+        records, frozen = _linear_records()
+        records["bridge_0__seed_0__v0_alpha_00_plus"]["spec"]["sign"] = -1
+        with self.assertRaises(ValueError): api.analyze_task6_records(records, strict=True)
+
     def test_missing_and_stopped_are_not_reported_as_scientific_failures(self):
         result = api.analyze_task6_records({"baseline_pre": {}}, strict=False)
         self.assertEqual(result["status"], "INCOMPLETE")
@@ -170,38 +179,74 @@ class AnalysisTests(unittest.TestCase):
 
     def test_decoder_analysis_reads_sixteen_records_and_emits_five_spaces(self):
         import umi_task6_decoder as decoder_api
+        import umi_task6_primitives as task6p
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); raw = root / "raw"; dec = root / "decoder"; mask = np.ones((1,1,2,2), bool)
             logicals = ["baseline_pre", "baseline_post"] + [f"v0_alpha_{i:02d}_{s}" for i in range(3) for s in ("plus", "minus")]
             for logical in logicals:
-                sample = raw / "samples" / logical; sample.mkdir(parents=True)
+                sample_id = f"bridge_0__seed_0__{logical}"
+                sample = raw / "samples" / sample_id; sample.mkdir(parents=True)
                 delta = 0.0 if logical.startswith("baseline") else (1 if logical.endswith("plus") else -1) * float(p5.ALPHAS[int(logical.split("alpha_")[1][:2])])
                 np.save(sample / "mask.npy", mask, allow_pickle=False); np.save(sample / "actual_delta_fp32.npy", np.full(mask.shape, delta, np.float32), allow_pickle=False)
-                (sample / "sample.json").write_text(json.dumps({"sample_id": logical}), encoding="utf-8"); (sample / "status.json").write_text(json.dumps({"status":"success","artifact_sha256":{}}), encoding="utf-8")
+                (sample / "sample.json").write_text(json.dumps({"sample_id": sample_id}), encoding="utf-8"); (sample / "status.json").write_text(json.dumps({"status":"success","artifact_sha256":{}}), encoding="utf-8")
+            for item in task6p.build_generation_plan():
+                sample = raw / "samples" / item["sample_id"]
+                if sample.exists(): continue
+                sample.mkdir(parents=True)
+                np.save(sample / "output_full.npy", np.zeros((3, 2, 2, 2), np.float32), allow_pickle=False)
+                np.save(sample / "predicted_latent.npy", np.zeros((1, 48, 4, 16, 16), np.float32), allow_pickle=False)
+                (sample / "sample.json").write_text(json.dumps({"sample_id": item["sample_id"]}), encoding="utf-8")
+                hashes = {name: hashlib.sha256((sample / name).read_bytes()).hexdigest() for name in ("output_full.npy", "predicted_latent.npy")}
+                (sample / "status.json").write_text(json.dumps({"status": "success", "artifact_sha256": hashes}), encoding="utf-8")
+            raw_status = {"status": "AWAITING_REVIEW", "completed_samples": [item["sample_id"] for item in task6p.build_generation_plan()], "group": {"state": "bridge_0", "seed": 0}}
+            (raw / "run_status.json").write_text(json.dumps(raw_status), encoding="utf-8")
+            raw_entries = []
+            for path in sorted(raw.rglob("*")):
+                if path.is_file() and path.name != "MANIFEST.sha256": raw_entries.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.relative_to(raw).as_posix()}\n")
+            (raw / "MANIFEST.sha256").write_text("".join(raw_entries), encoding="ascii")
             for spec in decoder_api.decoder_replay_plan():
-                replay = dec / spec["replay_id"]; replay.mkdir(parents=True); logical = spec["sample_id"].split("__")[-1]; factor = 1.0 if logical.endswith("plus") else -1.0 if logical.endswith("minus") else 0.0
+                replay = dec / spec["replay_id"]; replay.mkdir(parents=True); logical = spec["sample_id"].split("__")[-1]
+                ordinal = int(logical.split("alpha_")[1][:2]) if "alpha_" in logical else None
+                signed_alpha = (1.0 if logical.endswith("plus") else -1.0 if logical.endswith("minus") else 0.0) * (float(p5.ALPHAS[ordinal]) if ordinal is not None else 0.0)
+                factor = signed_alpha
                 arrays = {"decoder_input_full_latent": np.full((1,1,2,2), .1 + factor * .01, np.float32), "predicted_latent": np.full((1,1,4,2,2), .15 + factor*.01, np.float32), "decoded_full_float32": np.full((3,2,2,2), .2 + factor*.01, np.float32), "decoded_final_float32": np.full((3,2,2), .2 + factor*.01, np.float32), "direct_float_input": np.full((3,2,2), .2 + factor*.01, np.float32), "uint8_simulated_input": np.full((3,2,2), .2 + factor*.01, np.float32), "direct_condition_latent_float32": np.full((1,1,2,2), .1 + factor*.01, np.float32), "uint8_condition_latent_float32": np.full((1,1,2,2), .1 + factor*.005, np.float32)}
                 for name, value in arrays.items(): np.save(replay / f"{name}.npy", value, allow_pickle=False)
-                (replay / "record.json").write_text(json.dumps({"status":"success","precision":spec["decode_precision"],"spec":spec}), encoding="utf-8")
-            (dec / "decoder_config.json").write_text(json.dumps({"raw_manifest_sha256":"raw","raw_group":{"state":"bridge_0","seed":0}}), encoding="utf-8"); (dec / "status.json").write_text(json.dumps({"status":"COMPLETE"}), encoding="utf-8")
+                artifact_hashes = {name + ".npy": hashlib.sha256((replay / (name + ".npy")).read_bytes()).hexdigest() for name in arrays}
+                (replay / "record.json").write_text(json.dumps({"status":"success","precision":spec["decode_precision"],"spec":spec,"artifact_sha256":artifact_hashes}), encoding="utf-8")
+            decoder_config = {"schema_version": "umi-task6-decoder-v2", "state": "bridge_0", "seed": 0, "plan": decoder_api.decoder_replay_plan(), "runtime_identity": {"runtime": "fixture", "model": "fixture"}, "encoder_identity": {"encoder": "fixture", "code": "fixture"}, "raw_manifest_sha256": hashlib.sha256((raw / "MANIFEST.sha256").read_bytes()).hexdigest(), "raw_group": {"state": "bridge_0", "seed": 0}, "decoder_code_sha256": decoder_api._decoder_code_sha256(), "source": "fixture"}
+            replay_ids = [item["replay_id"] for item in decoder_api.decoder_replay_plan()]
+            (dec / "decoder_config.json").write_text(json.dumps(decoder_config), encoding="utf-8"); (dec / "status.json").write_text(json.dumps({"status":"COMPLETE", "decoder_calls": 16, "records": replay_ids}), encoding="utf-8")
             entries = []
             for path in sorted(dec.rglob("*")):
                 if path.is_file(): entries.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.relative_to(dec).as_posix()}\n")
             (dec / "MANIFEST.sha256").write_text("".join(entries), encoding="ascii")
             result = api.analyze_decoder_replays(raw, dec)
             self.assertEqual(result["status"], "COMPLETE"); self.assertEqual(result["decoder_calls"], 16); self.assertEqual(set(result["metrics_spaces"]), {"prediction_latent", "native_rgb", "fp32_rgb", "direct_float_condition_latent", "uint8_sim_condition_latent"}); self.assertTrue(result["tensors"])
-            summaries = [row for row in result["space_metrics"] if row.get("status") == "SUMMARY"]; self.assertTrue(summaries); self.assertTrue(all("plus_slope" in row and "next_secant_cosine" not in row for row in summaries))
-            # A partial decoder evidence tree remains analyzable only as an
-            # explicit field-level N/A; it must not silently lose its summary.
-            missing = root / "decoder_missing"
-            shutil.copytree(dec, missing)
-            next(missing.glob("*baseline_pre__native_bf16/decoded_final_float32.npy")).unlink()
+            summaries = [row for row in result["space_metrics"] if row.get("status") == "SUMMARY"]; secants = [row for row in result["space_metrics"] if row.get("status") == "OK" and row.get("next_secant_cosine") is not None]; self.assertEqual({row["space"] for row in summaries}, set(result["metrics_spaces"])); self.assertTrue(all(row["candidate_status"] == "PASS" and abs(row["plus_slope"] - 1.0) < 1e-3 and abs(row["minus_slope"] - 1.0) < 1e-3 and row["plus_r2"] > .999 and row["minus_r2"] > .999 for row in summaries)); self.assertTrue(all(abs(row["next_secant_cosine"] - 1.0) < 1e-5 and abs(row["next_secant_relative_change"]) < 1e-2 for row in secants))
+            forged = root / "forged_decoder"; shutil.copytree(dec, forged)
+            forged_config = json.loads((forged / "decoder_config.json").read_text(encoding="utf-8")); forged_config["plan"] = forged_config["plan"][:-1]
+            (forged / "decoder_config.json").write_text(json.dumps(forged_config), encoding="utf-8")
             entries = []
-            for path in sorted(missing.rglob("*")):
-                if path.is_file() and path.name != "MANIFEST.sha256":
-                    entries.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.relative_to(missing).as_posix()}\n")
-            (missing / "MANIFEST.sha256").write_text("".join(entries), encoding="ascii")
-            partial = api.analyze_decoder_replays(raw, missing)
+            for path in sorted(forged.rglob("*")):
+                if path.is_file() and path.relative_to(forged).as_posix() != "MANIFEST.sha256": entries.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.relative_to(forged).as_posix()}\n")
+            (forged / "MANIFEST.sha256").write_text("".join(entries), encoding="ascii")
+            self.assertEqual(api.analyze_decoder_replays(raw, forged)["status"], "INVALID")
+            # A missing raw input-delta field remains analyzable only as an
+            # explicit field-level N/A; it must not silently fabricate hp/hm.
+            (raw / "samples" / "bridge_0__seed_0__v0_alpha_00_plus" / "actual_delta_fp32.npy").unlink()
+            raw_entries = []
+            for path in sorted(raw.rglob("*")):
+                if path.is_file() and path.relative_to(raw).as_posix() != "MANIFEST.sha256":
+                    raw_entries.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.relative_to(raw).as_posix()}\n")
+            (raw / "MANIFEST.sha256").write_text("".join(raw_entries), encoding="ascii")
+            decoder_config["raw_manifest_sha256"] = hashlib.sha256((raw / "MANIFEST.sha256").read_bytes()).hexdigest()
+            (dec / "decoder_config.json").write_text(json.dumps(decoder_config), encoding="utf-8")
+            entries = []
+            for path in sorted(dec.rglob("*")):
+                if path.is_file() and path.relative_to(dec).as_posix() != "MANIFEST.sha256":
+                    entries.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.relative_to(dec).as_posix()}\n")
+            (dec / "MANIFEST.sha256").write_text("".join(entries), encoding="ascii")
+            partial = api.analyze_decoder_replays(raw, dec)
             self.assertEqual(partial["status"], "COMPLETE")
             self.assertTrue(any(row.get("status") == "N/A" and row.get("reason") == "missing_pair" and row.get("candidate_status") == "N/A" for row in partial["space_metrics"]))
 
