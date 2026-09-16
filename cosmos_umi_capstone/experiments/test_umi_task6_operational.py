@@ -1,4 +1,5 @@
 import hashlib
+import errno
 import json
 import tempfile
 import unittest
@@ -43,6 +44,20 @@ class OperationalTask6Tests(unittest.TestCase):
         with self.assertRaises(self.op.OperationalEvidenceError):
             self.op.checkpoint_content_identity(object())
 
+    def test_checkpoint_content_identity_rejects_symlink_to_file(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); target = root / "checkpoint.bin"; target.write_bytes(b"model")
+            link = root / "checkpoint-link"; self._symlink_or_skip(link, target, target_is_directory=False)
+            with self.assertRaisesRegex(self.op.OperationalEvidenceError, "symlink"):
+                self.op.checkpoint_content_identity(link)
+
+    def test_checkpoint_content_identity_rejects_symlink_to_directory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); target = root / "checkpoint"; target.mkdir(); (target / "model.bin").write_bytes(b"model")
+            link = root / "checkpoint-link"; self._symlink_or_skip(link, target, target_is_directory=True)
+            with self.assertRaisesRegex(self.op.OperationalEvidenceError, "symlink"):
+                self.op.checkpoint_content_identity(link)
+
     def test_factory_rejects_missing_checkpoint(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -53,14 +68,60 @@ class OperationalTask6Tests(unittest.TestCase):
             shutil_target = checkpoint
             for child in shutil_target.iterdir(): child.unlink()
             shutil_target.rmdir()
+            video = root / "video.mp4"; video.write_bytes(b"video")
             with mock.patch.object(self.op, "_live_framework_commit", return_value=contract["framework_commit"]):
-                with self.assertRaises(self.op.OperationalEvidenceError):
+                with self.assertRaisesRegex(self.op.OperationalEvidenceError, "checkpoint path is missing or unsupported"):
                     self.op.OfficialRuntimeFactory(
                         loader=lambda **kwargs: {}, framework_root=root, checkpoint=checkpoint, vae=vae,
                         contract=contract, direction_bank=np.zeros((3, 1, 48, 5, 16, 16), np.float32),
                         action=np.zeros((16, 10), np.float32), prompt=self.op.BRIDGE0_PROMPT,
-                        video=root / "video.mp4",
+                        video=video,
                     )
+
+    def test_factory_rejects_symlink_to_file_checkpoint(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); target = root / "checkpoint.bin"; target.write_bytes(b"model")
+            link = root / "checkpoint-link"; self._symlink_or_skip(link, target, target_is_directory=False)
+            vae = root / "vae.pth"; vae.write_bytes(b"vae"); video = root / "video.mp4"; video.write_bytes(b"video")
+            contract = self._valid_factory_contract(target, vae)
+            with mock.patch.object(self.op, "_live_framework_commit", return_value=contract["framework_commit"]):
+                with self.assertRaisesRegex(self.op.OperationalEvidenceError, "symlink"):
+                    self.op.OfficialRuntimeFactory(
+                        loader=lambda **kwargs: {}, framework_root=root, checkpoint=link, vae=vae,
+                        contract=contract, direction_bank=np.zeros((3, 1, 48, 5, 16, 16), np.float32),
+                        action=np.zeros((16, 10), np.float32), prompt=self.op.BRIDGE0_PROMPT, video=video,
+                    )
+
+    def test_factory_rejects_symlink_to_directory_checkpoint(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); target = root / "checkpoint"; target.mkdir(); (target / "model.bin").write_bytes(b"model")
+            link = root / "checkpoint-link"; self._symlink_or_skip(link, target, target_is_directory=True)
+            vae = root / "vae.pth"; vae.write_bytes(b"vae"); video = root / "video.mp4"; video.write_bytes(b"video")
+            contract = self._valid_factory_contract(target, vae)
+            with mock.patch.object(self.op, "_live_framework_commit", return_value=contract["framework_commit"]):
+                with self.assertRaisesRegex(self.op.OperationalEvidenceError, "symlink"):
+                    self.op.OfficialRuntimeFactory(
+                        loader=lambda **kwargs: {}, framework_root=root, checkpoint=link, vae=vae,
+                        contract=contract, direction_bank=np.zeros((3, 1, 48, 5, 16, 16), np.float32),
+                        action=np.zeros((16, 10), np.float32), prompt=self.op.BRIDGE0_PROMPT, video=video,
+                    )
+
+    def test_factory_rejects_symlink_before_resolving_checkpoint_path(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); target = root / "checkpoint.bin"; target.write_bytes(b"model")
+            link = root / "checkpoint-link"; vae = root / "vae.pth"; vae.write_bytes(b"vae")
+            video = root / "video.mp4"; video.write_bytes(b"video")
+            contract = self._valid_factory_contract(target, vae)
+            def reports_symlink(path):
+                return path == link
+            with mock.patch.object(Path, "is_symlink", autospec=True, side_effect=reports_symlink):
+                with mock.patch.object(self.op, "_live_framework_commit", return_value=contract["framework_commit"]):
+                    with self.assertRaisesRegex(self.op.OperationalEvidenceError, "symlink"):
+                        self.op.OfficialRuntimeFactory(
+                            loader=lambda **kwargs: {}, framework_root=root, checkpoint=link, vae=vae,
+                            contract=contract, direction_bank=np.zeros((3, 1, 48, 5, 16, 16), np.float32),
+                            action=np.zeros((16, 10), np.float32), prompt=self.op.BRIDGE0_PROMPT, video=video,
+                        )
 
     def test_factory_rejects_directory_vae(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -332,8 +393,9 @@ class OperationalTask6Tests(unittest.TestCase):
     def _valid_factory_contract(self, checkpoint, vae):
         contract = self.contract()
         import umi_fd_post_vae_scan as scan
+        checkpoint_hash = scan.sha256_tree(checkpoint) if checkpoint.is_dir() else scan.sha256_file(checkpoint)
         contract.update({
-            "checkpoint_identity": {"sha256": scan.sha256_tree(checkpoint)},
+            "checkpoint_identity": {"sha256": checkpoint_hash},
             "vae_sha256": self.op.sha256_file(vae),
             "code_bundle_sha256": self.op.code_bundle_sha256(),
             "bridge_asset_hashes": dict(self.op.BRIDGE0_ASSET_SHA256),
@@ -345,6 +407,15 @@ class OperationalTask6Tests(unittest.TestCase):
             },
         })
         return contract
+
+    def _symlink_or_skip(self, link, target, *, target_is_directory):
+        try:
+            link.symlink_to(target, target_is_directory=target_is_directory)
+        except OSError as error:
+            winerror = getattr(error, "winerror", None)
+            if winerror in (5, 1314) or error.errno in (errno.EACCES, errno.EPERM):
+                self.skipTest(f"symlink creation is unavailable: {error}")
+            raise
 
 
 if __name__ == "__main__": unittest.main()

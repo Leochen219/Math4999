@@ -74,10 +74,14 @@ def checkpoint_content_identity(path: str | os.PathLike[str]) -> str:
     """Return the content hash for a regular-file or directory checkpoint."""
     try:
         candidate = Path(path)
+        if candidate.is_symlink():
+            raise OperationalEvidenceError(f"checkpoint path is an unsupported symlink: {candidate}")
         if candidate.is_file():
             return sha256_file(candidate)
         if candidate.is_dir():
             return sha256_tree(candidate)
+    except OperationalEvidenceError:
+        raise
     except (OSError, TypeError, ValueError) as error:
         label = str(path)
         raise OperationalEvidenceError(f"checkpoint content identity could not be observed: {label}") from error
@@ -410,7 +414,9 @@ class OfficialRuntimeFactory:
                  phase: str = "unknown", run_dir: str | os.PathLike[str] | None = None, resume: bool = False):
         self.loader = import_callable(loader) if isinstance(loader, str) else loader
         if not callable(self.loader): raise OperationalEvidenceError("explicit official loader is required")
-        self.framework_root, self.checkpoint, self.vae = Path(framework_root).resolve(), Path(checkpoint).resolve(), Path(vae).resolve()
+        checkpoint_source = Path(checkpoint)
+        self.framework_root, self.checkpoint, self.vae = Path(framework_root).resolve(), checkpoint_source.resolve(), Path(vae).resolve()
+        self._checkpoint_source = checkpoint_source
         if not self.framework_root.exists() or not self.vae.is_file():
             raise OperationalEvidenceError("framework/checkpoint/VAE path is missing")
         self.contract, self.direction_bank = dict(contract), np.asarray(direction_bank, dtype=np.float32)
@@ -424,7 +430,7 @@ class OfficialRuntimeFactory:
             raise OperationalEvidenceError("framework checkout HEAD differs from launch contract")
         self._unload: Callable[[], Any] | None = None
         _validate_static_contract(self.contract)
-        if self.contract["checkpoint_identity"]["sha256"] != checkpoint_content_identity(self.checkpoint):
+        if self.contract["checkpoint_identity"]["sha256"] != checkpoint_content_identity(self._checkpoint_source):
             raise OperationalEvidenceError("checkpoint identity does not match the supplied path")
         if self.contract["vae_sha256"] != sha256_file(self.vae):
             raise OperationalEvidenceError("VAE identity does not match the supplied path")
