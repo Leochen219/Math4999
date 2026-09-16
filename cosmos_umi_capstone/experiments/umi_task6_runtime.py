@@ -237,7 +237,7 @@ class Task6RuntimeAdapter:
             expected_delta[~target.geometry.mask] = 0.0
         fields = {"z_bar": np.array(target.z_bar, dtype=np.float32, copy=True), "mask": np.array(target.geometry.mask, dtype=bool, copy=True),
                   "direction": direction, "actual_delta_fp32": actual_delta, "target_delta_fp32": expected_delta,
-                  "s_z": float(target.s_z), "spec": dict(spec), "group": {"state": target.state, "seed": target.seed}, "seed": target.seed, "model_seed": target.seed}
+                  "consumed_input_fp32": np.array(consumed, dtype=np.float32, copy=True), "s_z": float(target.s_z), "spec": dict(spec), "group": {"state": target.state, "seed": target.seed}, "seed": target.seed, "model_seed": target.seed}
         for name, value in fields.items():
             if name in record:
                 existing = record[name]
@@ -247,7 +247,17 @@ class Task6RuntimeAdapter:
             record[name] = value
         if "predicted_latent" not in record:
             if "output_full" not in record: raise ValueError("runtime record lacks predicted latent/output_full")
-            record["predicted_latent"] = np.array(record["output_full"], dtype=np.float32, copy=True)
+            output_full = np.asarray(record["output_full"], dtype=np.float32)
+            if output_full.shape == target.z0.shape:
+                indexes = list(target.geometry.predicted_indexes)
+                record["predicted_latent"] = np.array(output_full[:, :, indexes, ...], dtype=np.float32, copy=True)
+                record["predicted_latent_source"] = "runtime_carrier_sliced_by_predicted_indexes"
+            else:
+                # A non-carrier output is accepted only as an already isolated
+                # prediction block from the official runtime seam.
+                if not output_full.size or not np.all(np.isfinite(output_full)): raise ValueError("runtime output_full is not a validated prediction block")
+                record["predicted_latent"] = np.array(output_full, dtype=np.float32, copy=True)
+                record["predicted_latent_source"] = "runtime_prediction_block"
         else:
             record["predicted_latent"] = np.array(record["predicted_latent"], dtype=np.float32, copy=True)
         return record

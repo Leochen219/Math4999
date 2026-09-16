@@ -117,6 +117,15 @@ class Task6RuntimeTests(unittest.TestCase):
             self.assertEqual(record["group"], {"state":"bridge_0","seed":0})
             self.assertEqual(record["predicted_latent"].dtype, np.float32)
 
+    def test_adapter_slices_carrier_fallback_using_validated_prediction_indexes(self):
+        inputs = self.inputs()
+        class StrictRuntime:
+            def __init__(self): self.inputs = inputs
+            def execute(self, spec, runtime_inputs, *, scope): return {"output_full": runtime_inputs.z0.copy()}
+        record = self.api.Task6RuntimeAdapter(StrictRuntime(), inputs).execute({"state": "bridge_0", "seed": 0, "kind": "baseline", "alpha": 0.0, "sign": 0})
+        self.assertEqual(record["predicted_latent"].shape[2], 4)
+        self.assertEqual(record["predicted_latent_source"], "runtime_carrier_sliced_by_predicted_indexes")
+
     def test_adapter_cleanup_uses_runtime_seam(self):
         inputs = self.inputs(); calls = []
         class StrictRuntime:

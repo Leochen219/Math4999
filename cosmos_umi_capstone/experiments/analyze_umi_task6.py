@@ -89,6 +89,8 @@ def _normalize_records(records: Mapping[str, Mapping[str, Any]]) -> dict[str, di
     result: dict[str, dict[str, Any]] = {}
     for key, original in records.items():
         short = str(key).split("__")[-1]
+        if short in result and str(key) != short:
+            raise ValueError(f"duplicate normalized Task 6 sample id: {short}")
         record = dict(original)
         if "predicted_latent" not in record and "output_full" in record:
             record["predicted_latent"] = record["output_full"]
@@ -157,7 +159,12 @@ def _derive_plan_detail(records: Mapping[str, Mapping[str, Any]]) -> dict[str, A
         alpha = 0.0 if sample_id.startswith("baseline_") else float(next(value for value in ALPHAS if f"alpha_{ALPHAS.index(value):02d}" in sample_id))
         sign = 0 if sample_id.startswith("baseline_") else (1 if sample_id.endswith("plus") else -1)
         expected_delta = np.multiply(np.float32(sign * alpha * s_z), expected_direction, dtype=np.float32); expected_delta[~mask] = 0.0
-        if not np.array_equal(np.asarray(item["target_delta_fp32"], np.float32), expected_delta) or not np.array_equal(np.asarray(item["actual_delta_fp32"], np.float32), expected_delta): raise ValueError(f"sample {sample_id} consumed delta mismatch")
+        target_delta = np.asarray(item["target_delta_fp32"], np.float32); actual_delta = np.asarray(item["actual_delta_fp32"], np.float32)
+        if target_delta.shape != z_bar.shape or not np.array_equal(target_delta, expected_delta): raise ValueError(f"sample {sample_id} target delta mismatch")
+        if actual_delta.shape != z_bar.shape or not np.all(np.isfinite(actual_delta)) or not np.all(actual_delta[~mask] == 0.0): raise ValueError(f"sample {sample_id} consumed delta geometry mismatch")
+        if "consumed_input_fp32" in item:
+            consumed = np.asarray(item["consumed_input_fp32"], np.float32)
+            if consumed.shape != z_bar.shape or not np.array_equal(np.subtract(consumed, z_bar, dtype=np.float32), actual_delta): raise ValueError(f"sample {sample_id} consumed input does not reproduce actual delta")
         if "s_z" in item and not math.isclose(float(item["s_z"]), s_z, rel_tol=0.0, abs_tol=1e-7): raise ValueError(f"sample {sample_id} s_z mismatch")
     return {"s_z": s_z, "combination_coefficients": {"c01": c01, "c12": c12}}
 
@@ -261,6 +268,26 @@ def _candidate32(direction_id: str, entries: list[dict[str, Any]], floor: float,
     return {"direction_id": direction_id, "quantity": quantity, "plus_slope": pfit["slope"], "plus_r2": pfit["r2"], "minus_slope": mfit["slope"], "minus_r2": mfit["r2"], "baseline_floor_rms": floor, "candidate_status": "PASS" if not reasons else "FAIL", "failure_reasons": " | ".join(reasons), "window_alphas": ",".join(str(e["alpha"]) for e in entries)}
 
 
+def _validate_record_identity(records: Mapping[str, Mapping[str, Any]], group: Mapping[str, Any] | None) -> None:
+    expected_group = dict(group or {})
+    observed_group = None
+    for sample_id, record in records.items():
+        spec = record.get("spec")
+        if isinstance(spec, Mapping):
+            if spec.get("sample_id") not in (None, sample_id): raise ValueError(f"sample {sample_id} spec identity mismatch")
+            if sample_id.startswith("baseline_"):
+                if spec.get("kind") not in (None, "baseline"): raise ValueError(f"sample {sample_id} kind mismatch")
+            elif spec.get("kind") not in (None, "perturbation"): raise ValueError(f"sample {sample_id} kind mismatch")
+        item_group = record.get("group")
+        if isinstance(item_group, Mapping):
+            current = dict(item_group)
+            if observed_group is None: observed_group = current
+            elif current != observed_group: raise ValueError("Task 6 sample groups differ")
+            if expected_group and current != expected_group: raise ValueError("Task 6 sample group differs from requested group")
+        if "seed" in record and observed_group is not None and int(record["seed"]) != int(observed_group.get("seed")):
+            raise ValueError(f"sample {sample_id} seed differs from group")
+
+
 def analyze_task6_records(records: Mapping[str, Mapping[str, Any]], *, plan_detail: Mapping[str, Any] | None = None,
                           group: Mapping[str, Any] | None = None, strict: bool = False) -> dict[str, Any]:
     """Analyze Task 6 evidence directly, with FP32 tensor arithmetic.
@@ -269,11 +296,16 @@ def analyze_task6_records(records: Mapping[str, Mapping[str, Any]], *, plan_deta
     analyzer: Task 6's subtraction order and evidence schema are part of its
     reproducibility contract.
     """
-    normalized = _normalize_records(records); missing = sorted(_required_ids() - set(normalized))
+    try: normalized = _normalize_records(records)
+    except ValueError as error:
+        if strict: raise
+        return _status_incomplete([], reason=f"invalid sample identity: {error}")
+    missing = sorted(_required_ids() - set(normalized))
     if missing:
         if strict: raise ValueError("incomplete Task 6 group: " + ", ".join(missing))
         return _status_incomplete(missing)
     try:
+        _validate_record_identity(normalized, group)
         derived = _derive_plan_detail(normalized); detail = dict(derived)
         if plan_detail is not None:
             supplied = dict(plan_detail)
@@ -284,7 +316,9 @@ def analyze_task6_records(records: Mapping[str, Mapping[str, Any]], *, plan_deta
                 if not math.isclose(float(detail["combination_coefficients"][key]), float(derived["combination_coefficients"][key]), rel_tol=0, abs_tol=1e-7): raise ValueError(f"{key} differs from saved directions")
         coefficients = detail["combination_coefficients"]; c01, c12 = float(coefficients["c01"]), float(coefficients["c12"])
         y0 = np.asarray(normalized["baseline_pre"]["predicted_latent"], dtype=np.float32); ypost = np.asarray(normalized["baseline_post"]["predicted_latent"], dtype=np.float32)
-        rgb0 = np.asarray(normalized["baseline_pre"].get("decoded_final", np.zeros((), np.float32)), dtype=np.float32); rgbpost = np.asarray(normalized["baseline_post"].get("decoded_final", rgb0), dtype=np.float32)
+        if "decoded_final" not in normalized["baseline_pre"] or "decoded_final" not in normalized["baseline_post"]: raise ValueError("decoded_final RGB evidence is missing")
+        rgb0 = np.asarray(normalized["baseline_pre"]["decoded_final"], dtype=np.float32); rgbpost = np.asarray(normalized["baseline_post"]["decoded_final"], dtype=np.float32)
+        if rgb0.shape != rgbpost.shape or not rgb0.size or not np.all(np.isfinite(rgb0)) or not np.all(np.isfinite(rgbpost)): raise ValueError("decoded_final RGB baseline evidence is invalid")
         floors = [{"quantity": "predicted_latent", "baseline_pre_post_rms": _rms32_to64(_sub32(ypost, y0)), "baseline_pre_post_max_abs": float(np.max(np.abs(_sub32(ypost, y0))) if y0.size else 0.)}, {"quantity": "decoded_final_rgb", "baseline_pre_post_rms": _rms32_to64(_sub32(rgbpost, rgb0)), "baseline_pre_post_max_abs": float(np.max(np.abs(_sub32(rgbpost, rgb0))) if rgb0.size else 0.)}]
         floors_map = {row["quantity"]: row["baseline_pre_post_rms"] for row in floors}; points: list[dict[str, Any]] = []; derivatives: list[dict[str, Any]] = []; tensors: dict[str, np.ndarray] = {}; central: dict[tuple[str, float], np.ndarray] = {}; actual_steps: dict[tuple[str, float], float] = {}; by_direction: dict[str, list[dict[str, Any]]] = {}
         for direction_id in DIRECTION_IDS:
@@ -296,8 +330,11 @@ def analyze_task6_records(records: Mapping[str, Mapping[str, Any]], *, plan_deta
                 hp, hm = _rms32_to64(pd[mask]), _rms32_to64(md[mask]); denominator = hp + hm
                 if denominator == 0: raise ValueError("Task 6 effective central-difference step is zero")
                 yp = np.asarray(plus["predicted_latent"], dtype=np.float32); ym = np.asarray(minus["predicted_latent"], dtype=np.float32); rp = _sub32(yp, y0); rm = _sub32(ym, y0); diff = _sub32(yp, ym); d = np.divide(diff, np.float32(denominator), dtype=np.float32); central[(direction_id, float(alpha))] = d; actual_steps[(direction_id, float(alpha))] = (denominator / 2.0); tensors[f"dactual_{direction_id}_{ordinal:02d}.npy"] = d
-                r_plus_rgb = _sub32(np.asarray(plus.get("decoded_final", rgb0), np.float32), rgb0); r_minus_rgb = _sub32(np.asarray(minus.get("decoded_final", rgb0), np.float32), rgb0)
-                d_rgb = np.divide(_sub32(np.asarray(plus.get("decoded_final", rgb0), np.float32), np.asarray(minus.get("decoded_final", rgb0), np.float32)), np.float32(denominator), dtype=np.float32); tensors[f"dactual_rgb_{direction_id}_{ordinal:02d}.npy"] = d_rgb
+                if "decoded_final" not in plus or "decoded_final" not in minus: raise ValueError("decoded_final RGB evidence is missing")
+                plus_rgb = np.asarray(plus["decoded_final"], np.float32); minus_rgb = np.asarray(minus["decoded_final"], np.float32)
+                if plus_rgb.shape != rgb0.shape or minus_rgb.shape != rgb0.shape: raise ValueError("decoded_final RGB shape mismatch")
+                r_plus_rgb = _sub32(plus_rgb, rgb0); r_minus_rgb = _sub32(minus_rgb, rgb0)
+                d_rgb = np.divide(_sub32(plus_rgb, minus_rgb), np.float32(denominator), dtype=np.float32); tensors[f"dactual_rgb_{direction_id}_{ordinal:02d}.npy"] = d_rgb
                 entry = {"direction_id": direction_id, "alpha": float(alpha), "h_plus_actual": hp, "h_minus_actual": hm, "h_target": float(alpha * detail["s_z"]), "plus_input_cosine": _cosine32(pd[mask], direction[mask]), "minus_input_cosine": _cosine32(md[mask], -direction[mask]), "plus_minus_input_cosine": _cosine32(pd[mask], md[mask]), "plus_outside_mask_exact": bool(np.all(pd[~mask] == 0)), "minus_outside_mask_exact": bool(np.all(md[~mask] == 0)), "input_nonzero": hp > 0 and hm > 0, "plus_predicted_latent_rms": _rms32_to64(rp), "minus_predicted_latent_rms": _rms32_to64(rm), "plus_decoded_final_rgb_rms": _rms32_to64(r_plus_rgb), "minus_decoded_final_rgb_rms": _rms32_to64(r_minus_rgb), "dactual_predicted_latent_rms": _rms32_to64(d), "dactual_decoded_final_rgb_rms": _rms32_to64(d_rgb)}; entries.append(entry)
                 for sign, record, actual, target, response, rgb_response in ((1, plus, pd, plus["target_delta_fp32"], rp, r_plus_rgb), (-1, minus, md, minus["target_delta_fp32"], rm, r_minus_rgb)):
                     target_rms = _rms32_to64(np.asarray(target, np.float32)[mask]); actual_rms = _rms32_to64(actual[mask]); points.append({"sample_id": f"{direction_id}_alpha_{ordinal:02d}_{'plus' if sign == 1 else 'minus'}", "direction_id": direction_id, "alpha": float(alpha), "sign": sign, "target_delta_rms": target_rms, "actual_delta_rms": actual_rms, "actual_over_target": None if target_rms == 0 else actual_rms / target_rms, "target_direction_cosine": _cosine32(actual[mask], np.float32(sign) * direction[mask]), "outside_mask_exact": bool(np.all(actual[~mask] == 0)), "predicted_latent_response_rms": _rms32_to64(response), "decoded_final_rgb_response_rms": _rms32_to64(rgb_response)})
@@ -434,7 +471,8 @@ def analyze_decoder_replays(run_root: str | Path, decoder_root: str | Path | Non
         source_records[str(spec.get("decode_precision"))][logical] = {**meta, **{p.stem: np.load(p, allow_pickle=False) for p in path.glob("*.npy")}}
     spaces = {"native_bf16": "native_rgb", "temporary_fp32": "fp32_rgb"}
     for precision, rgb_space in spaces.items():
-            values = {"prediction_latent": "decoder_input_full_latent", rgb_space: "decoded_final_float32", "direct_float_condition_latent": "direct_condition_latent_float32", "uint8_sim_condition_latent": "uint8_condition_latent_float32"}
+        values = {rgb_space: "decoded_final_float32", "direct_float_condition_latent": "direct_condition_latent_float32", "uint8_sim_condition_latent": "uint8_condition_latent_float32"}
+        if precision == "native_bf16": values = {"prediction_latent": "decoder_input_full_latent", **values}
         for space, key in values.items():
             source = source_records[precision]
             if any(item not in source or key not in source[item] for item in ("baseline_pre", "baseline_post")):
@@ -453,6 +491,28 @@ def analyze_decoder_replays(run_root: str | Path, decoder_root: str | Path | Non
                 if central["status"] == "OK" and actual_step:
                     decoder_tensors[f"decoder_dactual_{precision}_{space}_{ordinal:02d}.npy"] = np.divide(np.subtract(np.asarray(plus, np.float32), np.asarray(minus, np.float32), dtype=np.float32), np.float32(actual_step), dtype=np.float32)
                 alpha_rows.append({"space": space, "precision": precision, "direction_id": "v0", "alpha": float(alpha), "plus_response_rms": p["rms"], "minus_response_rms": m["rms"], "baseline_floor_rms": floor["rms"], "response_floor_ratio_plus": None if not floor["rms"] else p["rms"] / floor["rms"], "response_floor_ratio_minus": None if not floor["rms"] else m["rms"] / floor["rms"], "response_floor_ratio_reason": "zero_denominator" if not floor["rms"] else None, "input_plus_rms": hp, "input_minus_rms": hm, "gain_plus": None if not hp or p["rms"] is None else p["rms"] / hp, "gain_minus": None if not hm or m["rms"] is None else m["rms"] / hm, "central_difference_rms": d, "status": "N/A" if p["rms"] is None or m["rms"] is None or not actual_step else "OK", "reason": p.get("reason") or m.get("reason") or ("zero_denominator" if not actual_step else None)})
+            valid_rows = [row for row in alpha_rows if row.get("status") == "OK"]
+            if len(valid_rows) == len(ALPHAS):
+                for index in range(len(valid_rows) - 1):
+                    left_key = f"decoder_dactual_{precision}_{space}_{index:02d}.npy"; right_key = f"decoder_dactual_{precision}_{space}_{index+1:02d}.npy"
+                    left = decoder_tensors[left_key]; right = decoder_tensors[right_key]; denom = _rms32_to64(left)
+                    valid_rows[index]["next_secant_cosine"] = _cosine32(left, right); valid_rows[index]["next_secant_relative_change"] = None if denom == 0 else _rms32_to64(np.subtract(right, left, dtype=np.float32)) / denom
+                valid_rows[-1]["next_secant_cosine"] = None; valid_rows[-1]["next_secant_relative_change"] = None
+                pfit = _fit_loglog32([float(row["input_plus_rms"]) for row in valid_rows], [float(row["plus_response_rms"]) for row in valid_rows]); mfit = _fit_loglog32([float(row["input_minus_rms"]) for row in valid_rows], [float(row["minus_response_rms"]) for row in valid_rows])
+                reasons = []
+                for row in valid_rows:
+                    if floor["rms"] is None:
+                        reasons.append(f"alpha={row['alpha']}: baseline floor shape/nonfinite mismatch")
+                    elif floor["rms"] == 0.0:
+                        if row["plus_response_rms"] == 0.0 or row["minus_response_rms"] == 0.0: reasons.append(f"alpha={row['alpha']}: zero response with zero floor")
+                    elif row["plus_response_rms"] <= 10.0 * floor["rms"] or row["minus_response_rms"] <= 10.0 * floor["rms"]: reasons.append(f"alpha={row['alpha']}: response below 10x floor")
+                    if row.get("next_secant_cosine") is not None and row["next_secant_cosine"] < .95: reasons.append(f"alpha={row['alpha']}: secant cosine below 0.95")
+                    if row.get("next_secant_relative_change") is not None and row["next_secant_relative_change"] > .25: reasons.append(f"alpha={row['alpha']}: secant change above 0.25")
+                if pfit["slope"] is None or not .8 <= pfit["slope"] <= 1.2: reasons.append("plus slope outside [0.8,1.2]")
+                if mfit["slope"] is None or not .8 <= mfit["slope"] <= 1.2: reasons.append("minus slope outside [0.8,1.2]")
+                if pfit["r2"] is None or pfit["r2"] < .98: reasons.append("plus R2 below 0.98")
+                if mfit["r2"] is None or mfit["r2"] < .98: reasons.append("minus R2 below 0.98")
+                space_rows.append({"space": space, "precision": precision, "direction_id": "v0", "status": "SUMMARY", "baseline_floor_rms": floor["rms"], "plus_slope": pfit["slope"], "plus_r2": pfit["r2"], "minus_slope": mfit["slope"], "minus_r2": mfit["r2"], "candidate_status": "PASS" if not reasons else "FAIL", "failure_reasons": " | ".join(reasons)})
             space_rows.extend(alpha_rows)
     # Native-vs-FP32 RGB and direct-float-vs-uint8 condition latent contrasts.
     for logical in sorted(set(source_records["native_bf16"]) & set(source_records["temporary_fp32"])):
