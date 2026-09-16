@@ -42,7 +42,7 @@ PILOT_GROUP = {"state": "bridge_0", "seed": 0}
 TASK6_CODE_SOURCES = ("umi_task6_runtime.py", "run_umi_task6_experiment.py", "umi_task6_primitives.py",
     "umi_fd_post_vae_bridge.py", "umi_precision_runtime.py", "umi_precision_storage.py",
     "umi_precision_official.py", "umi_task5_runtime.py", "umi_task5_primitives.py",
-    "umi_task6_operational.py", "run_umi_task6_official.py")
+    "umi_task6_operational.py", "run_umi_task6_official.py", "umi_task6_cosmos_loader.py")
 
 
 class OperationalEvidenceError(ValueError):
@@ -200,17 +200,33 @@ def extract_task5_directions(task5_root: str | os.PathLike[str], *, expected_man
     for key, value in expected.items():
         if key in file_hashes and file_hashes[key] != value:
             raise OperationalEvidenceError(f"Task 5 direction file hash mismatch: {key}")
-    frozen_hashes = {key: sha256_array(value) for key, value in found.items()}
+    mask_path = root / "samples" / "v0_alpha_00_plus" / "mask.npy"
+    if not mask_path.is_file():
+        raise OperationalEvidenceError("Task 5 direction evidence lacks the runtime condition mask")
+    mask_status = _json(root / "samples" / "v0_alpha_00_plus" / "status.json")
+    if mask_status.get("artifact_sha256", {}).get("mask.npy") != sha256_file(mask_path):
+        raise OperationalEvidenceError("Task 5 condition mask artifact hash mismatch")
+    mask = np.load(mask_path, allow_pickle=False).astype(bool, copy=False)
+    if mask.shape != next(iter(found.values())).shape or not np.any(mask):
+        raise OperationalEvidenceError("Task 5 runtime condition mask has the wrong shape")
+    for direction, value in found.items():
+        other_mask_path = root / "samples" / f"{direction}_alpha_00_plus" / "mask.npy"
+        if not other_mask_path.is_file() or not np.array_equal(mask, np.load(other_mask_path, allow_pickle=False).astype(bool, copy=False)):
+            raise OperationalEvidenceError(f"Task 5 direction mask differs: {direction}")
+        if np.any(value[~mask]) or not np.isclose(np.sqrt(np.mean(value[mask].astype(np.float64) ** 2)), 1.0, atol=1e-6, rtol=0.0):
+            raise OperationalEvidenceError(f"Task 5 direction geometry is invalid: {direction}")
+    frozen = freeze_task5_directions(np.stack([found[k] for k in ("v0", "v1", "v2")]), mask)["directions"]
+    frozen_hashes = {key: sha256_array(value) for key, value in frozen.items()}
     for key, value in dict(expected_direction_hashes or {}).items():
         if key in frozen_hashes and frozen_hashes[key] != value:
             raise OperationalEvidenceError(f"Task 5 frozen direction hash mismatch: {key}")
     bank = np.stack([found[key] for key in ("v0", "v1", "v2")])
-    return {"bank": bank, "directions": found, "manifest_sha256": manifest_sha,
+    return {"bank": bank, "mask": mask, "directions": frozen, "manifest_sha256": manifest_sha,
             "plan_sha256": plan_sha, "direction_file_sha256": file_hashes, "direction_sha256": frozen_hashes,
             "task5_root": str(root)}
 
 
-REQUIRED_CONTRACT_KEYS = frozenset({"framework_commit", "checkpoint_identity", "vae_sha256", "torch_version", "cuda_version",
+REQUIRED_CONTRACT_KEYS = frozenset({"framework_commit", "asset_source_commit", "checkpoint_identity", "vae_sha256", "torch_version", "cuda_version",
     "code_bundle_sha256", "bridge_asset_hashes", "task5", "group", "prompt", "action", "settings", "cache_flags", "seed_routes", "geometry"})
 
 
@@ -219,8 +235,6 @@ def validate_launch_contract(contract: Mapping[str, Any], *, observed: Mapping[s
     if not isinstance(contract, Mapping) or not REQUIRED_CONTRACT_KEYS.issubset(contract):
         missing = sorted(REQUIRED_CONTRACT_KEYS - set(contract) if isinstance(contract, Mapping) else REQUIRED_CONTRACT_KEYS)
         raise OperationalEvidenceError(f"launch contract is missing required evidence: {missing}")
-    if contract["framework_commit"] != SOURCE_COMMIT:
-        raise OperationalEvidenceError("framework/dependency commit is not pinned")
     _validate_static_contract(contract)
     group = contract["group"]
     if dict(group) != PILOT_GROUP:
@@ -256,6 +270,11 @@ def validate_launch_contract(contract: Mapping[str, Any], *, observed: Mapping[s
 
 def _validate_static_contract(contract: Mapping[str, Any]) -> None:
     """Validate immutable contract fields before any runtime is loaded."""
+    framework_commit = contract.get("framework_commit")
+    if not isinstance(framework_commit, str) or len(framework_commit) != 40 or any(c not in "0123456789abcdefABCDEF" for c in framework_commit):
+        raise OperationalEvidenceError("framework git commit is missing or malformed")
+    if contract.get("asset_source_commit") != SOURCE_COMMIT:
+        raise OperationalEvidenceError("Bridge asset source commit is not pinned")
     assets = contract.get("bridge_asset_hashes")
     if assets != BRIDGE0_ASSET_SHA256:
         raise OperationalEvidenceError("bridge asset contract does not equal the pinned official hashes")
@@ -292,7 +311,8 @@ def observe_live_launch(contract: Mapping[str, Any], *, runtime: Any, inputs: An
         raise OperationalEvidenceError("runtime did not expose actual content identity")
     geometry = inputs.geometry
     observation = {
-        "framework_commit": SOURCE_COMMIT,
+        "framework_commit": _live_framework_commit(contract.get("framework_root")),
+        "asset_source_commit": SOURCE_COMMIT,
         "checkpoint_identity": {"sha256": sha256_file(checkpoint)},
         "vae_sha256": sha256_file(vae),
         "code_bundle_sha256": code_bundle_sha256(),
@@ -312,6 +332,23 @@ def observe_live_launch(contract: Mapping[str, Any], *, runtime: Any, inputs: An
         "runtime_identity": actual,
     }
     return observation
+
+
+def _live_framework_commit(framework_root: str | os.PathLike[str] | None) -> str:
+    """Read-only framework checkout identity; dirty/non-git trees fail closed."""
+    if not framework_root:
+        raise OperationalEvidenceError("framework_root is required for live commit observation")
+    import subprocess
+    path = Path(framework_root).resolve()
+    try:
+        result = subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"], check=True, capture_output=True, text=True)
+        dirty = subprocess.run(["git", "-C", str(path), "status", "--porcelain"], check=True, capture_output=True, text=True)
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise OperationalEvidenceError("framework root is not a readable git checkout") from error
+    commit = result.stdout.strip()
+    if len(commit) != 40 or any(c not in "0123456789abcdefABCDEF" for c in commit) or dirty.stdout.strip():
+        raise OperationalEvidenceError("framework checkout is dirty or has no valid HEAD")
+    return commit.lower()
 
 
 def import_callable(spec: str) -> Callable[..., Any]:
@@ -354,7 +391,8 @@ class OfficialRuntimeFactory:
 
     def build(self):
         payload = self.loader(framework_root=str(self.framework_root), checkpoint=str(self.checkpoint), vae=str(self.vae),
-                              device="cuda:0", model_seed=0, prompt=self.prompt, action=self.action.copy())
+                              device="cuda:0", model_seed=0, prompt=self.prompt, action=self.action.copy(),
+                              video=self.contract.get("bridge_video_path"), contract=dict(self.contract))
         if not isinstance(payload, Mapping) or not {"model", "data_batch"}.issubset(payload):
             raise OperationalEvidenceError("official loader must return model and data_batch")
         self._unload = payload.get("unload") if callable(payload.get("unload")) else None

@@ -18,14 +18,14 @@ try:
     from .umi_task6_operational import (OfficialRuntimeFactory, OperationalEvidenceError, extract_task5_directions,
         prepare_bridge_upload_bundle, validate_launch_contract, verify_pinned_bridge_assets, observe_live_launch,
         _validate_static_contract)
-    from .umi_task6_primitives import STATE_CATALOG
+    from .umi_task6_primitives import STATE_CATALOG, evaluate_resources
     from .umi_task6_runtime import Task6Inputs, build_task6_hash_binding, preflight_task6, task6_binding_config
     from .run_umi_task6_experiment import BlockedExecution, ResourceMonitor, accept_resource_smoke, run_pilot, run_resource_smoke
     from .umi_task6_decoder import run_task6_decoder_replays
     from .umi_fd_post_vae_bridge import sha256_array
 except ImportError:  # pragma: no cover
     from umi_task6_operational import OfficialRuntimeFactory, OperationalEvidenceError, extract_task5_directions, prepare_bridge_upload_bundle, validate_launch_contract, verify_pinned_bridge_assets, observe_live_launch, _validate_static_contract
-    from umi_task6_primitives import STATE_CATALOG
+    from umi_task6_primitives import STATE_CATALOG, evaluate_resources
     from umi_task6_runtime import Task6Inputs, build_task6_hash_binding, preflight_task6, task6_binding_config
     from run_umi_task6_experiment import BlockedExecution, ResourceMonitor, accept_resource_smoke, run_pilot, run_resource_smoke
     from umi_task6_decoder import run_task6_decoder_replays
@@ -92,6 +92,8 @@ def execute_official(args: argparse.Namespace) -> dict[str, Any]:
     # Static contract checks happen before any installed framework import.
     _validate_static_contract(contract)
     assets = verify_pinned_bridge_assets(args.action, args.video)
+    contract["bridge_video_path"] = str(Path(args.video).resolve())
+    contract["framework_root"] = str(Path(args.framework_root).resolve())
     task5 = extract_task5_directions(args.task5_root,
         expected_manifest_sha256=contract["task5"].get("manifest_sha256"),
         expected_plan_sha256=contract["task5"].get("plan_sha256"),
@@ -101,6 +103,12 @@ def execute_official(args: argparse.Namespace) -> dict[str, Any]:
                                      vae=args.vae, contract=contract, direction_bank=task5["bank"], action=load_json(args.action), prompt=contract["prompt"])
     if args.phase == "preflight":
         root = Path(args.run_dir); root.mkdir(parents=True, exist_ok=True)
+        samplers = resource_samplers(args.run_dir, gpu_index=args.gpu_index)
+        resource_sample = {"stage": "pre_load", **dict(samplers["gpu"]()), **dict(samplers["ram"]()), **dict(samplers["disk"]())}
+        resource_decision = evaluate_resources(resource_sample, phase="preload")
+        (root / "preflight_resource_samples.json").write_text(json.dumps({"samples": [resource_sample], "decision": resource_decision}, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
+        if resource_decision.get("status") == "HARD_STOP":
+            raise BlockedExecution(f"preflight resource gate stopped before model load: {resource_decision.get('reason')}")
         runtime = inputs = None
         try:
             runtime, inputs, _ = factory.build()
@@ -199,7 +207,7 @@ def parse_args(argv=None):
     parser.add_argument("--run-dir", required=True); parser.add_argument("--decoder-root"); parser.add_argument("--analysis-root")
     parser.add_argument("--launch-contract", required=True); parser.add_argument("--observed-evidence", help="optional expected snapshot; never trusted as live evidence")
     parser.add_argument("--framework-root", required=True); parser.add_argument("--checkpoint", required=True); parser.add_argument("--vae", required=True)
-    parser.add_argument("--loader", required=True, help="installed official adapter module:function")
+    parser.add_argument("--loader", default="umi_task6_cosmos_loader:load_task6_cosmos_runtime", help="installed official adapter module:function")
     parser.add_argument("--action", required=True); parser.add_argument("--video", required=True); parser.add_argument("--task5-root", required=True)
     parser.add_argument("--gpu-index", type=int, default=0); parser.add_argument("--resume", action="store_true")
     return parser.parse_args(argv)

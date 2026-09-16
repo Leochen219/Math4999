@@ -56,10 +56,12 @@ class OperationalTask6Tests(unittest.TestCase):
             root = Path(temp); (root / "samples").mkdir()
             for direction in ("v0", "v1", "v2"):
                 sample = root / "samples" / f"{direction}_alpha_00_plus"; sample.mkdir()
-                arr = np.ones((1, 48, 5, 16, 16), np.float32) * (len(direction) + 1)
+                arr = np.zeros((1, 48, 5, 16, 16), np.float32)
+                mask = np.zeros_like(arr, dtype=bool); mask[:, :, 0] = True; arr[mask] = 1.0
                 np.save(sample / "direction.npy", arr)
+                np.save(sample / "mask.npy", mask)
                 (sample / "sample.json").write_text("{}")
-                hashes = {name: hashlib.sha256((sample / name).read_bytes()).hexdigest() for name in ("direction.npy", "sample.json")}
+                hashes = {name: hashlib.sha256((sample / name).read_bytes()).hexdigest() for name in ("direction.npy", "mask.npy", "sample.json")}
                 (sample / "status.json").write_text(json.dumps({"status": "success", "artifact_sha256": hashes}))
             plan = {"status": "complete", "plan": [{"sample_id": f"s{i}"} for i in range(32)]}; (root / "task5_plan.json").write_text(json.dumps(plan))
             (root / "status.json").write_text(json.dumps({"status": "complete", "formal_successful": 32}))
@@ -68,7 +70,7 @@ class OperationalTask6Tests(unittest.TestCase):
                 if path.is_file(): entries.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.relative_to(root).as_posix()}")
             (root / "MANIFEST.sha256").write_text("\n".join(entries) + "\n")
             result = self.op.extract_task5_directions(root)
-            self.assertEqual(result["bank"].shape, (3, 1, 48, 5, 16, 16))
+            self.assertEqual(result["bank"].shape, (3, 1, 48, 5, 16, 16)); self.assertEqual(set(result["direction_sha256"]), {"v0", "v1", "v2", "u01", "u12"})
 
     def test_task5_manifest_rejects_nested_manifest_and_extra_file(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -82,7 +84,7 @@ class OperationalTask6Tests(unittest.TestCase):
         with self.assertRaises(self.op.OperationalEvidenceError): self.op.import_callable("not-a-spec")
 
     def contract(self):
-        return {"framework_commit": "2b17a2413bd86b2cf9b03823637108851e4ddf2d", "checkpoint_identity": {"sha256": "x"},
+        return {"framework_commit": "1" * 40, "asset_source_commit": "2b17a2413bd86b2cf9b03823637108851e4ddf2d", "checkpoint_identity": {"sha256": "x"},
                 "vae_sha256": "a" * 64, "torch_version": "2.10.0+cu130", "cuda_version": "13.0", "code_bundle_sha256": "b" * 64,
                 "bridge_asset_hashes": {"action": "a" * 64, "video": "b" * 64}, "task5": {"manifest_sha256": "c" * 64},
                 "group": {"state": "bridge_0", "seed": 0}, "prompt": self.op.BRIDGE0_PROMPT,

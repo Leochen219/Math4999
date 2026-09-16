@@ -457,10 +457,16 @@ def run_task6_decoder_replays(runtime: Any, run_root: str | Path, *, state: str 
                 _atomic_json(stage / "record.json", metadata); os.replace(stage, replay_dir); stage = None
                 summary["decoder_calls"] += 1; summary["records"].append(spec["replay_id"]); _atomic_json(status_path, summary); _decoder_manifest(root)
                 if monitor is not None and callable(getattr(monitor, "capture_sample", None)):
-                    row = monitor.capture_sample(spec["replay_id"], "post_cleanup", len(plan) - len(summary["records"]), root)
+                    try:
+                        row = monitor.capture_sample(spec["replay_id"], "post_cleanup", len(plan) - len(summary["records"]), root)
+                    except BaseException as error:
+                        return canonical_resource_stop("MONITOR_FAILURE", str(error))
                     if row.get("decision_status") == "HARD_STOP":
                         return canonical_resource_stop(str(row.get("reason_code") or "RESOURCE_STOP"), "decoder resource gate stopped after cleanup")
             except Exception as error:
+                text_error = str(error).lower()
+                if isinstance(error, MemoryError) or "out of memory" in text_error or "cuda oom" in text_error:
+                    return canonical_resource_stop("CUDA_OOM", str(error))
                 summary["failures"] += 1; summary.update({"status": "BLOCKED", "error": {"type": type(error).__name__, "message": str(error)}}); stop_monitor(); _atomic_json(status_path, summary); _decoder_manifest(root); return summary
             finally:
                 if stage is not None and stage.exists():
