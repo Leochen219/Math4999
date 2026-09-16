@@ -229,6 +229,8 @@ def validate_launch_contract(contract: Mapping[str, Any], *, observed: Mapping[s
             raise OperationalEvidenceError(f"invalid launch identity: {key}")
     if observed is None:
         raise OperationalEvidenceError("approved observed launch evidence is required; self-attested contract is insufficient")
+    if not isinstance(observed, Mapping) or not REQUIRED_CONTRACT_KEYS.issubset(observed):
+        raise OperationalEvidenceError("observed launch evidence is incomplete")
     mismatches = [key for key in REQUIRED_CONTRACT_KEYS if key in observed and observed[key] != contract[key]]
     if mismatches:
         raise OperationalEvidenceError(f"launch contract differs from observed evidence: {mismatches}")
