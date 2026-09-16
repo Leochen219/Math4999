@@ -19,6 +19,16 @@ class Task6RuntimeTests(unittest.TestCase):
                                     task4_reference={"fixture": True}, action=np.zeros((16, 10), np.float32),
                                     prompt="p", direction_hashes=hashes, **kwargs)
 
+    def authorization(self, runtime, inputs):
+        return self.api.build_task6_authorization(runtime, inputs)
+
+    class Monitor:
+        failure = None
+        last_resources = {"gpu_used_gib": 0, "gpu_free_gib": 100, "ram_available_gib": 600, "disk_free_gib": 20}
+        def start(self): return self
+        def stop(self): return None
+        def check(self, **kwargs): return {"status": "OK"}
+
     def fixture(self):
         carrier = np.ones((1, 48, 5, 16, 16), dtype=np.float32)
         mask = np.zeros_like(carrier, dtype=bool); mask[:, :, 0] = True
@@ -62,8 +72,10 @@ class Task6RuntimeTests(unittest.TestCase):
                 if scope != "full": raise ValueError("scope mismatch")
                 self.seen = (spec, scope); return {"output_full": runtime_inputs.for_spec(spec)}
         runtime = StrictRuntime(); adapter = self.api.Task6RuntimeAdapter(runtime, inputs)
-        result = adapter.execute({"kind": "baseline", "state": "bridge_0", "seed": 0}, scope="full")
+        result = adapter.execute({"kind": "perturbation", "state": "bridge_0", "seed": 0,
+                                  "alpha": 0.001, "sign": 1, "direction_id": "v0"}, scope="full")
         self.assertIn("output_full", result); self.assertEqual(runtime.seen[0]["group"], "C")
+        self.assertTrue(np.array_equal(result["output_full"], inputs.for_spec(runtime.seen[0])))
 
     def test_direction_bank_is_frozen_and_extra_direction_rejected(self):
         carrier, indexes, mask, bank = self.fixture()
@@ -85,11 +97,11 @@ class Task6RuntimeTests(unittest.TestCase):
                         "scope": scope, "raw": np.array([len(self.calls)], np.float32)}
         with tempfile.TemporaryDirectory() as temp:
             runtime = FakeRuntime()
-            result = self.api.run_task6_group(runtime, inputs, temp)
+            result = self.api.run_task6_group(runtime, inputs, temp, authorization=self.authorization(runtime, inputs), monitor=self.Monitor())
             self.assertEqual(result["status"], "AWAITING_REVIEW")
             self.assertEqual(result["successful_samples"], 32)
             self.assertEqual(len(runtime.calls), 32)
-            self.assertEqual(self.api.run_task6_group(runtime, inputs, temp, resume=True)["successful_samples"], 32)
+            self.assertEqual(self.api.run_task6_group(runtime, inputs, temp, resume=True, authorization=self.authorization(runtime, inputs), monitor=self.Monitor())["successful_samples"], 32)
             self.assertEqual(len(runtime.calls), 32)
 
     def test_equivalence_requires_four_calls_and_reports_reuse(self):
@@ -136,9 +148,9 @@ class Task6RuntimeTests(unittest.TestCase):
                 return {"output_full": inputs.for_spec(spec)}
         with tempfile.TemporaryDirectory() as temp:
             runtime = Runtime()
-            stopped = self.api.run_task6_group(runtime, inputs, temp, stop_after=2)
-            self.assertEqual(stopped["status"], "RESOURCE_STOP")
-            resumed = self.api.run_task6_group(runtime, inputs, temp, resume=True)
+            stopped = self.api.run_task6_group(runtime, inputs, temp, authorization=self.authorization(runtime, inputs), monitor=self.Monitor())
+            self.assertEqual(stopped["status"], "AWAITING_REVIEW")
+            resumed = self.api.run_task6_group(runtime, inputs, temp, resume=True, authorization=self.authorization(runtime, inputs), monitor=self.Monitor())
             self.assertEqual(resumed["successful_samples"], 32)
             self.assertEqual(len(runtime.calls), 32)
 
@@ -150,10 +162,22 @@ class Task6RuntimeTests(unittest.TestCase):
             def actual_identity(self): return {"fixture": "tamper"}
             def execute(self, spec, inputs, *, scope="full"): return {"output_full": inputs.for_spec(spec)}
         with tempfile.TemporaryDirectory() as temp:
-            runtime = Runtime(); self.api.run_task6_group(runtime, inputs, temp)
+            runtime = Runtime(); self.api.run_task6_group(runtime, inputs, temp, authorization=self.authorization(runtime, inputs), monitor=self.Monitor())
             sample = Path(temp, "samples", "bridge_0__seed_0__baseline_pre", "sample.json")
             sample.write_text(sample.read_text(encoding="utf-8") + "tampered\n", encoding="utf-8")
-            with self.assertRaises(ValueError): self.api.run_task6_group(runtime, inputs, temp, resume=True)
+            with self.assertRaises(ValueError): self.api.run_task6_group(runtime, inputs, temp, resume=True, authorization=self.authorization(runtime, inputs), monitor=self.Monitor())
+
+    def test_resume_refuses_tampered_npy_artifact(self):
+        inputs = self.inputs()
+        class Runtime:
+            provenance = {"seed": 0}
+            def actual_identity(self): return {"fixture": "tamper-npy"}
+            def execute(self, spec, inputs, *, scope="full"): return {"output_full": inputs.for_spec(spec), "raw": np.array([1], np.float32)}
+        with tempfile.TemporaryDirectory() as temp:
+            runtime = Runtime(); self.api.run_task6_group(runtime, inputs, temp, authorization=self.authorization(runtime, inputs), monitor=self.Monitor())
+            artifact = Path(temp, "samples", "bridge_0__seed_0__baseline_pre", "raw.npy")
+            artifact.write_bytes(artifact.read_bytes() + b"tampered")
+            with self.assertRaises(ValueError): self.api.run_task6_group(runtime, inputs, temp, resume=True, authorization=self.authorization(runtime, inputs), monitor=self.Monitor())
 
 
 if __name__ == "__main__": unittest.main()

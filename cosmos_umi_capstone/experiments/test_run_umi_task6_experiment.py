@@ -18,13 +18,20 @@ class Task6RunnerTests(unittest.TestCase):
         args = api.parse_args([])
         self.assertEqual(args.phase, "preflight")
         with tempfile.TemporaryDirectory() as temp:
+            class Inputs:
+                state = "bridge_0"; seed = 0
+                def identity(self): return {"fixture": "inputs"}
             class Runtime:
                 def __init__(self): self.calls = 0
                 def execute(self, spec, inputs, *, scope): self.calls += 1; return {"output_full": np.zeros(8, np.float32)}
+                def actual_identity(self): return {"fixture": "runtime"}
+            runtime, inputs = Runtime(), Inputs()
+            binding = api.build_task6_hash_binding(runtime, inputs, api.task6_binding_config(inputs))
+            Path(temp, "run_status.json").write_text(json.dumps({"status": "PREFLIGHT_COMPLETE", "phase": "RESOURCE_SMOKE", "hashes": binding}))
             samplers = {key: (lambda: {"gpu_used_gib": 0, "gpu_free_gib": 100,
                 "ram_available_gib": 600, "disk_free_gib": 20}) for key in ("gpu", "ram", "disk")}
-            result = api.run_resource_smoke(temp, runtime=Runtime(), inputs=object(), samplers=samplers,
-                                            lifecycle={"pre_load": lambda: None, "load": lambda: None,
+            result = api.run_resource_smoke(temp, samplers=samplers,
+                                            lifecycle={"pre_load": lambda: None, "load": lambda: (runtime, inputs),
                                                        "cleanup": lambda: None, "unload": lambda: None})
             self.assertEqual(result["status"], "AWAITING_RESOURCE_REVIEW")
             self.assertEqual(result["baseline_calls"], 1)
@@ -44,7 +51,8 @@ class Task6RunnerTests(unittest.TestCase):
     def test_monitor_flushes_csv_on_failure(self):
         import run_umi_task6_experiment as api
         with tempfile.TemporaryDirectory() as temp:
-            monitor = api.ResourceMonitor(temp, gpu_sampler=lambda: (_ for _ in ()).throw(RuntimeError("poll")))
+            monitor = api.ResourceMonitor(temp, gpu_sampler=lambda: (_ for _ in ()).throw(RuntimeError("poll")),
+                                          ram_sampler=lambda: {}, disk_sampler=lambda: {})
             monitor.start(); time.sleep(0.03)
             with self.assertRaises(RuntimeError): monitor.stop()
             self.assertTrue(Path(temp, "gpu_samples.csv").is_file())
@@ -55,8 +63,14 @@ class Task6RunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             runtime = type("Runtime", (), {"execute": lambda self, spec, inputs, *, scope: {"output_full": np.zeros(8, np.float32)}})()
             samplers = {key: (lambda: {"gpu_used_gib": 0, "gpu_free_gib": 100, "ram_available_gib": 600, "disk_free_gib": 20}) for key in ("gpu", "ram", "disk")}
-            api.run_resource_smoke(temp, runtime=runtime, inputs=object(), samplers=samplers,
-                                   lifecycle={"pre_load": lambda: None, "load": lambda: None,
+            class Inputs:
+                state = "bridge_0"; seed = 0
+                def identity(self): return {}
+            runtime.inputs = Inputs()
+            binding = api.build_task6_hash_binding(runtime, runtime.inputs, api.task6_binding_config(runtime.inputs))
+            Path(temp, "run_status.json").write_text(json.dumps({"status": "PREFLIGHT_COMPLETE", "phase": "RESOURCE_SMOKE", "hashes": binding}))
+            api.run_resource_smoke(temp, samplers=samplers,
+                                   lifecycle={"pre_load": lambda: None, "load": lambda: (runtime, runtime.inputs),
                                               "cleanup": lambda: None, "unload": lambda: None})
             with self.assertRaises(api.BlockedExecution):
                 api.authorize_pilot(temp)

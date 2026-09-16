@@ -54,12 +54,29 @@ def _array_sha(value: Any) -> str:
 def build_task6_hash_binding(runtime: Any, inputs: Any, config: Mapping[str, Any] | None = None) -> dict[str, str]:
     """Derive the six canonical hashes from actual runtime/input identities."""
     actual = runtime.actual_identity() if hasattr(runtime, "actual_identity") else {"runtime": type(runtime).__name__}
-    source = Path(__file__).resolve()
-    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    source_root = Path(__file__).resolve().parent
+    sources = [source_root / name for name in ("umi_task6_runtime.py", "run_umi_task6_experiment.py",
+        "umi_precision_runtime.py", "umi_precision_storage.py", "umi_precision_official.py",
+        "umi_task5_runtime.py", "umi_task5_primitives.py") if (source_root / name).is_file()]
+    code_digest = hashlib.sha256()
+    for source in sources:
+        code_digest.update(source.name.encode("utf-8")); code_digest.update(b"\0"); code_digest.update(source.read_bytes())
     identity = inputs.identity() if hasattr(inputs, "identity") else {}
-    return {"code": digest, "model": _sha(actual), "config": _sha(config or {}),
+    return {"code": code_digest.hexdigest(), "model": _sha(actual), "config": _sha(config or {}),
             "direction": _sha(identity.get("directions", {})), "input": _sha(identity),
             "noise": _sha({"seed": identity.get("seed"), "strategy": "runtime_prepare_noise", "routes": ["prepare", "sampler", "scheduler"]})}
+
+
+def task6_binding_config(inputs: Any) -> dict[str, Any]:
+    return {"schema_version": "umi-task6-v1", "group": {"state": inputs.state, "seed": inputs.seed},
+            "settings": {"num_steps": 30, "guidance": 1.0, "shift": 10.0, "autocast": False,
+                         "tf32": False, "diffusion_cache": False, "batch_size": 1}}
+
+
+def build_task6_authorization(runtime: Any, inputs: Any) -> dict[str, Any]:
+    """Test/controller helper for an accepted smoke decision binding."""
+    return {"status": "AWAITING_RESOURCE_REVIEW", "smoke_decision_accepted": True,
+            "hashes": build_task6_hash_binding(runtime, inputs, task6_binding_config(inputs))}
 
 
 def load_frozen_directions(direction_bank: Any, mask: Any, *, expected_hashes: Mapping[str, str] | None = None) -> dict[str, np.ndarray]:
@@ -164,18 +181,16 @@ class Task6Inputs:
 
 class Task6RuntimeAdapter:
     """Narrow adapter allowing one resident validated Task 5 runtime to be reused."""
-    def __init__(self, runtime: Any, inputs: Task6Inputs, *, runtime_inputs: Any | None = None,
-                 inputs_factory: Any | None = None):
+    def __init__(self, runtime: Any, inputs: Task6Inputs):
         self.runtime = runtime
         self.inputs = inputs
         # OfficialPrecisionRuntime validates identity against the inputs it
         # constructed during its generation-free prepare seam.  Reuse that
         # exact object (or a caller-supplied factory result) rather than
         # passing a Task6Inputs wrapper with a different schema.
+        runtime_inputs = getattr(runtime, "inputs", None)
         if runtime_inputs is None:
-            runtime_inputs = getattr(runtime, "inputs", None)
-        if runtime_inputs is None and callable(inputs_factory):
-            runtime_inputs = inputs_factory(inputs)
+            raise ValueError("wrapped runtime must expose inputs created with Task6 inputs_factory")
         if runtime_inputs is not None and hasattr(runtime_inputs, "identity") and hasattr(inputs, "identity"):
             if runtime_inputs.identity() != inputs.identity():
                 raise ValueError("runtime inputs identity differs; construct OfficialPrecisionRuntime with Task6 inputs_factory")
@@ -194,7 +209,7 @@ class Task6RuntimeAdapter:
         return method() if callable(method) else {"runtime": type(self.runtime).__name__}
 
     def execute(self, spec: Mapping[str, Any], inputs: Task6Inputs | None = None, *, scope: str = "full"):
-        target = self.runtime_inputs if inputs is None or inputs is self.inputs else inputs
+        target = self.inputs
         request = dict(spec)
         # The validated Task 5 seam names its single FP32 execution path C;
         # Task 6 state/seed are carried alongside it, never used to branch the
@@ -223,11 +238,14 @@ def preflight_task6(config: Mapping[str, Any], *, strict: bool = False, runtime:
         expected_inputs = config.get("observed_input_identity", config.get("input_identity"))
         if expected_runtime != observed_runtime: failures.append("runtime_identity")
         if expected_inputs != observed_inputs: failures.append("input_identity")
+        if config.get("prompt") is not None and config.get("prompt") != getattr(inputs, "prompt", None): failures.append("prompt")
+        if config.get("action_hash") is not None and config.get("action_hash") != observed_inputs.get("action"): failures.append("action_hash")
+        if config.get("direction_hashes") is not None and config.get("direction_hashes") != observed_inputs.get("directions"): failures.append("direction_hashes")
     required = ("environment", "provenance", "asset_hashes", "carrier_shape", "condition_indexes",
                 "predicted_indexes", "mask_shape", "action_shape", "direction_hashes", "settings", "seed_config")
     if strict:
         failures.extend(key for key in required if key not in config)
-        failures.extend(key for key in ("carrier", "mask", "action", "prompt", "asset_paths", "direction_bank_path",
+        failures.extend(key for key in ("asset_paths",
                                          "observed_runtime_identity", "observed_input_identity") if key not in config)
     shape = config.get("carrier_shape")
     if "carrier" in config:
@@ -415,13 +433,18 @@ def _atomic_text(path: Path, text: str) -> None:
 
 
 def run_task6_group(runtime: Any, inputs: Task6Inputs, run_dir: str | Path, *, resume: bool = False,
-                    resource_sampler: Any | None = None, stop_after: int | None = None, monitor: Any | None = None) -> dict[str, Any]:
+                    authorization: Mapping[str, Any], monitor: Any) -> dict[str, Any]:
     """Execute one exact 32-call group serially with immutable samples."""
     root = Path(run_dir); root.mkdir(parents=True, exist_ok=True)
     group = (inputs.state, inputs.seed)
     plan = build_generation_plan(*group)
-    config_binding = {"schema_version": "umi-task6-v1", "group": {"state": inputs.state, "seed": inputs.seed},
-                      "settings": {"num_steps": 30, "guidance": 1.0, "shift": 10.0, "autocast": False, "tf32": False, "diffusion_cache": False, "batch_size": 1}}
+    if not isinstance(authorization, Mapping) or authorization.get("status") != "AWAITING_RESOURCE_REVIEW" or authorization.get("smoke_decision_accepted") is not True:
+        raise ValueError("generation requires an accepted resource-smoke authorization")
+    config_binding = task6_binding_config(inputs)
+    expected_binding = build_task6_hash_binding(runtime, inputs, config_binding)
+    if dict(authorization.get("hashes", {})) != expected_binding:
+        raise ValueError("accepted resource-smoke hash binding differs from current runtime/input/config")
+    if monitor is None: raise ValueError("generation requires an integrated resource monitor")
     config = {**config_binding,
               "plan": plan, "inputs": inputs.identity(), "provenance": getattr(runtime, "provenance", {}),
               "actual_runtime": runtime.actual_identity() if hasattr(runtime, "actual_identity") else {}}
@@ -481,12 +504,6 @@ def run_task6_group(runtime: Any, inputs: Task6Inputs, run_dir: str | Path, *, r
             disposition = samples.prepare(spec["sample_id"], resume=resume, required_files=("sample.json",))
             if disposition == "skip":
                 skipped.append(spec["sample_id"]); completed.append(spec["sample_id"]); continue
-            if stop_after is not None and len(completed) >= stop_after:
-                payload = write_status("RESOURCE_STOP", "RESOURCE_STOP", "injected resource stop"); _write_manifest(root); return payload
-            if resource_sampler is not None:
-                decision = resource_sampler() if callable(resource_sampler) else resource_sampler
-                if decision.get("status") == "HARD_STOP":
-                    payload = write_status("RESOURCE_STOP", decision.get("reason_code"), decision.get("reason")); _write_manifest(root); return payload
             if monitor is not None and getattr(monitor, "failure", None) is not None:
                 payload = write_status("RESOURCE_STOP", "MONITOR_FAILURE", "resource monitor failed"); _write_manifest(root); return payload
             if monitor is not None and hasattr(monitor, "check"):
@@ -534,9 +551,8 @@ def run_task6_group(runtime: Any, inputs: Task6Inputs, run_dir: str | Path, *, r
 
 validate_task6_preflight = preflight_task6
 load_task5_direction_bank = load_frozen_directions
-run_task6_experiment = run_task6_group
 verify_umi_reference_reuse = verify_reference_reuse
 
-__all__ = ["PreflightError", "ResourceStop", "Task6Inputs", "Task6Runtime", "Task6RuntimeAdapter", "build_task6_hash_binding",
-           "load_frozen_directions", "load_task5_direction_bank", "preflight_task6", "run_task6_experiment",
+__all__ = ["PreflightError", "ResourceStop", "Task6Inputs", "Task6Runtime", "Task6RuntimeAdapter", "build_task6_authorization", "build_task6_hash_binding", "task6_binding_config",
+           "load_frozen_directions", "load_task5_direction_bank", "preflight_task6",
            "run_task6_group", "validate_task6_preflight", "verify_reference_reuse", "verify_umi_reference_reuse"]
