@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import inspect
+import numbers
 from contextlib import contextmanager
 
 import numpy as np
@@ -168,13 +169,12 @@ class OfficialPrecisionRuntime:
         self.scheduler_class = scheduler_class
         self.provenance = copy.deepcopy(provenance)
         if seed is not None:
-            if model_seed != 0 and int(model_seed) != int(seed):
+            if model_seed != 0 and (not isinstance(model_seed, numbers.Integral) or int(model_seed) != int(seed)):
                 raise ValueError("model_seed and seed disagree")
             model_seed = seed
-        try:
-            model_seed = int(model_seed)
-        except (TypeError, ValueError) as error:
-            raise ValueError("model seed must be a non-negative integer") from error
+        if isinstance(model_seed, bool) or not isinstance(model_seed, numbers.Integral):
+            raise ValueError("model seed must be a non-negative integer")
+        model_seed = int(model_seed)
         if model_seed < 0:
             raise ValueError("model seed must be a non-negative integer")
         self.model_seed = model_seed
@@ -286,6 +286,9 @@ class OfficialPrecisionRuntime:
     def execute(self, spec, inputs, *, scope):
         if scope not in ("full", "module") or inputs.identity() != self.inputs.identity():
             raise ValueError("runtime scope/input identity mismatch")
+        spec_seed = spec.get("model_seed", self.model_seed)
+        if isinstance(spec_seed, bool) or not isinstance(spec_seed, numbers.Integral) or int(spec_seed) != self.model_seed:
+            raise ValueError("execution spec seed disagrees with runtime model seed")
         model, ops = self.model, self.ops
         target = inputs.for_spec(spec) if hasattr(inputs, "for_spec") else inputs.for_call(spec["group"], spec["alpha"], spec["sign"])
         dtype = "bfloat16" if spec["group"] == "A" else "float32"

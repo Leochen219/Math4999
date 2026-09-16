@@ -389,6 +389,21 @@ class OfficialTests(unittest.TestCase):
         self.assertNotEqual(record0["initial_noise_hash"], record1["initial_noise_hash"])
         self.assertEqual(runtime0.inputs.identity(), runtime1.inputs.identity())
         self.assertEqual(runtime0.settings, runtime1.settings)
+        identity0, identity1 = runtime0.actual_identity(), runtime1.actual_identity()
+        for key in ("data_batch", "model_state", "decoder_state", "model_config", "inputs", "settings", "code", "sampler_config", "backend"):
+            self.assertEqual(identity0[key], identity1[key], key)
+        self.assertEqual(identity0["artifacts"]["checkpoint"]["sha256"], identity1["artifacts"]["checkpoint"]["sha256"])
+        self.assertEqual(identity0["artifacts"]["decoder"]["sha256"], identity1["artifacts"]["decoder"]["sha256"])
+        self.assertNotEqual(identity0["noise_policy"]["seed"], identity1["noise_policy"]["seed"])
+        self.assertNotEqual(identity0["noise_policy"]["initial_noise"], identity1["noise_policy"]["initial_noise"])
+
+    def test_seed_validation_rejects_bool_nonintegral_and_spec_mismatch(self):
+        for bad in (True, False, 1.5, "1"):
+            with self.subTest(seed=bad), self.assertRaises(ValueError):
+                self.fixture(seed=bad)
+        runtime, _ = self.fixture(seed=1)
+        with self.assertRaisesRegex(ValueError, "disagrees"):
+            runtime.execute({"sample_id": "bad", "group": "B", "alpha": 0., "sign": 0, "model_seed": 0}, runtime.inputs, scope="module")
 
 
 if __name__ == "__main__":

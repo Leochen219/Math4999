@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import numbers
 import json
 import os
 import tempfile
@@ -95,10 +96,9 @@ def build_call_plan(alphas, model_seed=0):
     alphas = tuple(float(x) for x in alphas)
     if len(alphas) != 6 or any(not np.isfinite(x) or x <= 0 for x in alphas) or sorted(set(alphas)) != list(alphas):
         raise ValueError("exactly six distinct increasing positive finite alphas required")
-    try:
-        model_seed = int(model_seed)
-    except (TypeError, ValueError) as error:
-        raise ValueError("model seed must be a non-negative integer") from error
+    if isinstance(model_seed, bool) or not isinstance(model_seed, numbers.Integral):
+        raise ValueError("model seed must be a non-negative integer")
+    model_seed = int(model_seed)
     if model_seed < 0:
         raise ValueError("model seed must be a non-negative integer")
     result = []
@@ -125,7 +125,10 @@ class PrecisionCompatibilityError(EvidenceError):
 
 def validate_capture(record, spec, inputs, scope, *, paired_noise=None):
     mask = inputs.geometry.mask
-    expected_seed = int(spec.get("model_seed", spec.get("seed", 0)))
+    expected_seed_raw = spec.get("model_seed", spec.get("seed", 0))
+    if isinstance(expected_seed_raw, bool) or not isinstance(expected_seed_raw, numbers.Integral):
+        raise ValueError("model seed must be a non-negative integer")
+    expected_seed = int(expected_seed_raw)
     if expected_seed < 0:
         raise ValueError("model seed must be non-negative")
     # Task 4 uses the fixed direction-0 ``for_call`` contract.  Later bounded

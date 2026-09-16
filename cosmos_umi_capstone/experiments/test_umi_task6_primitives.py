@@ -11,6 +11,7 @@ from umi_task6_primitives import (
     build_decoder_replay_plan,
     build_generation_plan,
     build_run_status,
+    TERMINAL_STATUSES,
     parse_action,
     pilot_groups,
     preprocess_frame,
@@ -41,6 +42,12 @@ class CatalogAndPlansTests(unittest.TestCase):
         self.assertEqual({x["decode_precision"] for x in replay}, {"native_bf16", "temporary_fp32"})
         self.assertEqual([x["direction_id"] for x in replay if x["kind"] == "perturbation"], ["v0"] * 12)
 
+    def test_group_layer_accepts_only_exact_integer_seed_zero_or_one(self):
+        for bad in (True, False, "0", 0.0, 1.5, 2, -1):
+            with self.subTest(seed=bad):
+                with self.assertRaises(ValueError):
+                    build_generation_plan("bridge_0", bad)
+
 
 class PreprocessTests(unittest.TestCase):
     def test_aspect_preserving_resize_and_reflection_padding_wide_tall_square_odd(self):
@@ -55,7 +62,7 @@ class PreprocessTests(unittest.TestCase):
     def test_reflection_padding_is_true_reflect_without_edge_repeat(self):
         frame = np.array([[[1], [2], [3], [4]], [[5], [6], [7], [8]]], dtype=np.uint8)
         result = preprocess_frame(frame, size=4)
-        self.assertTrue(np.array_equal(result[:, :, 0], [[5, 6, 7, 8], [1, 2, 3, 4], [5, 6, 7, 8], [1, 2, 3, 4]]))
+        self.assertTrue(np.array_equal(result[:, :, 0], [[1, 2, 3, 4], [5, 6, 7, 8], [5, 6, 7, 8], [5, 6, 7, 8]]))
 
     def test_float_dtype_and_range_are_preserved(self):
         frame = np.linspace(0, 1, 15, dtype=np.float32).reshape(3, 5, 1)
@@ -63,6 +70,32 @@ class PreprocessTests(unittest.TestCase):
         self.assertEqual(result.dtype, np.float32)
         self.assertGreaterEqual(float(result.min()), 0)
         self.assertLessEqual(float(result.max()), 1)
+
+    def test_no_upscale_and_official_rounding_right_bottom_reflect_and_edge(self):
+        frame = np.arange(15, dtype=np.float32).reshape(3, 5, 1)
+        # target 8x8: scale is capped at one (no upscale), then right/bottom padding only.
+        result = preprocess_frame(frame, size=(8, 8))
+        self.assertEqual(result.shape, (8, 8, 1))
+        self.assertTrue(np.array_equal(result[:3, :5, 0], frame[:, :, 0]))
+        # 5x5 -> 8x8 has 3px right/bottom reflect padding.
+        square = np.arange(25, dtype=np.uint8).reshape(5, 5, 1)
+        reflected = preprocess_frame(square, size=8)
+        self.assertTrue(np.array_equal(reflected[:5, :5], square))
+        self.assertTrue(np.array_equal(reflected[5:, :5, 0], square[3:0:-1, :, 0]))
+        # If either padding is at least the resized dimension, official code
+        # uses edge mode for both axes.
+        edge = preprocess_frame(np.arange(4, dtype=np.uint8).reshape(1, 4, 1), size=8)
+        self.assertTrue(np.all(edge[1:, :, 0] == edge[0:1, :, 0]))
+
+    def test_downscale_calls_explicit_backend_once(self):
+        calls = []
+        frame = np.zeros((8, 8, 1), dtype=np.float32)
+        def backend(value, width, height):
+            calls.append((value.shape, width, height))
+            return np.ones((height, width, 1), dtype=np.float32)
+        result = preprocess_frame(frame, size=4, resize_backend=backend)
+        self.assertEqual(calls, [((8, 8, 1), 4, 4)])
+        self.assertTrue(np.all(result == 1))
 
 
 class InputAndResourceTests(unittest.TestCase):
@@ -92,6 +125,55 @@ class InputAndResourceTests(unittest.TestCase):
                                       "consecutive_growth_samples": 0})
         self.assertEqual(warning["status"], "WARNING")
 
+    def test_nonfinite_and_malformed_resource_values_fail_closed(self):
+        base = {"gpu_used_gib": 0, "gpu_free_gib": 100, "gpu_reserved_gib": 0,
+                "ram_available_gib": 600, "rss_gib": 1, "swap_used_gib": 0,
+                "disk_free_gib": 20, "forecast_free_gib": 20}
+        for key, value in (("gpu_used_gib", float("inf")), ("gpu_free_gib", float("-inf")),
+                           ("ram_available_gib", "not-a-number"), ("disk_free_gib", float("nan")),
+                           ("consecutive_growth_samples", "bad"), ("gpu_consecutive_growth_samples", float("inf"))):
+            with self.subTest(key=key):
+                sample = dict(base); sample[key] = value
+                result = evaluate_resources(sample)
+                self.assertEqual(result["status"], "HARD_STOP")
+                self.assertEqual(result["reason_code"], "RESOURCE_SNAPSHOT_NONFINITE")
+
+    def test_resource_boundaries_and_all_stop_reasons(self):
+        base = {"gpu_used_gib": 0, "gpu_free_gib": 100, "gpu_reserved_gib": 0,
+                "ram_available_gib": 600, "rss_gib": 1, "swap_used_gib": 0,
+                "disk_free_gib": 20, "forecast_free_gib": 20,
+                "gpu_peak_allocated_gib": 0, "gpu_peak_nvml_used_gib": 0}
+        for key, value, code in (("gpu_used_gib", 75.01, "GPU_USED_HIGH"),
+                                  ("gpu_free_gib", 19.99, "GPU_FREE_LOW"),
+                                  ("gpu_reserved_gib", 65.01, "GPU_RESERVED_HIGH"),
+                                  ("gpu_peak_allocated_gib", 35.01, "GPU_SMOKE_PEAK_ALLOCATED_HIGH"),
+                                  ("gpu_peak_nvml_used_gib", 45.01, "GPU_SMOKE_PEAK_USED_HIGH"),
+                                  ("ram_available_gib", 299.99, "RAM_AVAILABLE_LOW"),
+                                  ("rss_gib", 160.01, "RAM_RSS_HIGH"),
+                                  ("swap_used_gib", 0.01, "SWAP_IN_USE"),
+                                  ("disk_free_gib", 4.99, "DISK_FREE_LOW")):
+            with self.subTest(key=key):
+                sample = dict(base); sample[key] = value
+                self.assertEqual(evaluate_resources(sample)["reason_code"], code)
+        self.assertEqual(evaluate_resources({**base, "gpu_used_gib": 1.01}, phase="start")["reason_code"], "GPU_START_USED_HIGH")
+        self.assertEqual(evaluate_resources({**base, "ram_available_gib": 499.99}, phase="start")["reason_code"], "RAM_START_AVAILABLE_LOW")
+        self.assertEqual(evaluate_resources({**base, "disk_free_gib": 9.99}, phase="start")["reason_code"], "DISK_START_FREE_LOW")
+        self.assertEqual(evaluate_resources({**base, "gpu_cleanup_growth_gib": 2.01, "consecutive_growth_samples": 2})["reason_code"], "GPU_CLEANUP_GROWTH")
+        self.assertEqual(evaluate_resources({**base, "ram_cleanup_growth_gib": 10.01, "consecutive_growth_samples": 2})["reason_code"], "RAM_CLEANUP_GROWTH")
+
+    def test_resource_forecast_oom_monitor_and_full_matrix_gates(self):
+        base = {"gpu_used_gib": 0, "gpu_free_gib": 100, "gpu_reserved_gib": 0,
+                "ram_available_gib": 600, "rss_gib": 1, "swap_used_gib": 0,
+                "disk_free_gib": 20, "forecast_free_gib": 20}
+        self.assertEqual(evaluate_resources({**base, "cuda_oom": True})["reason_code"], "CUDA_OOM")
+        self.assertEqual(evaluate_resources({**base, "monitor_failure": "poll failed"})["reason_code"], "MONITOR_FAILURE")
+        warning = evaluate_resources({**base, "mean_success_sample_bytes": 5 * 1024**3,
+                                      "remaining_samples": 3, "disk_free_gib": 24.0})
+        self.assertEqual(warning["reason_code"], "DISK_FORECAST_WARNING")
+        full = evaluate_resources({**base, "disk_free_gib": 20,
+                                   "remaining_matrix_estimate_gib": 12, "full_matrix_launch": True})
+        self.assertEqual(full["reason_code"], "DISK_FULL_MATRIX_INSUFFICIENT")
+
     def test_run_status_is_canonical_and_contains_terminal_evidence(self):
         payload = build_run_status("AWAITING_REVIEW", reason_code="PILOT_COMPLETE",
                                    completed=["baseline_pre"], failed=[], skipped=["baseline_post"],
@@ -103,6 +185,17 @@ class InputAndResourceTests(unittest.TestCase):
         self.assertEqual(payload["completed_samples"], ["baseline_pre"])
         self.assertEqual(payload["last_resource_snapshots"]["gpu"]["used_gib"], 1)
         self.assertEqual(set(payload["hashes"]), {"code", "model", "config", "direction", "input", "noise"})
+
+    def test_run_status_rejects_nonterminal_unknown_or_invalid_hash_contract(self):
+        hashes = {key: "x" for key in ("code", "model", "config", "direction", "input", "noise")}
+        for status in TERMINAL_STATUSES:
+            self.assertEqual(build_run_status(status, hashes=hashes)["status"], status)
+        for status in ("PREFLIGHT", "UNKNOWN", ""):
+            with self.assertRaises(ValueError):
+                build_run_status(status, hashes=hashes)
+        for bad in ({}, {**hashes, "extra": "x"}, {**hashes, "code": ""}, {**hashes, "code": None}):
+            with self.assertRaises(ValueError):
+                build_run_status("AWAITING_REVIEW", hashes=bad)
 
 
 if __name__ == "__main__":

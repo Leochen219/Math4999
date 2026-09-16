@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import numbers
 from dataclasses import asdict, dataclass
 from types import MappingProxyType
 from typing import Any, Mapping
@@ -20,6 +21,10 @@ ALPHAS = (0.001, 0.003, 0.01)
 DIRECTION_IDS = ("v0", "v1", "v2", "u01", "u12")
 STATE_IDS = ("umi_reference", "bridge_0", "bridge_384")
 SEEDS = (0, 1)
+TERMINAL_STATUSES = frozenset({
+    "AWAITING_RESOURCE_REVIEW", "AWAITING_REVIEW", "COMPLETE", "FAILED",
+    "SKIPPED", "RESOURCE_STOP", "INTERRUPTED",
+})
 
 
 @dataclass(frozen=True)
@@ -58,6 +63,10 @@ class ExperimentGroup:
     state: str
     seed: int
 
+    def __post_init__(self) -> None:
+        if self.state not in STATE_IDS or isinstance(self.seed, bool) or not isinstance(self.seed, numbers.Integral) or int(self.seed) not in SEEDS:
+            raise ValueError("Task 6 groups require one of the exact integer seeds 0 or 1")
+
     @property
     def group_id(self) -> str:
         return f"{self.state}__seed_{self.seed}"
@@ -75,8 +84,10 @@ select_pilot_groups = pilot_groups
 
 
 def _require_group(state: str, seed: int) -> ExperimentGroup:
+    if not isinstance(state, str) or isinstance(seed, bool) or not isinstance(seed, numbers.Integral):
+        raise ValueError("state and seed identify an approved Task 6 group")
     try:
-        group = ExperimentGroup(str(state), int(seed))
+        group = ExperimentGroup(state, int(seed))
     except (TypeError, ValueError) as error:
         raise ValueError("state and seed identify an approved Task 6 group") from error
     if group not in GROUPS:
@@ -138,46 +149,59 @@ def build_decoder_replay_plan(state: str = "bridge_0", seed: int = 0) -> list[di
     return result
 
 
-def preprocess_frame(frame: Any, *, size: int = 256) -> np.ndarray:
-    """Aspect-preserving nearest resize followed by symmetric reflection pad.
+def preprocess_frame(frame: Any, *, size: int | tuple[int, int] = 256, resize_backend=None) -> np.ndarray:
+    """Apply official geometry with a lazy, bindable resize backend.
 
-    The implementation is NumPy-only so importing this module never requires
-    OpenCV. Values and dtype are retained; only spatial dimensions change.
+    Scale is capped at one (never upscale), rounded as ``int(scale*dim+0.5)``;
+    padding is right/bottom only. The official backend is Torchvision bicubic
+    antialiasing, imported only at call time. A NumPy nearest fallback is
+    explicitly not pixel-equivalent to that backend.
     """
     source = np.asarray(frame)
     if source.ndim != 3 or source.shape[0] < 1 or source.shape[1] < 1 or source.shape[2] < 1:
         raise ValueError("frame must be a nonempty HWC array")
     if not np.issubdtype(source.dtype, np.number) or not np.all(np.isfinite(source)):
         raise ValueError("frame must contain finite numeric values")
-    target_size = int(size)
-    if target_size < 1:
+    if isinstance(size, numbers.Integral):
+        target_h = target_w = int(size)
+    else:
+        if len(size) != 2:
+            raise ValueError("size must be a positive integer or (height, width)")
+        target_h, target_w = (int(size[0]), int(size[1]))
+    if target_h < 1 or target_w < 1:
         raise ValueError("size must be positive")
     height, width = source.shape[:2]
-    scale = min(target_size / height, target_size / width)
-    resized_h = max(1, int(round(height * scale)))
-    resized_w = max(1, int(round(width * scale)))
-    # Pixel-centre nearest-neighbour mapping is deterministic and independent
-    # of external image libraries.
-    rows = np.minimum((np.arange(resized_h) + 0.5) * height / resized_h, height - 1).astype(int)
-    cols = np.minimum((np.arange(resized_w) + 0.5) * width / resized_w, width - 1).astype(int)
-    resized = source[rows[:, None], cols[None, :], :]
-    pad_h = target_size - resized_h
-    pad_w = target_size - resized_w
+    scale = min(target_w / width, target_h / height, 1.0)
+    resized_h = max(1, int(scale * height + 0.5))
+    resized_w = max(1, int(scale * width + 0.5))
+    if (resized_h, resized_w) == (height, width):
+        resized = source.copy()
+    elif resize_backend is not None:
+        try:
+            resized = np.asarray(resize_backend(source, resized_w, resized_h))
+        except TypeError:
+            resized = np.asarray(resize_backend(source, (resized_h, resized_w)))
+        if resized.shape != (resized_h, resized_w, source.shape[2]):
+            raise ValueError("resize backend returned the wrong HWC shape")
+        if resized.dtype != source.dtype:
+            resized = resized.astype(source.dtype)
+    else:
+        try:
+            import torch
+            from torchvision.transforms.functional import InterpolationMode, resize as tv_resize
+            tensor = torch.from_numpy(np.ascontiguousarray(source)).permute(2, 0, 1)
+            resized_tensor = tv_resize(tensor, [resized_h, resized_w], interpolation=InterpolationMode.BICUBIC, antialias=True)
+            resized = resized_tensor.permute(1, 2, 0).cpu().numpy().astype(source.dtype, copy=False)
+        except (ImportError, ModuleNotFoundError, RuntimeError):
+            rows = np.minimum((np.arange(resized_h) + 0.5) * height / resized_h, height - 1).astype(int)
+            cols = np.minimum((np.arange(resized_w) + 0.5) * width / resized_w, width - 1).astype(int)
+            resized = source[rows[:, None], cols[None, :], :]
+    pad_h = target_h - resized_h
+    pad_w = target_w - resized_w
     if pad_h < 0 or pad_w < 0:
         raise AssertionError("aspect resize exceeded target")
-    top, bottom = pad_h // 2, pad_h - pad_h // 2
-    left, right = pad_w // 2, pad_w - pad_w // 2
-    # np.pad(..., mode='reflect') is the official reflection convention: an
-    # edge value is not repeated. It also correctly rejects impossible width 1
-    # reflection, for which edge padding is the only valid deterministic result.
-    if resized_h == 1 and (top or bottom):
-        vertical = np.pad(resized, ((top, bottom), (0, 0), (0, 0)), mode="symmetric")
-    else:
-        vertical = np.pad(resized, ((top, bottom), (0, 0), (0, 0)), mode="reflect")
-    if vertical.shape[1] == 1 and (left or right):
-        output = np.pad(vertical, ((0, 0), (left, right), (0, 0)), mode="symmetric")
-    else:
-        output = np.pad(vertical, ((0, 0), (left, right), (0, 0)), mode="reflect")
+    mode = "edge" if pad_h >= resized_h or pad_w >= resized_w else "reflect"
+    output = np.pad(resized, ((0, pad_h), (0, pad_w), (0, 0)), mode=mode)
     return np.ascontiguousarray(output, dtype=source.dtype)
 
 
@@ -224,15 +248,15 @@ hash_array = stable_hash
 class ResourceSnapshot:
     """Optional-field snapshot convenient for tests and monitor adapters."""
     gpu_used_gib: float = 0.0
-    gpu_free_gib: float = float("inf")
+    gpu_free_gib: float = 1e300
     gpu_reserved_gib: float = 0.0
     gpu_peak_allocated_gib: float = 0.0
     gpu_peak_nvml_used_gib: float = 0.0
-    ram_available_gib: float = float("inf")
+    ram_available_gib: float = 1e300
     rss_gib: float = 0.0
     swap_used_gib: float = 0.0
-    disk_free_gib: float = float("inf")
-    forecast_free_gib: float = float("inf")
+    disk_free_gib: float = 1e300
+    forecast_free_gib: float = 1e300
     gpu_cleanup_growth_gib: float = 0.0
     ram_cleanup_growth_gib: float = 0.0
     consecutive_growth_samples: int = 0
@@ -244,10 +268,12 @@ class ResourceSnapshot:
 def _number(snapshot: Mapping[str, Any], *names: str, default: float = 0.0) -> float:
     for name in names:
         if name in snapshot and snapshot[name] is not None:
+            if isinstance(snapshot[name], bool):
+                return float("nan")
             try:
                 return float(snapshot[name])
             except (TypeError, ValueError):
-                return float("inf")
+                return float("nan")
     return default
 
 
@@ -264,21 +290,40 @@ def evaluate_resources(snapshot: Mapping[str, Any] | ResourceSnapshot, *, phase:
     hard: list[tuple[str, str]] = []
     warnings: list[tuple[str, str]] = []
     gpu_used = _number(snapshot, "gpu_used_gib", "nvml_used_gib")
-    gpu_free = _number(snapshot, "gpu_free_gib", "nvml_free_gib", default=float("inf"))
+    gpu_free = _number(snapshot, "gpu_free_gib", "nvml_free_gib", default=1e300)
     gpu_reserved = _number(snapshot, "gpu_reserved_gib", "torch_reserved_gib")
-    ram_available = _number(snapshot, "ram_available_gib", "available_ram_gib", default=float("inf"))
+    ram_available = _number(snapshot, "ram_available_gib", "available_ram_gib", default=1e300)
     rss = _number(snapshot, "rss_gib", "process_rss_gib")
     swap = _number(snapshot, "swap_used_gib", "swap_gib")
-    disk = _number(snapshot, "disk_free_gib", "free_disk_gib", default=float("inf"))
-    forecast = _number(snapshot, "forecast_free_gib", "forecast_completion_free_gib", default=float("inf"))
-    consecutive = int(_number(snapshot, "consecutive_growth_samples", default=0))
+    disk = _number(snapshot, "disk_free_gib", "free_disk_gib", default=1e300)
+    forecast = _number(snapshot, "forecast_free_gib", "forecast_completion_free_gib", default=1e300)
+    consecutive_raw = _number(snapshot, "consecutive_growth_samples", default=0)
+    gpu_consecutive_raw = _number(snapshot, "gpu_consecutive_growth_samples", default=consecutive_raw)
+    ram_consecutive_raw = _number(snapshot, "ram_consecutive_growth_samples", default=consecutive_raw)
+    consecutive = int(consecutive_raw) if np.isfinite(consecutive_raw) and consecutive_raw.is_integer() and consecutive_raw >= 0 else float("nan")
+    gpu_consecutive = int(gpu_consecutive_raw) if np.isfinite(gpu_consecutive_raw) and gpu_consecutive_raw.is_integer() and gpu_consecutive_raw >= 0 else float("nan")
+    ram_consecutive = int(ram_consecutive_raw) if np.isfinite(ram_consecutive_raw) and ram_consecutive_raw.is_integer() and ram_consecutive_raw >= 0 else float("nan")
     gpu_growth = _number(snapshot, "gpu_cleanup_growth_gib", "gpu_cleanup_baseline_growth_gib")
     ram_growth = _number(snapshot, "ram_cleanup_growth_gib", "ram_cleanup_baseline_growth_gib")
 
     numeric_values = (gpu_used, gpu_free, gpu_reserved, ram_available, rss, swap, disk, forecast,
                       gpu_growth, ram_growth)
-    if any(np.isnan(value) for value in numeric_values):
-        hard.append(("RESOURCE_SNAPSHOT_NONFINITE", "resource snapshot contains a NaN value"))
+    if any(not np.isfinite(value) for value in numeric_values) or not np.isfinite(consecutive) or not np.isfinite(gpu_consecutive) or not np.isfinite(ram_consecutive):
+        hard.append(("RESOURCE_SNAPSHOT_NONFINITE", "resource snapshot contains nonfinite or malformed numeric values"))
+    if bool(snapshot.get("cuda_oom", False)) or bool(snapshot.get("cuda_out_of_memory", False)):
+        hard.append(("CUDA_OOM", "CUDA reported an out-of-memory failure"))
+    if snapshot.get("monitor_failure") or snapshot.get("monitor_error"):
+        hard.append(("MONITOR_FAILURE", "resource monitor reported a failure"))
+    mean_bytes = _number(snapshot, "mean_success_sample_bytes", default=0.0)
+    remaining_samples = _number(snapshot, "remaining_samples", default=0.0)
+    if mean_bytes < 0 or remaining_samples < 0 or not np.isfinite(mean_bytes + remaining_samples):
+        hard.append(("RESOURCE_SNAPSHOT_NONFINITE", "disk forecast inputs are malformed"))
+    elif "disk_free_gib" in snapshot and (mean_bytes or remaining_samples):
+        forecast = disk - (mean_bytes * remaining_samples * 1.3) / (1024 ** 3)
+    matrix_estimate = _number(snapshot, "remaining_matrix_estimate_gib", default=0.0)
+    full_matrix = bool(snapshot.get("full_matrix_launch", False)) or phase == "full-matrix"
+    if full_matrix and (not np.isfinite(matrix_estimate) or disk <= 1.3 * matrix_estimate + 5.0):
+        hard.append(("DISK_FULL_MATRIX_INSUFFICIENT", "free disk must exceed 1.3 times remaining matrix estimate plus 5 GiB"))
 
     if phase in ("start", "resource-smoke") and gpu_used > 1:
         hard.append(("GPU_START_USED_HIGH", "GPU start used memory exceeds 1 GiB"))
@@ -294,10 +339,9 @@ def evaluate_resources(snapshot: Mapping[str, Any] | ResourceSnapshot, *, phase:
     if swap > 0: hard.append(("SWAP_IN_USE", "swap is in use"))
     if phase in ("start", "resource-smoke") and disk < 10:
         hard.append(("DISK_START_FREE_LOW", "disk start free space is below 10 GiB"))
-    if starting_new_sample and disk < 5: hard.append(("DISK_FREE_LOW", "disk free space is below 5 GiB"))
     if disk < 5: hard.append(("DISK_FREE_LOW", "disk free space is below 5 GiB"))
-    if consecutive >= 2 and gpu_growth > 2: hard.append(("GPU_CLEANUP_GROWTH", "GPU cleanup-baseline growth exceeds 2 GiB twice consecutively"))
-    if consecutive >= 2 and ram_growth > 10: hard.append(("RAM_CLEANUP_GROWTH", "RAM cleanup-baseline growth exceeds 10 GiB twice consecutively"))
+    if gpu_consecutive >= 2 and gpu_growth > 2: hard.append(("GPU_CLEANUP_GROWTH", "GPU cleanup-baseline growth exceeds 2 GiB twice consecutively"))
+    if ram_consecutive >= 2 and ram_growth > 10: hard.append(("RAM_CLEANUP_GROWTH", "RAM cleanup-baseline growth exceeds 10 GiB twice consecutively"))
 
     if gpu_used > 60: warnings.append(("GPU_USED_WARNING", "GPU used memory exceeds 60 GiB"))
     if gpu_free < 35: warnings.append(("GPU_FREE_WARNING", "GPU free memory is below 35 GiB"))
@@ -324,6 +368,12 @@ def build_run_status(status: str, *, reason_code: str | None = None, reason: str
                      resource_snapshots: Mapping[str, Any] | None = None,
                      hashes: Mapping[str, str] | None = None, **extra: Any) -> dict[str, Any]:
     """Build a stable terminal status payload suitable for canonical JSON."""
+    if status not in TERMINAL_STATUSES:
+        raise ValueError(f"status is not terminal: {status!r}")
+    if not isinstance(hashes, Mapping) or set(hashes) != {"code", "model", "config", "direction", "input", "noise"}:
+        raise ValueError("run status requires exactly the six canonical nonempty hash fields")
+    if any(not isinstance(value, str) or not value for value in hashes.values()):
+        raise ValueError("run status hash fields must be nonempty strings")
     payload: dict[str, Any] = {
         "status": str(status), "reason_code": reason_code, "reason": reason,
         "completed_samples": sorted(str(x) for x in completed),
@@ -346,4 +396,4 @@ __all__ = ["ALPHAS", "DIRECTION_IDS", "GROUPS", "SEEDS", "SOURCE_COMMIT", "STATE
            "build_generation_plan", "build_run_status", "build_task6_call_plan", "evaluate_resources",
            "evaluate_resource_policy", "hash_action", "hash_array", "parse_action", "pilot_groups",
            "preprocess_frame", "preprocess_frame0", "preprocess_frame_zero", "select_pilot_groups",
-           "stable_hash", "validate_action", "canonical_run_status"]
+           "stable_hash", "validate_action", "canonical_run_status", "TERMINAL_STATUSES"]
