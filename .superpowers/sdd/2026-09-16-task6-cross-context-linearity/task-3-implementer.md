@@ -155,3 +155,14 @@ and calibration-environment tests failed because this bundled environment
 lacks the checked-in calibration hash/line-ending state and matplotlib. Those
 failures do not involve the changed Task 6 files. No remote/model/SVD action
 was taken.
+
+Focused regression after the correction (bundled interpreter, from
+`cosmos_umi_capstone/experiments`):
+
+```text
+python -m unittest test_umi_task6_decoder test_analyze_umi_task6 test_umi_task6_runtime test_umi_task6_primitives test_umi_task5_decoder test_umi_task5_primitives test_umi_task5_runtime test_analyze_umi_task5 test_umi_precision_runtime test_umi_precision_official test_umi_precision_primitives test_umi_precision_storage
+Ran 132 tests in 35.034s ... OK
+```
+
+Latest implementation commit before this report-only update:
+`cf2e674480dd1291042291ff06e917d66c2833bc`.
