@@ -338,7 +338,8 @@ def _verify_decoder_manifest(root: Path) -> str:
 
 def run_task6_decoder_replays(runtime: Any, run_root: str | Path, *, state: str = "bridge_0", seed: int = 0,
                               encoder: Any | None = None, resume: bool = False,
-                              decoder_root: str | Path | None = None) -> dict[str, Any]:
+                              decoder_root: str | Path | None = None, monitor: Any | None = None,
+                              main_status_path: str | Path | None = None) -> dict[str, Any]:
     """Run exactly 16 serial replays in a derived tree, never in raw_root."""
     raw_root = Path(run_root).resolve()
     if encoder is None: raise EvidenceError("Task 6 decoder requires a condition encoder")
@@ -364,7 +365,51 @@ def run_task6_decoder_replays(runtime: Any, run_root: str | Path, *, state: str 
     else: config_path.write_text(config_text, encoding="utf-8")
     summary = {"status": "running", "state": state, "seed": seed, "decoder_calls": 0,
                "selected_latents": 8, "failures": 0, "records": [], "config_sha256": sha256_file(config_path)}
+    monitor_started = False
+    monitor_stopped = False
+    def stop_monitor() -> None:
+        nonlocal monitor_stopped
+        if monitor is not None and monitor_started and not monitor_stopped and callable(getattr(monitor, "stop", None)):
+            monitor_stopped = True
+            try:
+                monitor.stop()
+            except BaseException as error:
+                summary.setdefault("secondary_errors", []).append({"type": type(error).__name__, "message": str(error)})
+    def canonical_resource_stop(code: str, reason: str) -> dict[str, Any]:
+        summary.update({"status": "RESOURCE_STOP", "reason_code": code, "reason": reason,
+                        "resource_stop": True, "completed_decoder_calls": int(summary.get("decoder_calls", 0))})
+        stop_monitor(); _atomic_json(status_path, summary); _decoder_manifest(root)
+        if main_status_path is not None:
+            main_path = Path(main_status_path)
+            if main_path.is_file():
+                try:
+                    main = json.loads(main_path.read_text(encoding="utf-8"))
+                    main.update({"status": "RESOURCE_STOP", "reason_code": code, "reason": reason,
+                                 "decoder_calls": int(summary.get("decoder_calls", 0)),
+                                 "decoder_status": "RESOURCE_STOP"})
+                    _atomic_json(main_path, main)
+                except (OSError, ValueError, json.JSONDecodeError):
+                    # Preserve the decoder evidence; a malformed mutable main
+                    # status is itself reported in the decoder summary.
+                    summary["main_status_update_error"] = "invalid or unwritable main status"
+                    _atomic_json(status_path, summary); _decoder_manifest(root)
+        return summary
+    def monitor_guard(remaining: int) -> dict[str, Any] | None:
+        if monitor is None: return None
+        if getattr(monitor, "failure", None) is not None:
+            return canonical_resource_stop("MONITOR_FAILURE", "decoder resource monitor failed")
+        checker = getattr(monitor, "check", None)
+        if callable(checker):
+            decision = checker(phase="pilot", starting_new_sample=True, remaining_samples=remaining, run_dir=root)
+            if decision.get("status") == "HARD_STOP":
+                return canonical_resource_stop(str(decision.get("reason_code") or "RESOURCE_STOP"), str(decision.get("reason") or "decoder resource gate stopped"))
+        return None
     with ProcessLock(root / ".decoder.lock"):
+        if monitor is not None and callable(getattr(monitor, "start", None)):
+            try:
+                monitor.start(); monitor_started = True
+            except BaseException as error:
+                return canonical_resource_stop("MONITOR_FAILURE", str(error))
         _atomic_json(status_path, summary)
         _decoder_manifest(root)
         for spec in plan:
@@ -375,6 +420,12 @@ def run_task6_decoder_replays(runtime: Any, run_root: str | Path, *, state: str 
                 for name, digest in record.get("artifact_sha256", {}).items():
                     if not (replay_dir / name).is_file() or sha256_file(replay_dir / name) != digest: raise EvidenceError("successful decoder artifact was tampered")
                 summary["records"].append(spec["replay_id"]); _atomic_json(status_path, summary); _decoder_manifest(root); continue
+            stopped = monitor_guard(len(plan) - len(summary["records"]))
+            if stopped is not None: return stopped
+            if monitor is not None and callable(getattr(monitor, "capture_sample", None)):
+                row = monitor.capture_sample(spec["replay_id"], "pre_sample", len(plan) - len(summary["records"]), root)
+                if row.get("decision_status") == "HARD_STOP":
+                    return canonical_resource_stop(str(row.get("reason_code") or "RESOURCE_STOP"), "decoder resource gate stopped before replay")
             if replay_dir.exists():
                 attempt = 1
                 while (root / f"{spec['replay_id']}.attempt.{attempt}").exists(): attempt += 1
@@ -395,13 +446,23 @@ def run_task6_decoder_replays(runtime: Any, run_root: str | Path, *, state: str 
                                  "artifact_sha256": {name: sha256_file(stage / name) for name in arrays}})
                 _atomic_json(stage / "record.json", metadata); os.replace(stage, replay_dir); stage = None
                 summary["decoder_calls"] += 1; summary["records"].append(spec["replay_id"]); _atomic_json(status_path, summary); _decoder_manifest(root)
+                if monitor is not None and callable(getattr(monitor, "capture_sample", None)):
+                    row = monitor.capture_sample(spec["replay_id"], "post_cleanup", len(plan) - len(summary["records"]), root)
+                    if row.get("decision_status") == "HARD_STOP":
+                        return canonical_resource_stop(str(row.get("reason_code") or "RESOURCE_STOP"), "decoder resource gate stopped after cleanup")
             except Exception as error:
-                summary["failures"] += 1; summary.update({"status": "BLOCKED", "error": {"type": type(error).__name__, "message": str(error)}}); _atomic_json(status_path, summary); _decoder_manifest(root); return summary
+                summary["failures"] += 1; summary.update({"status": "BLOCKED", "error": {"type": type(error).__name__, "message": str(error)}}); stop_monitor(); _atomic_json(status_path, summary); _decoder_manifest(root); return summary
             finally:
                 if stage is not None and stage.exists():
                     import shutil; shutil.rmtree(stage, ignore_errors=True)
             _atomic_json(status_path, summary); _decoder_manifest(root)
-        summary.update({"status": "COMPLETE", "decoder_calls": 16}); _atomic_json(status_path, summary); _decoder_manifest(root); return summary
+        summary.update({"status": "COMPLETE", "decoder_calls": 16}); stop_monitor()
+        if summary.get("secondary_errors"):
+            summary.update({"status": "RESOURCE_STOP", "reason_code": "MONITOR_FAILURE", "reason": "decoder resource monitor failed during shutdown"})
+        _atomic_json(status_path, summary); _decoder_manifest(root); return summary
+    # The monitor is normally stopped by the canonical status path below.  A
+    # finally block is kept outside the lock in the implementation's next
+    # revision; this branch is retained for API compatibility.
 
 
 __all__ = ["decoder_replay_plan", "reencode_frame", "replay_one", "run_task6_decoder_replays",
