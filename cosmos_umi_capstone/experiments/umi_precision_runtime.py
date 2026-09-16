@@ -91,16 +91,22 @@ class PrecisionInputs:
                 "geometry": self.geometry.metadata(), "quantizer": "bf16_round_to_nearest_even"}
 
 
-def build_call_plan(alphas):
+def build_call_plan(alphas, model_seed=0):
     alphas = tuple(float(x) for x in alphas)
     if len(alphas) != 6 or any(not np.isfinite(x) or x <= 0 for x in alphas) or sorted(set(alphas)) != list(alphas):
         raise ValueError("exactly six distinct increasing positive finite alphas required")
+    try:
+        model_seed = int(model_seed)
+    except (TypeError, ValueError) as error:
+        raise ValueError("model seed must be a non-negative integer") from error
+    if model_seed < 0:
+        raise ValueError("model seed must be a non-negative integer")
     result = []
     for group in "ABC":
         def entry(kind, alpha=0., sign=0, ordinal=None):
             suffix = kind if ordinal is None else f"alpha_{ordinal:02d}_{'plus' if sign == 1 else 'minus'}"
             return {"sample_id": f"{group}_{suffix}", "group": group, "kind": kind,
-                    "alpha": alpha, "sign": sign, "direction_index": 0, "model_seed": 0}
+                    "alpha": alpha, "sign": sign, "direction_index": 0, "model_seed": model_seed}
         result.append(entry("pre"))
         for i, alpha in enumerate(alphas):
             for sign in (1, -1):
@@ -119,6 +125,9 @@ class PrecisionCompatibilityError(EvidenceError):
 
 def validate_capture(record, spec, inputs, scope, *, paired_noise=None):
     mask = inputs.geometry.mask
+    expected_seed = int(spec.get("model_seed", spec.get("seed", 0)))
+    if expected_seed < 0:
+        raise ValueError("model seed must be non-negative")
     # Task 4 uses the fixed direction-0 ``for_call`` contract.  Later bounded
     # experiments may carry a frozen direction id in the call spec; retain the
     # same actual Cosmos observation boundary rather than duplicating it.
@@ -148,7 +157,7 @@ def validate_capture(record, spec, inputs, scope, *, paired_noise=None):
         raise EvidenceError("incorrect denoiser step coverage")
     if [x["step"] for x in steps] != list(range(count)) or not all(np.isfinite(x["timestep"]) for x in steps):
         raise EvidenceError("invalid denoiser step/timestep observations")
-    if scope == "full" and record.get("sampler_generator_seeds") != [0] * count:
+    if scope == "full" and record.get("sampler_generator_seeds") != [expected_seed] * count:
         raise EvidenceError("actual scheduler generator seed evidence is missing or unpaired")
     for role in required - {"weights", "common_condition"}:
         if {r["step"] for r in rows if r["role"] == role} != set(range(count)):
@@ -181,7 +190,7 @@ def validate_capture(record, spec, inputs, scope, *, paired_noise=None):
     if not np.array_equal(np.asarray(record["consumed_initial_mask"], dtype=bool), mask):
         raise EvidenceError("consumed initial mask differs from frozen geometry")
     noise_evidence = record["noise_evidence"]
-    if noise_evidence != {"source": "first_velocity_input", "seed": 0, "prepare_seed": 0, "batch_size": 1}:
+    if noise_evidence != {"source": "first_velocity_input", "seed": expected_seed, "prepare_seed": expected_seed, "batch_size": 1}:
         raise EvidenceError("missing or mismatched actual noise policy evidence")
     noise_hash = fixed_noise_hash(initial, mask)
     if paired_noise is not None and noise_hash != paired_noise:
@@ -241,7 +250,7 @@ def run_precision_experiment(runtime, inputs, run_dir, *, alphas, resume=False):
 
 
 def _run_precision_experiment_locked(runtime, inputs, run_dir, *, alphas, resume):
-    plan = build_call_plan(alphas)
+    plan = build_call_plan(alphas, model_seed=getattr(runtime, "model_seed", 0))
     root = Path(run_dir)
     source_paths = {Path(__file__).resolve()}
     for obj in (quantize_bf16_fp32, construct_delta, SampleStore, fingerprint, sha256_file, _atomic_rename_noreplace, type(runtime)):
@@ -328,7 +337,8 @@ def _run_precision_experiment_locked(runtime, inputs, run_dir, *, alphas, resume
             records = {}
             for group in "ABC":
                 spec = {"sample_id": f"{scope}_{group}_zero", "group": group, "alpha": 0., "sign": 0,
-                        "kind": "diagnostic", "direction_index": 0, "model_seed": 0}
+                        "kind": "diagnostic", "direction_index": 0,
+                        "model_seed": int(getattr(runtime, "model_seed", 0))}
                 attempt = next((item for item in summary["compatibility_attempts"]
                                 if item["sample_id"] == spec["sample_id"] and item.get("status") == "success"), None)
                 if attempt is None:

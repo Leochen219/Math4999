@@ -156,7 +156,7 @@ class Model:
         baseline = np.ones(shape, np.float32)
         mask = np.zeros(shape, np.float32)
         mask[:, :, 0] = 1
-        initial = np.arange(12, dtype=np.float32).reshape(shape)
+        initial = np.arange(12, dtype=np.float32).reshape(shape) + seed[0]
         initial[mask.astype(bool)] = 1
         return ([NS(condition_frame_indexes_vision=[0])], NS(x0_tokens_vision=[Native(baseline, "float32")]),
                 [[1]], [[]], [Native(initial.reshape(-1), "float32")],
@@ -204,7 +204,7 @@ class OfficialTests(unittest.TestCase):
     def setUp(self):
         self.assertIsNotNone(self.api, "official precision seam implementation is missing")
 
-    def fixture(self):
+    def fixture(self, seed=0):
         ops = Ops()
         model = Model(ops)
         direction = np.zeros((1, 1, 1, 3, 2, 2), np.float32)
@@ -215,9 +215,9 @@ class OfficialTests(unittest.TestCase):
         checkpoint.write_bytes(b"fixture checkpoint")
         decoder.write_bytes(b"fixture decoder")
         runtime = self.api.OfficialPrecisionRuntime(model, {"prompt": "mouse", "action": [1, 2]}, direction,
-            provenance={"decode": "fixture-fixed", "seed": 0}, ops=ops, scheduler_class=Scheduler,
+            provenance={"decode": "fixture-fixed", "seed": seed}, ops=ops, scheduler_class=Scheduler,
             generation_settings={"num_steps": 2, "guidance": 1., "shift": 10.},
-            artifact_paths={"checkpoint": checkpoint, "decoder": decoder})
+            artifact_paths={"checkpoint": checkpoint, "decoder": decoder}, model_seed=seed)
         return runtime, model
 
     def test_true_seams_capture_dtype_noise_reset_baseline_and_output(self):
@@ -371,6 +371,24 @@ class OfficialTests(unittest.TestCase):
         model.sampler_seed_override = 1
         with self.assertRaisesRegex(EvidenceError, "sampler seed"):
             runtime.execute({"sample_id": "B", "group": "B", "alpha": 0., "sign": 0}, runtime.inputs, scope="module")
+
+    def test_seed_one_reaches_prepare_sampler_scheduler_and_changes_only_noise_path(self):
+        runtime0, model0 = self.fixture(seed=0)
+        runtime1, model1 = self.fixture(seed=1)
+        spec0 = {"sample_id": "B0", "group": "B", "alpha": 0., "sign": 0, "model_seed": 0}
+        spec1 = {"sample_id": "B1", "group": "B", "alpha": 0., "sign": 0, "model_seed": 1}
+        record0 = runtime0.execute(spec0, runtime0.inputs, scope="full")
+        record1 = runtime1.execute(spec1, runtime1.inputs, scope="full")
+        validate_capture(record0, spec0, runtime0.inputs, "full")
+        validate_capture(record1, spec1, runtime1.inputs, "full")
+        self.assertEqual(record0["noise_evidence"], {"source": "first_velocity_input", "seed": 0, "prepare_seed": 0, "batch_size": 1})
+        self.assertEqual(record1["noise_evidence"], {"source": "first_velocity_input", "seed": 1, "prepare_seed": 1, "batch_size": 1})
+        self.assertEqual(record0["sampler_generator_seeds"], [0, 0])
+        self.assertEqual(record1["sampler_generator_seeds"], [1, 1])
+        self.assertEqual(record0["common_input_fp32"].tobytes(), record1["common_input_fp32"].tobytes())
+        self.assertNotEqual(record0["initial_noise_hash"], record1["initial_noise_hash"])
+        self.assertEqual(runtime0.inputs.identity(), runtime1.inputs.identity())
+        self.assertEqual(runtime0.settings, runtime1.settings)
 
 
 if __name__ == "__main__":

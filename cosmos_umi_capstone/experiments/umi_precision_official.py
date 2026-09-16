@@ -158,7 +158,8 @@ class _StepZeroDone(BaseException):
 
 class OfficialPrecisionRuntime:
     def __init__(self, model, data_batch, direction_bank, *, provenance, ops=None,
-                 scheduler_class=None, generation_settings=None, artifact_paths=None, inputs_factory=None):
+                 scheduler_class=None, generation_settings=None, artifact_paths=None, inputs_factory=None,
+                 model_seed=0, seed=None):
         self.model = model
         self.ops = ops or TorchOps()
         if scheduler_class is None:
@@ -166,6 +167,18 @@ class OfficialPrecisionRuntime:
             scheduler_class = FlowUniPCMultistepScheduler
         self.scheduler_class = scheduler_class
         self.provenance = copy.deepcopy(provenance)
+        if seed is not None:
+            if model_seed != 0 and int(model_seed) != int(seed):
+                raise ValueError("model_seed and seed disagree")
+            model_seed = seed
+        try:
+            model_seed = int(model_seed)
+        except (TypeError, ValueError) as error:
+            raise ValueError("model seed must be a non-negative integer") from error
+        if model_seed < 0:
+            raise ValueError("model seed must be a non-negative integer")
+        self.model_seed = model_seed
+        self.provenance["seed"] = model_seed
         from pathlib import Path
         if artifact_paths is None or set(artifact_paths) != {"checkpoint", "decoder"}:
             raise ValueError("actual checkpoint and decoder artifact paths are required")
@@ -189,7 +202,7 @@ class OfficialPrecisionRuntime:
 
         self._check_caches()
         with self.ops.inference():
-            prepared = model._prepare_inference_data(_clone_runtime(self.data_batch), [0], False)
+            prepared = model._prepare_inference_data(_clone_runtime(self.data_batch), [self.model_seed], False)
         self._check_caches()
         if not isinstance(prepared, tuple) or len(prepared) != 8:
             raise ValueError("runtime preparation must provide the verified 8-field interface")
@@ -221,7 +234,7 @@ class OfficialPrecisionRuntime:
                             "float32_matmul_precision": torch.get_float32_matmul_precision()})
         return {"data_batch": fingerprint(self.data_batch), "model_state": fingerprint(self.model.net),
                 "decoder_state": fingerprint(decoder), "model_config": fingerprint(self.model.config),
-                "prepared": fingerprint(self.prepared), "noise_policy": {"seed": 0, "batch_size": 1,
+                "prepared": fingerprint(self.prepared), "noise_policy": {"seed": self.model_seed, "batch_size": 1,
                 "source": "actual _prepare_inference_data", "initial_noise": fingerprint(self.prepared[4]),
                 "mask": fingerprint(self.prepared[6])}, "inputs": self.inputs.identity(),
                 "settings": fingerprint(self.settings),
@@ -325,8 +338,8 @@ class OfficialPrecisionRuntime:
             scheduler_ids = []
             def prepare(*args, **kwargs):
                 bound = inspect.signature(original_prepare).bind_partial(*args, **kwargs)
-                if bound.arguments.get("seed") != [0]:
-                    raise EvidenceError("actual preparation seed is not paired seed zero")
+                if bound.arguments.get("seed") != [self.model_seed]:
+                    raise EvidenceError("actual preparation seed is not paired to requested model seed")
                 prepared = self._prepared_for_call(target)
                 record["initial_state"] = projection(prepared[4][0]).reshape(inputs.z_bar.shape)
                 record["noise_evidence"] = {"source": "first_velocity_input", "seed": int(bound.arguments["seed"][0]),
@@ -336,8 +349,8 @@ class OfficialPrecisionRuntime:
             def sampler_forward(*args, **kwargs):
                 bound = inspect.signature(original_sampler_forward).bind_partial(*args, **kwargs)
                 seeds = bound.arguments.get("seed")
-                if seeds != [0]:
-                    raise EvidenceError("actual sampler seed is not paired seed zero")
+                if seeds != [self.model_seed]:
+                    raise EvidenceError("actual sampler seed is not paired to requested model seed")
                 noise = bound.arguments["noise"]
                 if len(noise) != 1 or str(noise[0].dtype).removeprefix("torch.") != "float32":
                     raise EvidenceError("sampler consumed initial state must be one FP32 sample")
@@ -452,8 +465,8 @@ class OfficialPrecisionRuntime:
                 evidence.record("sampler_accumulator", sample, step=step)
                 generator = bound.arguments.get("generator")
                 generator_seed = int(generator.initial_seed()) if generator is not None else None
-                if generator_seed != 0:
-                    raise EvidenceError("actual scheduler generator seed is not zero")
+                if generator_seed != self.model_seed:
+                    raise EvidenceError("actual scheduler generator seed is not paired to requested model seed")
                 record.setdefault("sampler_generator_seeds", []).append(generator_seed)
                 if step == 0 and not np.array_equal(projection(sample).reshape(inputs.z_bar.shape), record["consumed_initial_state"]):
                     raise EvidenceError("scheduler consumed initial state changed after first velocity")
@@ -472,7 +485,7 @@ class OfficialPrecisionRuntime:
             patch(self.scheduler_class, "step", scheduler_step)
             with ops.inference():
                 try:
-                    result = model.generate_samples_from_batch(_clone_runtime(self.data_batch), seed=[0],
+                    result = model.generate_samples_from_batch(_clone_runtime(self.data_batch), seed=[self.model_seed],
                         num_steps=self.settings["num_steps"], guidance=1., shift=10., has_negative_prompt=False,
                         skip_text_tokens_for_cfg=False, normalize_cfg=False, use_batched_cfg=False)
                     if scope == "module":
