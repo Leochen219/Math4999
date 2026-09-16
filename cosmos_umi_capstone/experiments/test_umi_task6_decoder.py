@@ -14,14 +14,14 @@ import umi_task6_decoder as api
 
 class DecoderTests(unittest.TestCase):
     def _raw(self, root):
-        ids = [item["sample_id"] for item in api.select_decoder_latents()]
+        ids = [item["sample_id"] for item in api.build_generation_plan()]
         for sample_id in ids:
             sample = root / "samples" / sample_id; sample.mkdir(parents=True)
             np.save(sample / "output_full.npy", np.zeros((3, 2, 2, 2), np.float32), allow_pickle=False)
             digest = hashlib.sha256((sample / "output_full.npy").read_bytes()).hexdigest()
             (sample / "sample.json").write_text(json.dumps({"sample_id": sample_id}), encoding="utf-8")
             (sample / "status.json").write_text(json.dumps({"status": "success", "artifact_sha256": {"output_full.npy": digest}}), encoding="utf-8")
-        completed = [f"sample_{i:02d}" for i in range(32)]
+        completed = ids
         (root / "run_status.json").write_text(json.dumps({"status": "AWAITING_REVIEW", "completed_samples": completed, "group": {"state": "bridge_0", "seed": 0}}), encoding="utf-8")
         entries = []
         for path in sorted(root.rglob("*")):
@@ -109,6 +109,42 @@ class DecoderTests(unittest.TestCase):
             api.run_task6_decoder_replays(Runtime(), raw, encoder=Encoder(), decoder_root=decoder)
             target = next(decoder.glob("*__native_bf16/decoded_final_float32.npy")); target.write_bytes(b"tampered")
             with self.assertRaises(Exception): api.run_task6_decoder_replays(Runtime(), raw, encoder=Encoder(), decoder_root=decoder, resume=True)
+
+    def test_raw_manifest_rejects_unlisted_resource_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            raw = Path(temporary) / "raw"; self._raw(raw)
+            (raw / "unexpected.bin").write_bytes(b"not in the evidence manifest")
+            with self.assertRaises(Exception): api._verify_raw_task6(raw)
+
+    def test_partial_decoder_run_resumes_without_replaying_successes(self):
+        class Runtime:
+            decoder_state = "bf16"
+            def __init__(self, fail_after=None): self.calls = 0; self.fail_after = fail_after
+            def decode_prediction_latent(self, latent, *, precision):
+                self.calls += 1
+                if self.fail_after is not None and self.calls > self.fail_after: raise RuntimeError("planned stop")
+                return np.zeros((3, 2, 2, 2), np.float32)
+            def restore_decoder_state(self): self.decoder_state = "bf16"
+        class Encoder:
+            def __call__(self, frame): return np.asarray(frame, np.float32).mean(keepdims=True)
+        with tempfile.TemporaryDirectory() as temporary:
+            raw = Path(temporary) / "raw"; self._raw(raw); decoder = Path(temporary) / "decoder"
+            first = Runtime(3); stopped = api.run_task6_decoder_replays(first, raw, encoder=Encoder(), decoder_root=decoder)
+            self.assertEqual(stopped["status"], "BLOCKED"); self.assertEqual(first.calls, 4)
+            completed_dirs = [p for p in decoder.iterdir() if p.is_dir() and p.name.endswith(("__native_bf16", "__temporary_fp32"))]
+            before = {p.name: (p / "record.json").stat().st_mtime_ns for p in completed_dirs}
+            second = Runtime(); resumed = api.run_task6_decoder_replays(second, raw, encoder=Encoder(), decoder_root=decoder, resume=True)
+            self.assertEqual(resumed["status"], "COMPLETE"); self.assertEqual(second.calls, 13)
+            self.assertEqual(before, {p.name: (p / "record.json").stat().st_mtime_ns for p in completed_dirs})
+
+    def test_encoder_failure_restores_cache_and_keeps_primary_error(self):
+        class Encoder:
+            state = "clean"
+            def reset_cache(self): self.state = "clean"
+            def __call__(self, frame): self.state = "dirty"; raise RuntimeError("encoder failed")
+        with self.assertRaises(RuntimeError) as context:
+            api.reencode_frame(np.zeros((3, 2, 2), np.float32), Encoder())
+        self.assertEqual(str(context.exception), "encoder failed")
 
 
 if __name__ == "__main__": unittest.main()

@@ -215,7 +215,9 @@ class Task6RuntimeAdapter:
         return method() if callable(method) else {"runtime": type(self.runtime).__name__}
 
     def execute(self, spec: Mapping[str, Any], inputs: Task6Inputs | None = None, *, scope: str = "full"):
-        target = self.inputs
+        target = inputs or self.inputs
+        if target is not self.inputs and target.identity() != self.inputs.identity():
+            raise ValueError("Task 6 adapter inputs do not match bound group")
         request = dict(spec)
         # The validated Task 5 seam names its single FP32 execution path C;
         # Task 6 state/seed are carried alongside it, never used to branch the
@@ -224,7 +226,31 @@ class Task6RuntimeAdapter:
         request.setdefault("model_seed", request.get("seed", self.inputs.seed))
         if scope not in ("full", "module"):
             raise ValueError("official runtime supports only full or module scope")
-        return self.runtime.execute(request, target, scope=scope)
+        record = dict(self.runtime.execute(request, target, scope=scope))
+        consumed = target.for_spec({**request, "state": target.state, "seed": target.seed})
+        actual_delta = np.subtract(consumed, target.z_bar, dtype=np.float32)
+        direction = np.zeros_like(target.z_bar, dtype=np.float32)
+        expected_delta = np.zeros_like(target.z_bar, dtype=np.float32)
+        if spec.get("kind") == "perturbation":
+            direction = np.array(target.directions[spec["direction_id"]], dtype=np.float32, copy=True)
+            expected_delta = np.multiply(np.float32(spec["sign"] * float(spec["alpha"]) * target.s_z), direction, dtype=np.float32)
+            expected_delta[~target.geometry.mask] = 0.0
+        fields = {"z_bar": np.array(target.z_bar, dtype=np.float32, copy=True), "mask": np.array(target.geometry.mask, dtype=bool, copy=True),
+                  "direction": direction, "actual_delta_fp32": actual_delta, "target_delta_fp32": expected_delta,
+                  "s_z": float(target.s_z), "spec": dict(spec), "group": {"state": target.state, "seed": target.seed}, "seed": target.seed, "model_seed": target.seed}
+        for name, value in fields.items():
+            if name in record:
+                existing = record[name]
+                if isinstance(value, np.ndarray):
+                    if not np.array_equal(np.asarray(existing), value): raise ValueError(f"runtime returned mismatched Task 6 field: {name}")
+                elif existing != value: raise ValueError(f"runtime returned mismatched Task 6 field: {name}")
+            record[name] = value
+        if "predicted_latent" not in record:
+            if "output_full" not in record: raise ValueError("runtime record lacks predicted latent/output_full")
+            record["predicted_latent"] = np.array(record["output_full"], dtype=np.float32, copy=True)
+        else:
+            record["predicted_latent"] = np.array(record["predicted_latent"], dtype=np.float32, copy=True)
+        return record
 
     def cleanup(self) -> None:
         """Release per-call state while retaining the resident validated model."""

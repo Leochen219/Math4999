@@ -104,6 +104,19 @@ class Task6RuntimeTests(unittest.TestCase):
         self.assertIn("output_full", result); self.assertEqual(runtime.seen[0]["group"], "C")
         self.assertTrue(np.array_equal(result["output_full"], inputs.for_spec(runtime.seen[0])))
 
+    def test_adapter_publishes_immutable_task6_input_schema_for_baseline_and_perturbation(self):
+        inputs = self.inputs()
+        class StrictRuntime:
+            def __init__(self): self.inputs = inputs
+            def execute(self, spec, runtime_inputs, *, scope): return {"output_full": np.zeros((2,), np.float32)}
+        adapter = self.api.Task6RuntimeAdapter(StrictRuntime(), inputs)
+        for spec in ({"state":"bridge_0","seed":0,"kind":"baseline","alpha":0.0,"sign":0}, {"state":"bridge_0","seed":0,"kind":"perturbation","direction_id":"v0","alpha":0.001,"sign":1}):
+            record = adapter.execute(spec)
+            for key in ("z_bar", "mask", "direction", "actual_delta_fp32", "target_delta_fp32", "s_z", "spec", "group", "predicted_latent"):
+                self.assertIn(key, record)
+            self.assertEqual(record["group"], {"state":"bridge_0","seed":0})
+            self.assertEqual(record["predicted_latent"].dtype, np.float32)
+
     def test_adapter_cleanup_uses_runtime_seam(self):
         inputs = self.inputs(); calls = []
         class StrictRuntime:

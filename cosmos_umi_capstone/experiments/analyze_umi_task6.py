@@ -24,12 +24,10 @@ from typing import Any, Mapping
 import numpy as np
 
 try:
-    from .analyze_umi_task5 import analyze_task5_records
     from .umi_task5_primitives import ALPHAS, DIRECTION_IDS
     from .umi_task6_primitives import STATE_IDS, SEEDS
     from .umi_task6_decoder import sha256_file
 except ImportError:  # pragma: no cover
-    from analyze_umi_task5 import analyze_task5_records
     from umi_task5_primitives import ALPHAS, DIRECTION_IDS
     from umi_task6_primitives import STATE_IDS, SEEDS
     from umi_task6_decoder import sha256_file
@@ -140,12 +138,27 @@ def _derive_plan_detail(records: Mapping[str, Mapping[str, Any]]) -> dict[str, A
         item = next((records.get(f"{direction}_alpha_{i:02d}_plus") for i in range(len(ALPHAS)) if records.get(f"{direction}_alpha_{i:02d}_plus") is not None), None)
         if not isinstance(item, Mapping) or "direction" not in item: raise ValueError(f"missing frozen direction tensor: {direction}")
         directions[direction] = np.asarray(item["direction"], dtype=np.float32)
+        if directions[direction].shape != z_bar.shape or not np.all(np.isfinite(directions[direction])):
+            raise ValueError(f"direction {direction} has invalid shape or nonfinite values")
+        if not np.all(directions[direction][~mask] == 0.0) or not math.isclose(rms64(directions[direction][mask]), 1.0, rel_tol=0.0, abs_tol=2e-5):
+            raise ValueError(f"direction {direction} is not mask-only unit RMS")
     c01 = rms64((directions["v0"].astype(np.float32) + directions["v1"].astype(np.float32))[mask])
     c12 = rms64((directions["v1"].astype(np.float32) + directions["v2"].astype(np.float32))[mask])
     for combo, left, right, coefficient in (("u01", "v0", "v1", c01), ("u12", "v1", "v2", c12)):
         expected = np.divide(np.add(directions[left], directions[right], dtype=np.float32), np.float32(coefficient), dtype=np.float32)
         if not np.array_equal(expected[~mask], directions[combo][~mask]) or not np.allclose(expected[mask], directions[combo][mask], rtol=0.0, atol=2e-6):
             raise ValueError(f"saved combination direction {combo} is inconsistent with v directions")
+    for sample_id, item in records.items():
+        for field in ("z_bar", "mask", "direction", "actual_delta_fp32", "target_delta_fp32"):
+            if field not in item: raise ValueError(f"sample {sample_id} lacks immutable Task 6 field {field}")
+        if not np.array_equal(np.asarray(item["z_bar"], np.float32), z_bar) or not np.array_equal(np.asarray(item["mask"], bool), mask): raise ValueError("Task 6 samples do not share z_bar/mask")
+        expected_direction = np.zeros_like(z_bar, np.float32) if sample_id.startswith("baseline_") else directions.get(sample_id.split("_alpha", 1)[0])
+        if expected_direction is None or not np.array_equal(np.asarray(item["direction"], np.float32), expected_direction): raise ValueError(f"sample {sample_id} direction is not frozen")
+        alpha = 0.0 if sample_id.startswith("baseline_") else float(next(value for value in ALPHAS if f"alpha_{ALPHAS.index(value):02d}" in sample_id))
+        sign = 0 if sample_id.startswith("baseline_") else (1 if sample_id.endswith("plus") else -1)
+        expected_delta = np.multiply(np.float32(sign * alpha * s_z), expected_direction, dtype=np.float32); expected_delta[~mask] = 0.0
+        if not np.array_equal(np.asarray(item["target_delta_fp32"], np.float32), expected_delta) or not np.array_equal(np.asarray(item["actual_delta_fp32"], np.float32), expected_delta): raise ValueError(f"sample {sample_id} consumed delta mismatch")
+        if "s_z" in item and not math.isclose(float(item["s_z"]), s_z, rel_tol=0.0, abs_tol=1e-7): raise ValueError(f"sample {sample_id} s_z mismatch")
     return {"s_z": s_z, "combination_coefficients": {"c01": c01, "c12": c12}}
 
 
@@ -205,44 +218,116 @@ def _recompute_fp32_core(records: Mapping[str, Mapping[str, Any]], result: dict[
     return result
 
 
+def _cosine32(left: Any, right: Any) -> float | None:
+    lhs = np.asarray(left, dtype=np.float32).reshape(-1)
+    rhs = np.asarray(right, dtype=np.float32).reshape(-1)
+    if lhs.shape != rhs.shape or not np.all(np.isfinite(lhs)) or not np.all(np.isfinite(rhs)):
+        return None
+    denom = math.sqrt(float(np.dot(lhs.astype(np.float64), lhs.astype(np.float64)))) * math.sqrt(float(np.dot(rhs.astype(np.float64), rhs.astype(np.float64))))
+    return None if denom == 0.0 else float(np.dot(lhs.astype(np.float64), rhs.astype(np.float64)) / denom)
+
+
+def _fit_loglog32(steps: list[float], responses: list[float]) -> dict[str, float | None]:
+    x = np.asarray(steps, dtype=np.float64); y = np.asarray(responses, dtype=np.float64)
+    if len(x) < 2 or np.any(x <= 0) or np.any(y <= 0) or not np.all(np.isfinite(x)) or not np.all(np.isfinite(y)):
+        return {"slope": None, "intercept": None, "r2": None}
+    lx, ly = np.log(x), np.log(y)
+    slope, intercept = np.polyfit(lx, ly, 1)
+    predicted = slope * lx + intercept
+    total = float(np.sum((ly - np.mean(ly)) ** 2, dtype=np.float64)); residual = float(np.sum((ly - predicted) ** 2, dtype=np.float64))
+    return {"slope": float(slope), "intercept": float(intercept), "r2": 1.0 if total == 0 and residual == 0 else (None if total == 0 else float(1 - residual / total))}
+
+
+def _candidate32(direction_id: str, entries: list[dict[str, Any]], floor: float, quantity: str) -> dict[str, Any]:
+    pfit = _fit_loglog32([float(e["h_plus_actual"]) for e in entries], [float(e[f"plus_{quantity}_rms"]) for e in entries])
+    mfit = _fit_loglog32([float(e["h_minus_actual"]) for e in entries], [float(e[f"minus_{quantity}_rms"]) for e in entries])
+    reasons: list[str] = []
+    for e in entries:
+        alpha = e["alpha"]
+        if not e["input_nonzero"]: reasons.append(f"alpha={alpha}: effective input is zero")
+        for key in ("plus_input_cosine", "minus_input_cosine"):
+            if e[key] is None or e[key] < .99: reasons.append(f"alpha={alpha}: {key} below 0.99")
+        if e["plus_minus_input_cosine"] is None or e["plus_minus_input_cosine"] > -.99: reasons.append(f"alpha={alpha}: signed inputs are not opposite")
+        for side in ("plus", "minus"):
+            response = e[f"{side}_{quantity}_rms"]
+            if response is None or (response == 0.0 if floor == 0.0 else response <= 10.0 * floor): reasons.append(f"alpha={alpha}: {side} response is below floor gate")
+    for side, fit in (("plus", pfit), ("minus", mfit)):
+        if fit["slope"] is None or not .8 <= fit["slope"] <= 1.2: reasons.append(f"{side} slope outside [0.8,1.2]")
+        if fit["r2"] is None or fit["r2"] < .98: reasons.append(f"{side} R2 below 0.98")
+    for e in entries[:-1]:
+        cosine = e.get(f"next_{quantity}_dactual_cosine"); relative = e.get(f"next_{quantity}_dactual_relative_change")
+        if cosine is None or cosine < .95: reasons.append(f"alpha={e['alpha']}: adjacent derivative cosine below 0.95")
+        if relative is None or relative > .25: reasons.append(f"alpha={e['alpha']}: adjacent derivative change above 0.25")
+    return {"direction_id": direction_id, "quantity": quantity, "plus_slope": pfit["slope"], "plus_r2": pfit["r2"], "minus_slope": mfit["slope"], "minus_r2": mfit["r2"], "baseline_floor_rms": floor, "candidate_status": "PASS" if not reasons else "FAIL", "failure_reasons": " | ".join(reasons), "window_alphas": ",".join(str(e["alpha"]) for e in entries)}
+
+
 def analyze_task6_records(records: Mapping[str, Mapping[str, Any]], *, plan_detail: Mapping[str, Any] | None = None,
                           group: Mapping[str, Any] | None = None, strict: bool = False) -> dict[str, Any]:
-    """Recompute the unchanged Task 5 metrics from one Task 6 group.
+    """Analyze Task 6 evidence directly, with FP32 tensor arithmetic.
 
-    Missing, stopped, or nonfinite evidence is a truthful incomplete result by
-    default.  ``strict=True`` is useful for callers that want an exception.
+    This implementation intentionally does not call the historical Task 5
+    analyzer: Task 6's subtraction order and evidence schema are part of its
+    reproducibility contract.
     """
-    normalized = _normalize_records(records)
-    missing = sorted(_required_ids() - set(normalized))
+    normalized = _normalize_records(records); missing = sorted(_required_ids() - set(normalized))
     if missing:
         if strict: raise ValueError("incomplete Task 6 group: " + ", ".join(missing))
         return _status_incomplete(missing)
-    derived = _derive_plan_detail(normalized)
-    detail = dict(plan_detail or {})
-    if not detail: detail = derived
-    else:
-        if "combination_coefficients" not in detail: raise ValueError("Task 6 scientific plan detail is incomplete")
-        detail.setdefault("s_z", derived["s_z"])
-        if not math.isclose(float(detail["s_z"]), float(derived["s_z"]), rel_tol=0.0, abs_tol=1e-7): raise ValueError("s_z differs from saved tensors")
-        for key in ("c01", "c12"):
-            if not math.isclose(float(detail["combination_coefficients"][key]), float(derived["combination_coefficients"][key]), rel_tol=0.0, abs_tol=1e-7): raise ValueError(f"{key} differs from saved directions")
     try:
-        result = analyze_task5_records(normalized, plan_detail=detail)
-    except (ValueError, FloatingPointError) as error:
+        derived = _derive_plan_detail(normalized); detail = dict(derived)
+        if plan_detail is not None:
+            supplied = dict(plan_detail)
+            if "combination_coefficients" not in supplied: raise ValueError("Task 6 scientific plan detail is incomplete")
+            supplied.setdefault("s_z", derived["s_z"]); detail = supplied
+            if not math.isclose(float(detail["s_z"]), float(derived["s_z"]), rel_tol=0, abs_tol=1e-7): raise ValueError("s_z differs from saved tensors")
+            for key in ("c01", "c12"):
+                if not math.isclose(float(detail["combination_coefficients"][key]), float(derived["combination_coefficients"][key]), rel_tol=0, abs_tol=1e-7): raise ValueError(f"{key} differs from saved directions")
+        coefficients = detail["combination_coefficients"]; c01, c12 = float(coefficients["c01"]), float(coefficients["c12"])
+        y0 = np.asarray(normalized["baseline_pre"]["predicted_latent"], dtype=np.float32); ypost = np.asarray(normalized["baseline_post"]["predicted_latent"], dtype=np.float32)
+        rgb0 = np.asarray(normalized["baseline_pre"].get("decoded_final", np.zeros((), np.float32)), dtype=np.float32); rgbpost = np.asarray(normalized["baseline_post"].get("decoded_final", rgb0), dtype=np.float32)
+        floors = [{"quantity": "predicted_latent", "baseline_pre_post_rms": _rms32_to64(_sub32(ypost, y0)), "baseline_pre_post_max_abs": float(np.max(np.abs(_sub32(ypost, y0))) if y0.size else 0.)}, {"quantity": "decoded_final_rgb", "baseline_pre_post_rms": _rms32_to64(_sub32(rgbpost, rgb0)), "baseline_pre_post_max_abs": float(np.max(np.abs(_sub32(rgbpost, rgb0))) if rgb0.size else 0.)}]
+        floors_map = {row["quantity"]: row["baseline_pre_post_rms"] for row in floors}; points: list[dict[str, Any]] = []; derivatives: list[dict[str, Any]] = []; tensors: dict[str, np.ndarray] = {}; central: dict[tuple[str, float], np.ndarray] = {}; actual_steps: dict[tuple[str, float], float] = {}; by_direction: dict[str, list[dict[str, Any]]] = {}
+        for direction_id in DIRECTION_IDS:
+            entries: list[dict[str, Any]] = []
+            for ordinal, alpha in enumerate(ALPHAS):
+                plus = normalized[f"{direction_id}_alpha_{ordinal:02d}_plus"]; minus = normalized[f"{direction_id}_alpha_{ordinal:02d}_minus"]; mask = np.asarray(plus["mask"], dtype=bool); direction = np.asarray(plus["direction"], dtype=np.float32); pd = np.asarray(plus["actual_delta_fp32"], dtype=np.float32); md = np.asarray(minus["actual_delta_fp32"], dtype=np.float32)
+                if mask.shape != direction.shape or pd.shape != mask.shape or md.shape != mask.shape: raise ValueError("Task 6 input geometry shape mismatch")
+                if not np.all(pd[~mask] == 0) or not np.all(md[~mask] == 0): raise ValueError("Task 6 actual delta changed outside mask")
+                hp, hm = _rms32_to64(pd[mask]), _rms32_to64(md[mask]); denominator = hp + hm
+                if denominator == 0: raise ValueError("Task 6 effective central-difference step is zero")
+                yp = np.asarray(plus["predicted_latent"], dtype=np.float32); ym = np.asarray(minus["predicted_latent"], dtype=np.float32); rp = _sub32(yp, y0); rm = _sub32(ym, y0); diff = _sub32(yp, ym); d = np.divide(diff, np.float32(denominator), dtype=np.float32); central[(direction_id, float(alpha))] = d; actual_steps[(direction_id, float(alpha))] = (denominator / 2.0); tensors[f"dactual_{direction_id}_{ordinal:02d}.npy"] = d
+                r_plus_rgb = _sub32(np.asarray(plus.get("decoded_final", rgb0), np.float32), rgb0); r_minus_rgb = _sub32(np.asarray(minus.get("decoded_final", rgb0), np.float32), rgb0)
+                d_rgb = np.divide(_sub32(np.asarray(plus.get("decoded_final", rgb0), np.float32), np.asarray(minus.get("decoded_final", rgb0), np.float32)), np.float32(denominator), dtype=np.float32); tensors[f"dactual_rgb_{direction_id}_{ordinal:02d}.npy"] = d_rgb
+                entry = {"direction_id": direction_id, "alpha": float(alpha), "h_plus_actual": hp, "h_minus_actual": hm, "h_target": float(alpha * detail["s_z"]), "plus_input_cosine": _cosine32(pd[mask], direction[mask]), "minus_input_cosine": _cosine32(md[mask], -direction[mask]), "plus_minus_input_cosine": _cosine32(pd[mask], md[mask]), "plus_outside_mask_exact": bool(np.all(pd[~mask] == 0)), "minus_outside_mask_exact": bool(np.all(md[~mask] == 0)), "input_nonzero": hp > 0 and hm > 0, "plus_predicted_latent_rms": _rms32_to64(rp), "minus_predicted_latent_rms": _rms32_to64(rm), "plus_decoded_final_rgb_rms": _rms32_to64(r_plus_rgb), "minus_decoded_final_rgb_rms": _rms32_to64(r_minus_rgb), "dactual_predicted_latent_rms": _rms32_to64(d), "dactual_decoded_final_rgb_rms": _rms32_to64(d_rgb)}; entries.append(entry)
+                for sign, record, actual, target, response, rgb_response in ((1, plus, pd, plus["target_delta_fp32"], rp, r_plus_rgb), (-1, minus, md, minus["target_delta_fp32"], rm, r_minus_rgb)):
+                    target_rms = _rms32_to64(np.asarray(target, np.float32)[mask]); actual_rms = _rms32_to64(actual[mask]); points.append({"sample_id": f"{direction_id}_alpha_{ordinal:02d}_{'plus' if sign == 1 else 'minus'}", "direction_id": direction_id, "alpha": float(alpha), "sign": sign, "target_delta_rms": target_rms, "actual_delta_rms": actual_rms, "actual_over_target": None if target_rms == 0 else actual_rms / target_rms, "target_direction_cosine": _cosine32(actual[mask], np.float32(sign) * direction[mask]), "outside_mask_exact": bool(np.all(actual[~mask] == 0)), "predicted_latent_response_rms": _rms32_to64(response), "decoded_final_rgb_response_rms": _rms32_to64(rgb_response)})
+            for i in range(len(entries) - 1):
+                current, following = entries[i], entries[i + 1]; d0 = central[(direction_id, current["alpha"])]; d1 = central[(direction_id, following["alpha"])]
+                current["next_predicted_latent_dactual_cosine"] = _cosine32(d0, d1); current["next_predicted_latent_dactual_relative_change"] = None if _rms32_to64(d0) == 0 else _rms32_to64(_sub32(d1, d0)) / _rms32_to64(d0)
+                rg0 = tensors[f"dactual_rgb_{direction_id}_{i:02d}.npy"]; rg1 = tensors[f"dactual_rgb_{direction_id}_{i+1:02d}.npy"]; current["next_decoded_final_rgb_dactual_cosine"] = _cosine32(rg0, rg1); current["next_decoded_final_rgb_dactual_relative_change"] = None if _rms32_to64(rg0) == 0 else _rms32_to64(_sub32(rg1, rg0)) / _rms32_to64(rg0)
+            entries[-1]["next_predicted_latent_dactual_cosine"] = None; entries[-1]["next_predicted_latent_dactual_relative_change"] = None; entries[-1]["next_decoded_final_rgb_dactual_cosine"] = None; entries[-1]["next_decoded_final_rgb_dactual_relative_change"] = None; by_direction[direction_id] = entries; derivatives.extend(entries)
+        fits = [_candidate32(d, values, floors_map["predicted_latent"], "predicted_latent") for d, values in by_direction.items()]; image_fits = [_candidate32(d, values, floors_map["decoded_final_rgb"], "decoded_final_rgb") for d, values in by_direction.items()]
+        additivity: list[dict[str, Any]] = []
+        for label, combo, left, right, coefficient in (("01", "u01", "v0", "v1", c01), ("12", "u12", "v1", "v2", c12)):
+            for ordinal, alpha in enumerate(ALPHAS):
+                residual = _sub32(np.multiply(np.float32(coefficient), central[(combo, float(alpha))], dtype=np.float32), np.add(central[(left, float(alpha))], central[(right, float(alpha))], dtype=np.float32)); denominator = _rms32_to64(central[(left, float(alpha))]) + _rms32_to64(central[(right, float(alpha))]); absolute = _rms32_to64(residual); relative = None if denominator == 0 else absolute / denominator; tensors[f"additivity_{label}_{ordinal:02d}.npy"] = residual; additivity.append({"pair": label, "alpha": float(alpha), "coefficient": coefficient, "absolute_rms": absolute, "relative_error": relative, "status": "N/A" if relative is None else ("PASS" if relative <= .10 else "FAIL")})
+        g = {d: central[(d, float(ALPHAS[0]))] for d in ("v0", "v1", "v2")}; g["u01"] = np.divide(np.add(g["v0"], g["v1"], dtype=np.float32), np.float32(c01), dtype=np.float32); g["u12"] = np.divide(np.add(g["v1"], g["v2"], dtype=np.float32), np.float32(c12), dtype=np.float32); predictions: list[dict[str, Any]] = []
+        for d in DIRECTION_IDS:
+            ordinals = (1, 2) if d in ("v0", "v1", "v2") else (0, 1, 2)
+            for ordinal in ordinals:
+                alpha = float(ALPHAS[ordinal]); h = actual_steps[(d, alpha)]
+                for sign in (1, -1):
+                    actual = np.asarray(normalized[f"{d}_alpha_{ordinal:02d}_{'plus' if sign == 1 else 'minus'}"]["predicted_latent"], np.float32); estimate = np.add(y0, np.multiply(np.float32(sign * h), g[d], dtype=np.float32), dtype=np.float32); residual = _sub32(actual, estimate); response = _sub32(actual, y0); rr = _rms32_to64(response); rel = None if rr == 0 else _rms32_to64(residual) / rr; key = f"prediction_residual_{d}_{ordinal:02d}_{'p' if sign == 1 else 'm'}.npy"; tensors[key] = residual; predictions.append({"direction_id": d, "alpha": alpha, "sign": sign, "estimate_alpha": float(ALPHAS[0]), "response_rms": rr, "absolute_rms": _rms32_to64(residual), "relative_error": rel, "status": "N/A" if rel is None else ("PASS" if rel <= .10 else "FAIL"), "residual_tensor": key})
+        summary = {"direction_candidates_pass": sum(x["candidate_status"] == "PASS" for x in fits), "direction_candidates_total": 5, "additivity_pass": sum(x["status"] == "PASS" for x in additivity), "prediction_pass": sum(x["status"] == "PASS" for x in predictions), "additivity_total": 6, "prediction_total": 24, "max_additivity_error": max((x["relative_error"] for x in additivity if x["relative_error"] is not None), default=None), "max_holdout_error": max((x["relative_error"] for x in predictions if x["relative_error"] is not None), default=None), "reduction": "explicit float32 subtraction; float64 reductions/fits"}
+        result = {"status": "COMPLETE", "group": dict(group or {}), "raw_sample_count": len(normalized), "derivation": {"s_z": float(detail["s_z"]), "combination_coefficients": {"c01": c01, "c12": c12}}, "baseline_floors": floors, "points": points, "derivatives": derivatives, "fits": fits, "image_fits": image_fits, "additivity": additivity, "predictions": predictions, "decoder": {"status": "NOT_RUN", "metrics": [], "reason": "decoder replay has not been loaded"}, "tensors": tensors, "summary": summary}
+        group_id = f"{result['group'].get('state','')}__seed_{result['group'].get('seed','')}" if result["group"] else ""; result["cross_group_status"] = summarize_cross_groups({group_id: result}) if group_id != "__seed_" else summarize_cross_groups({}); return result
+    except (ValueError, FloatingPointError, KeyError) as error:
         if strict: raise
         return _status_incomplete([], reason=f"invalid raw evidence: {type(error).__name__}: {error}")
-    result = dict(result)
-    result.update({"status": "COMPLETE", "group": dict(group or {}), "raw_sample_count": len(normalized)})
-    result["summary"] = {**dict(result.get("summary", {})), "additivity_total": 6, "prediction_total": 24,
-                          "max_additivity_error": max((row.get("relative_error") or 0.0 for row in result.get("additivity", [])), default=None),
-                          "max_holdout_error": max((row.get("relative_error") or 0.0 for row in result.get("predictions", [])), default=None)}
-    group_id = f"{result.get('group', {}).get('state', '')}__seed_{result.get('group', {}).get('seed', '')}" if result.get("group") else ""
-    result["cross_group_status"] = summarize_cross_groups({group_id: result}) if group_id != "__seed_" else summarize_cross_groups({})
-    return _recompute_fp32_core(normalized, result, detail)
 
 
 def _manifest_entries(root: Path, *, exclude: set[str] | None = None, include_bundle: bool = False) -> dict[str, str]:
-    excluded = set(exclude or ()) | {"MANIFEST.sha256"}
+    excluded = set(exclude or ()) | {"MANIFEST.sha256", ".runner.lock"}
     if not include_bundle: excluded.add("review_bundle.zip")
     return {path.relative_to(root).as_posix(): sha256_file(path)
             for path in sorted(root.rglob("*")) if path.is_file() and path.name not in excluded}
@@ -314,6 +399,7 @@ def analyze_decoder_replays(run_root: str | Path, decoder_root: str | Path | Non
         return {"status": "INVALID", "metrics": [], "reason": "decoder is bound to a different raw manifest"}
     if expected_group is not None and config.get("raw_group") != dict(expected_group):
         return {"status": "INVALID", "metrics": [], "reason": "decoder group identity mismatch"}
+    raw_records = _normalize_records(_load_records(raw))
     records: dict[str, dict[str, Any]] = {}
     for path in sorted(root.iterdir()):
         if not path.is_dir() or not (path / "record.json").is_file(): continue
@@ -321,7 +407,7 @@ def analyze_decoder_replays(run_root: str | Path, decoder_root: str | Path | Non
         for array_path in path.glob("*.npy"): record[array_path.stem] = np.load(array_path, allow_pickle=False)
         records[path.name] = record
     if len(records) != 16: return {"status": "INCOMPLETE", "metrics": [], "reason": f"expected 16 decoder records, found {len(records)}"}
-    rows = []; space_rows: list[dict[str, Any]] = []
+    rows = []; space_rows: list[dict[str, Any]] = []; decoder_tensors: dict[str, np.ndarray] = {}
     for name, record in sorted(records.items()):
         arrays = [value for key, value in record.items() if key.endswith("float32") and isinstance(value, np.ndarray)]
         row = {"replay_id": name, "precision": record.get("spec", {}).get("decode_precision", record.get("precision")),
@@ -348,27 +434,36 @@ def analyze_decoder_replays(run_root: str | Path, decoder_root: str | Path | Non
         source_records[str(spec.get("decode_precision"))][logical] = {**meta, **{p.stem: np.load(p, allow_pickle=False) for p in path.glob("*.npy")}}
     spaces = {"native_bf16": "native_rgb", "temporary_fp32": "fp32_rgb"}
     for precision, rgb_space in spaces.items():
-        values = {rgb_space: "decoded_final_float32", "direct_float_condition_latent": "direct_condition_latent_float32", "uint8_sim_condition_latent": "uint8_condition_latent_float32"}
+            values = {"prediction_latent": "decoder_input_full_latent", rgb_space: "decoded_final_float32", "direct_float_condition_latent": "direct_condition_latent_float32", "uint8_sim_condition_latent": "uint8_condition_latent_float32"}
         for space, key in values.items():
             source = source_records[precision]
-            if any(item not in source or key not in source[item] for item in ("baseline_pre", "baseline_post")): continue
+            if any(item not in source or key not in source[item] for item in ("baseline_pre", "baseline_post")):
+                space_rows.append({"space": space, "precision": precision, "direction_id": "v0", "status": "N/A", "reason": "missing_pair"})
+                continue
             base = source["baseline_pre"][key]; post = source["baseline_post"][key]; floor = difference_metrics(post, base)
             alpha_rows = []
             for ordinal, alpha in enumerate(ALPHAS):
                 plus = source.get(f"v0_alpha_{ordinal:02d}_plus", {}).get(key); minus = source.get(f"v0_alpha_{ordinal:02d}_minus", {}).get(key)
-                if plus is None or minus is None: continue
+                if plus is None or minus is None:
+                    space_rows.append({"space": space, "precision": precision, "direction_id": "v0", "alpha": float(alpha), "status": "N/A", "reason": "missing_pair"}); continue
                 p = difference_metrics(plus, base); m = difference_metrics(minus, base); central = difference_metrics(plus, minus)
-                central_step = float(2.0 * alpha); d = None if central["rms"] is None else central["rms"] / central_step
-                alpha_rows.append({"space": space, "precision": precision, "direction_id": "v0", "alpha": float(alpha), "plus_response_rms": p["rms"], "minus_response_rms": m["rms"], "baseline_floor_rms": floor["rms"], "central_difference_rms": d, "status": "N/A" if p["rms"] is None or m["rms"] is None else "OK"})
+                raw_plus = raw_records.get(f"v0_alpha_{ordinal:02d}_plus", {}); raw_minus = raw_records.get(f"v0_alpha_{ordinal:02d}_minus", {}); mask = np.asarray(raw_plus.get("mask", []), bool)
+                hp = _rms32_to64(np.asarray(raw_plus.get("actual_delta_fp32"), np.float32)[mask]) if mask.size and "actual_delta_fp32" in raw_plus else None; hm = _rms32_to64(np.asarray(raw_minus.get("actual_delta_fp32"), np.float32)[mask]) if mask.size and "actual_delta_fp32" in raw_minus else None; actual_step = None if hp is None or hm is None else hp + hm
+                d = None if central["rms"] is None or not actual_step else central["rms"] / actual_step
+                if central["status"] == "OK" and actual_step:
+                    decoder_tensors[f"decoder_dactual_{precision}_{space}_{ordinal:02d}.npy"] = np.divide(np.subtract(np.asarray(plus, np.float32), np.asarray(minus, np.float32), dtype=np.float32), np.float32(actual_step), dtype=np.float32)
+                alpha_rows.append({"space": space, "precision": precision, "direction_id": "v0", "alpha": float(alpha), "plus_response_rms": p["rms"], "minus_response_rms": m["rms"], "baseline_floor_rms": floor["rms"], "response_floor_ratio_plus": None if not floor["rms"] else p["rms"] / floor["rms"], "response_floor_ratio_minus": None if not floor["rms"] else m["rms"] / floor["rms"], "response_floor_ratio_reason": "zero_denominator" if not floor["rms"] else None, "input_plus_rms": hp, "input_minus_rms": hm, "gain_plus": None if not hp or p["rms"] is None else p["rms"] / hp, "gain_minus": None if not hm or m["rms"] is None else m["rms"] / hm, "central_difference_rms": d, "status": "N/A" if p["rms"] is None or m["rms"] is None or not actual_step else "OK", "reason": p.get("reason") or m.get("reason") or ("zero_denominator" if not actual_step else None)})
             space_rows.extend(alpha_rows)
     # Native-vs-FP32 RGB and direct-float-vs-uint8 condition latent contrasts.
     for logical in sorted(set(source_records["native_bf16"]) & set(source_records["temporary_fp32"])):
         n = source_records["native_bf16"][logical]; f = source_records["temporary_fp32"][logical]
         if "decoded_final_float32" in n and "decoded_final_float32" in f:
-            metric = difference_metrics(n["decoded_final_float32"], f["decoded_final_float32"]); space_rows.append({"space": "native_vs_fp32_rgb", "sample_id": logical, **metric})
-        if "direct_condition_latent_float32" in n and "uint8_condition_latent_float32" in n:
-            metric = difference_metrics(n["direct_condition_latent_float32"], n["uint8_condition_latent_float32"]); space_rows.append({"space": "direct_vs_uint8_condition_latent", "sample_id": logical, **metric})
-    return {"status": "COMPLETE", "metrics": rows, "space_metrics": space_rows, "decoder_calls": 16, "decoder_manifest_sha256": decoder_manifest_sha,
+            metric = difference_metrics(n["decoded_final_float32"], f["decoded_final_float32"]); space_rows.append({"space": "native_vs_fp32_rgb", "sample_id": logical, "precision": "paired", **metric})
+        for precision, item in (("native_bf16", n), ("temporary_fp32", f)):
+            if "direct_condition_latent_float32" in item and "uint8_condition_latent_float32" in item:
+                metric = difference_metrics(item["direct_condition_latent_float32"], item["uint8_condition_latent_float32"]); space_rows.append({"space": "direct_vs_uint8_condition_latent", "sample_id": logical, "precision": precision, **metric})
+    return {"status": "COMPLETE", "metrics": rows, "space_metrics": space_rows, "tensors": decoder_tensors, "metrics_spaces": ["prediction_latent", "native_rgb", "fp32_rgb", "direct_float_condition_latent", "uint8_sim_condition_latent"], "decoder_calls": 16, "decoder_manifest_sha256": decoder_manifest_sha,
+            "decoder_config_sha256": sha256_file(config_path),
             "reason": "8 selected latents decoded serially at native BF16 and temporary FP32"}
 
 
@@ -418,11 +513,11 @@ def _math_note() -> str:
     return r"""# Task 6 mathematical note
 
 For state (k) and noise seed (s), the local expansion tested here is
-[
-G_{k,s}(z_k+delta)=G_{k,s}(z_k)+J_{k,s}(z_k)delta+R_{k,s}(delta).
-]
-If (G) is sufficiently smooth, a centered difference has truncation error
-(O(h^2)). Floating point evaluation adds a term of order (O(u/h)), so an
+\[
+G_{k,s}(z_k+\delta)=G_{k,s}(z_k)+J_{k,s}(z_k)\delta+R_{k,s}(\delta).
+\]
+If \(G\) is sufficiently smooth, a centered difference has truncation error
+\(O(h^2)\). Floating point evaluation adds a term of order \(O(u/h)\), so an
 arbitrarily small step is not automatically more accurate. FP32 differences
 are reduced in float64 and all quantitative spaces are kept separate.
 
@@ -461,8 +556,12 @@ def _package_valid(root: Path, raw_manifest_sha: str, decoder_manifest_sha: str 
         verify_analysis_manifest(root)
         expected_config = {"alphas": list(ALPHAS), "directions": list(DIRECTION_IDS), "spaces": ["prediction_latent", "native_rgb", "fp32_rgb", "float_roundtrip_condition_latent", "uint8_simulated_roundtrip_condition_latent"]}
         expected_config_sha = hashlib.sha256(json.dumps(expected_config, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        expected_identity = hashlib.sha256(json.dumps({"raw_manifest_sha256": raw_manifest_sha, "decoder_manifest_sha256": decoder_manifest_sha,
+            "decoder_config_sha256": value.get("decoder_config_sha256"), "analysis_code_sha256": _analysis_source_sha(),
+            "config_sha256": expected_config_sha, "group": value.get("group", {})}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         return (value.get("raw_manifest_sha256") == raw_manifest_sha and value.get("decoder_manifest_sha256") == decoder_manifest_sha
-                and value.get("analysis_code_sha256") == _analysis_source_sha() and value.get("config_sha256") == expected_config_sha)
+                and value.get("analysis_code_sha256") == _analysis_source_sha() and value.get("config_sha256") == expected_config_sha
+                and value.get("analysis_identity") == expected_identity)
     except Exception: return False
 
 
@@ -501,6 +600,7 @@ def write_task6_artifacts(result: Mapping[str, Any], output_dir: str | Path, *, 
         (stage / "figures").mkdir(); (stage / "analysis_tensors").mkdir()
         tensors = result.get("tensors", {})
         for name, value in tensors.items(): np.save(stage / "analysis_tensors" / Path(name).name, np.asarray(value, dtype=np.float32), allow_pickle=False)
+        for name, value in (decoder or {}).get("tensors", {}).items(): np.save(stage / "analysis_tensors" / Path(name).name, np.asarray(value, dtype=np.float32), allow_pickle=False)
         point_rows = result.get("points", []); floors = {row.get("quantity"): row.get("baseline_floor_rms", 0.0) for row in result.get("baseline_floors", [])}
         failures = []
         for row in point_rows:
@@ -510,7 +610,9 @@ def write_task6_artifacts(result: Mapping[str, Any], output_dir: str | Path, *, 
         _rows_csv(stage / "point_metrics.csv", point_rows); _rows_csv(stage / "difference_metrics.csv", result.get("derivatives", [])); _rows_csv(stage / "fit_metrics.csv", result.get("fits", [])); _rows_csv(stage / "window_decisions.csv", result.get("fits", []) + result.get("image_fits", [])); _rows_csv(stage / "additivity_metrics.csv", result.get("additivity", [])); _rows_csv(stage / "prediction_metrics.csv", result.get("predictions", [])); _rows_csv(stage / "failure_amplitudes.csv", failures); _rows_csv(stage / "decoder_metrics.csv", (decoder or {}).get("metrics", [])); _rows_csv(stage / "decoder_roundtrip_metrics.csv", (decoder or {}).get("metrics", [])); _rows_csv(stage / "decoder_space_metrics.csv", (decoder or {}).get("space_metrics", [])); _rows_csv(stage / "roundtrip_metrics.csv", [row for row in (decoder or {}).get("space_metrics", []) if "roundtrip" in str(row.get("space", ""))]); _rows_csv(stage / "pairwise_precision_metrics.csv", [row for row in (decoder or {}).get("space_metrics", []) if "vs_" in str(row.get("space", ""))]); _rows_csv(stage / "cross_group_status.csv", result.get("cross_group_status", summarize_cross_groups({})))
         _json(stage / "task6_summary.json", {key: value for key, value in result.items() if key != "tensors"}); _json(stage / "decoder_summary.json", decoder or {"status": "NOT_RUN"})
         source_hash = _analysis_source_sha(); config_value = {"alphas": list(ALPHAS), "directions": list(DIRECTION_IDS), "spaces": ["prediction_latent", "native_rgb", "fp32_rgb", "float_roundtrip_condition_latent", "uint8_simulated_roundtrip_condition_latent"]}; config_sha = hashlib.sha256(json.dumps(config_value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-        provenance = {"schema_version": "umi-task6-analysis-v1", "raw_manifest_sha256": raw_snapshot["sha256"], "decoder_manifest_sha256": decoder_manifest_sha, "analysis_code_sha256": source_hash, "config_sha256": config_sha, "raw_root": str(raw) if raw else None}
+        decoder_config_sha = (decoder or {}).get("decoder_config_sha256") if decoder else None
+        analysis_identity = hashlib.sha256(json.dumps({"raw_manifest_sha256": raw_snapshot["sha256"], "decoder_manifest_sha256": decoder_manifest_sha, "decoder_config_sha256": decoder_config_sha, "analysis_code_sha256": source_hash, "config_sha256": config_sha, "group": result.get("group", {})}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        provenance = {"schema_version": "umi-task6-analysis-v1", "raw_manifest_sha256": raw_snapshot["sha256"], "decoder_manifest_sha256": decoder_manifest_sha, "decoder_config_sha256": decoder_config_sha, "analysis_code_sha256": source_hash, "config_sha256": config_sha, "analysis_identity": analysis_identity, "group": result.get("group", {}), "raw_root": str(raw) if raw else None}
         _json(stage / "analysis_provenance.json", provenance); _json(stage / "provenance.json", provenance); _json(stage / "config.json", config_value)
         _atomic_text(stage / "math_note.md", _math_note()); _atomic_text(stage / "experiment_report.md", _report(result, decoder or {"status": "NOT_RUN"}))
         resource_lines = ["# Resource report", ""]
@@ -536,7 +638,12 @@ def write_task6_artifacts(result: Mapping[str, Any], output_dir: str | Path, *, 
         values = [(float(row.get("alpha", i)), float(row.get("predicted_latent_response_rms", row.get("response_rms", 0.0)) or 0.0)) for i, row in enumerate(result.get("points", [])) if row.get("predicted_latent_response_rms", row.get("response_rms")) is not None]
         charts = [("response", "Task 6 response", "RMS response"), ("additivity", "Task 6 additivity", "relative error"), ("holdout", "Task 6 holdout prediction", "relative error"), ("decoder_precision", "Decoder native vs FP32", "RMS"), ("roundtrip_quantization", "Float vs uint8 round trip", "RMS")]
         for stem, title, ylabel in charts:
-            chart_values = values if stem == "response" else [(float(i), float(row.get("relative_error", row.get("rms", 0.0)) or 0.0)) for i, row in enumerate((result.get("additivity", []) if stem == "additivity" else result.get("predictions", []) if stem == "holdout" else (decoder or {}).get("space_metrics", [])))][:64]
+            if stem == "response": chart_values = values
+            elif stem == "additivity": chart_values = [(float(i), float(row["relative_error"])) for i, row in enumerate(result.get("additivity", [])) if row.get("relative_error") is not None]
+            elif stem == "holdout": chart_values = [(float(i), float(row["relative_error"])) for i, row in enumerate(result.get("predictions", [])) if row.get("relative_error") is not None]
+            elif stem == "decoder_precision": chart_values = [(float(i), float(row["rms"])) for i, row in enumerate((decoder or {}).get("space_metrics", [])) if row.get("space") == "native_vs_fp32_rgb" and row.get("rms") is not None]
+            else: chart_values = [(float(i), float(row["rms"])) for i, row in enumerate((decoder or {}).get("space_metrics", [])) if row.get("space") == "direct_vs_uint8_condition_latent" and row.get("rms") is not None]
+            if not chart_values: chart_values = [(0.0, 0.0)]
             _svg(stage / "figures" / f"{stem}.svg", chart_values, title, ylabel); _png(stage / "figures" / f"{stem}.png", chart_values, title)
         if source_dir is not None:
             source = Path(source_dir)
@@ -548,7 +655,8 @@ def write_task6_artifacts(result: Mapping[str, Any], output_dir: str | Path, *, 
                 if path.is_file() and path != bundle and "analysis_tensors" not in path.parts:
                     info = zipfile.ZipInfo(path.relative_to(stage).as_posix(), (1980,1,1,0,0,0)); info.compress_type = zipfile.ZIP_DEFLATED
                     archive.writestr(info, path.read_bytes())
-            archive.writestr("README.txt", "Large raw tensors remain in the immutable run directory.\n")
+            readme = zipfile.ZipInfo("README.txt", (1980, 1, 1, 0, 0, 0)); readme.compress_type = zipfile.ZIP_DEFLATED
+            archive.writestr(readme, "Large raw tensors remain in the immutable run directory.\n")
         _write_manifest(stage)
         if raw is not None and verify_raw_manifest(raw)["sha256"] != raw_snapshot["sha256"]: raise ValueError("raw evidence changed during analysis")
         if output.exists(): raise FileExistsError("analysis output appeared during publication")

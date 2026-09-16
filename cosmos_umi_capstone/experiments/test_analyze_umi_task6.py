@@ -18,8 +18,8 @@ def _linear_records():
     bank[0, :, :, 0, 0, 0] = 2; bank[1, :, :, 0, 0, 1] = 2; bank[2, :, :, 0, 1, 0] = 2
     frozen = p5.freeze_task5_directions(bank, mask)
     y0 = np.zeros((1, 1, 2, 2, 2), np.float32)
-    records = {"bridge_0__seed_0__baseline_pre": {"output_full": y0, "decoded_final": np.zeros((3,2,2), np.float32)},
-               "bridge_0__seed_0__baseline_post": {"output_full": y0.copy(), "decoded_final": np.zeros((3,2,2), np.float32)}}
+    records = {"bridge_0__seed_0__baseline_pre": {"output_full": y0, "decoded_final": np.zeros((3,2,2), np.float32), "z_bar": np.ones(shape,np.float32), "mask": mask, "direction": np.zeros(shape,np.float32), "actual_delta_fp32": np.zeros(shape,np.float32), "target_delta_fp32": np.zeros(shape,np.float32)},
+               "bridge_0__seed_0__baseline_post": {"output_full": y0.copy(), "decoded_final": np.zeros((3,2,2), np.float32), "z_bar": np.ones(shape,np.float32), "mask": mask, "direction": np.zeros(shape,np.float32), "actual_delta_fp32": np.zeros(shape,np.float32), "target_delta_fp32": np.zeros(shape,np.float32)}}
     weights = np.arange(1, 5, dtype=np.float32).reshape(1, 1, 1, 2, 2)
     for direction_id, direction in frozen["directions"].items():
         scalar = float(np.sum(direction[:, :, 0] * weights[:, :, 0]))
@@ -46,6 +46,12 @@ class AnalysisTests(unittest.TestCase):
         detail = api._derive_plan_detail(api._normalize_records(records))
         self.assertAlmostEqual(detail["combination_coefficients"]["c01"], frozen["c01"])
         self.assertAlmostEqual(detail["combination_coefficients"]["c12"], frozen["c12"])
+
+    def test_public_core_derives_nontrivial_coefficients_without_plan_detail(self):
+        records, frozen = _linear_records()
+        result = api.analyze_task6_records(records, strict=True)
+        self.assertEqual(result["status"], "COMPLETE")
+        self.assertAlmostEqual(result["derivation"]["combination_coefficients"]["c01"], frozen["c01"])
 
     def test_missing_and_stopped_are_not_reported_as_scientific_failures(self):
         result = api.analyze_task6_records({"baseline_pre": {}}, strict=False)
@@ -104,6 +110,13 @@ class AnalysisTests(unittest.TestCase):
             output = Path(temporary) / "analysis"; published = api.write_task6_artifacts(result, output, raw_root=raw)
             self.assertTrue((output / "review_bundle.zip").is_file()); self.assertEqual(api.verify_analysis_manifest(output)["sha256"], Path(published["manifest"]).read_bytes() and api.verify_analysis_manifest(output)["sha256"])
             self.assertTrue(api.write_task6_artifacts(result, output, raw_root=raw)["idempotent"])
+
+    def test_fresh_review_bundles_are_byte_deterministic(self):
+        records, frozen = _linear_records(); result = api.analyze_task6_records(records, strict=True)
+        with tempfile.TemporaryDirectory() as temporary:
+            first = Path(temporary) / "a"; second = Path(temporary) / "b"
+            api.write_task6_artifacts(result, first); api.write_task6_artifacts(result, second)
+            self.assertEqual((first / "review_bundle.zip").read_bytes(), (second / "review_bundle.zip").read_bytes())
 
 
 if __name__ == "__main__": unittest.main()

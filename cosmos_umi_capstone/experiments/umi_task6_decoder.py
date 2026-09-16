@@ -19,10 +19,10 @@ import numpy as np
 
 try:
     from .umi_precision_runtime import EvidenceError, projection
-    from .umi_task6_primitives import ALPHAS, build_decoder_replay_plan
+    from .umi_task6_primitives import ALPHAS, build_decoder_replay_plan, build_generation_plan
 except ImportError:  # pragma: no cover
     from umi_precision_runtime import EvidenceError, projection
-    from umi_task6_primitives import ALPHAS, build_decoder_replay_plan
+    from umi_task6_primitives import ALPHAS, build_decoder_replay_plan, build_generation_plan
 
 try:
     from .umi_precision_storage import ProcessLock
@@ -122,11 +122,24 @@ def reencode_frame(frame: Any, encoder: Any, *, quantize: bool = False) -> dict[
     input_frame = simulate_uint8(original) if quantize else original
     before = _encoder_identity(encoder)
     reset = getattr(encoder, "reset_cache", None) or getattr(encoder, "clear_cache", None)
-    if callable(reset): reset()
-    latent = _call_encoder(encoder, input_frame)
-    if callable(reset): reset()
+    primary = None; latent = None; restore_error = None
+    try:
+        if callable(reset): reset()
+        latent = _call_encoder(encoder, input_frame)
+    except BaseException as error:
+        primary = error
+    finally:
+        try:
+            if callable(reset): reset()
+        except BaseException as error:
+            restore_error = error
     after = _encoder_identity(encoder)
-    if before != after: raise EvidenceError("condition encoder state was not restored")
+    if before != after and restore_error is None: restore_error = EvidenceError("condition encoder state was not restored")
+    if primary is not None:
+        if restore_error is not None: setattr(primary, "restoration_error", restore_error)
+        raise primary
+    if restore_error is not None: raise restore_error
+    assert latent is not None
     return {"input_float32": original, "input_after_uint8_simulation": input_frame,
             "condition_latent_float32": latent, "quantized": bool(quantize), "encoder_identity_before": before, "encoder_identity_after": after}
 
@@ -228,17 +241,36 @@ def _verify_raw_task6(root: Path) -> tuple[str, Mapping[str, Any]]:
     status_path = root / "run_status.json"
     if not status_path.is_file(): raise EvidenceError("Task 6 raw status is missing")
     status = json.loads(status_path.read_text(encoding="utf-8"))
-    if status.get("status") not in {"AWAITING_REVIEW", "COMPLETE"} or len(status.get("completed_samples", [])) != 32:
+    expected = [item["sample_id"] for item in build_generation_plan(status.get("group", {}).get("state", "bridge_0"), int(status.get("group", {}).get("seed", 0)))]
+    completed = status.get("completed_samples", [])
+    if status.get("status") not in {"AWAITING_REVIEW", "COMPLETE"} or len(completed) != 32 or len(set(completed)) != 32 or set(completed) != set(expected):
         raise EvidenceError("decoder requires a completed 32-sample Task 6 raw run")
     manifest = root / "MANIFEST.sha256"
     if not manifest.is_file(): raise EvidenceError("Task 6 raw manifest is missing")
-    mutable = {"run_status.json", "invocation_history.jsonl", "gpu_samples.csv", "ram_samples.csv", "disk_samples.csv", "sample_resource_snapshots.csv", "sample_resource_snapshots.jsonl"}
+    seen: set[str] = set()
     for line in manifest.read_text(encoding="ascii").splitlines():
-        parts = line.split(None, 1)
-        if len(parts) != 2: raise EvidenceError("malformed raw manifest")
-        target = root / parts[1].strip()
-        if target.name in mutable: continue
+        parts = line.split("  ", 1)
+        if len(parts) != 2 or len(parts[0]) != 64 or parts[1] in seen:
+            raise EvidenceError("malformed raw manifest")
+        relative = Path(parts[1])
+        if relative.is_absolute() or ".." in relative.parts or relative.name in {"MANIFEST.sha256", ".runner.lock"}:
+            raise EvidenceError("unsafe raw manifest path")
+        target = root / relative
         if not target.is_file() or sha256_file(target) != parts[0]: raise EvidenceError(f"raw manifest mismatch: {parts[1]}")
+        seen.add(parts[1])
+    actual = {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file() and p.name not in {"MANIFEST.sha256", ".runner.lock"}}
+    if seen != actual: raise EvidenceError("raw manifest inventory mismatch")
+    for sample_id in expected:
+        sample = root / "samples" / sample_id; state_path = sample / "status.json"
+        if not state_path.is_file(): raise EvidenceError(f"raw sample is missing: {sample_id}")
+        sample_status = json.loads(state_path.read_text(encoding="utf-8"))
+        if sample_status.get("status") != "success": raise EvidenceError(f"raw sample is not successful: {sample_id}")
+        for name, digest in sample_status.get("artifact_sha256", {}).items():
+            if not (sample / name).is_file() or sha256_file(sample / name) != digest: raise EvidenceError(f"raw sample hash mismatch: {sample_id}/{name}")
+    samples_root = root / "samples"
+    actual_dirs = {p.name for p in samples_root.iterdir() if p.is_dir() and ".attempt." not in p.name} if samples_root.is_dir() else set()
+    if actual_dirs != set(expected):
+        raise EvidenceError("raw sample directory inventory mismatch")
     return sha256_file(manifest), status
 
 
@@ -278,6 +310,7 @@ def run_task6_decoder_replays(runtime: Any, run_root: str | Path, *, state: str 
     config = {"schema_version": "umi-task6-decoder-v2", "state": state, "seed": seed, "plan": plan,
               "runtime_identity": _decoder_identity(runtime), "encoder_identity": _encoder_identity(encoder), "raw_manifest_sha256": raw_manifest_sha,
               "raw_group": raw_status.get("group"),
+              "decoder_code_sha256": sha256_file(Path(__file__)),
               "source": str(Path(__file__).resolve())}
     config_text = json.dumps(config, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
     config_path = root / "decoder_config.json"

@@ -93,3 +93,30 @@ The public analysis path rejects stopped/partial generation runs and missing,
 invalid, or unbound decoder evidence. Packages bind raw and decoder manifests,
 fixed configuration, and hashes of relevant Task 6/5 runtime sources. No
 remote execution or Task 4 work was performed.
+
+## Review round 3 implementation
+
+The public Task 6 core now performs its own point, derivative, slope/R2,
+additivity, and 24-row holdout calculations; it no longer imports or calls the
+Task 5 analyzer. Every tensor subtraction is explicitly FP32 and only norms,
+cosines, fits, and other reductions use FP64. Plan detail is exposed in the
+result and is derived from saved `z_bar`, mask, and frozen direction evidence;
+nontrivial combination coefficients are not defaulted. Decoder analysis now
+includes the prediction-latent, native RGB, temporary-FP32 RGB, and both
+condition-latent round-trip spaces, records N/A reasons, and persists centered
+finite-difference tensors. Decoder code identity, condition-encoder failure
+restoration, strict raw inventory, and byte-stable README ZIP metadata were
+also hardened. New tests cover strict raw extra-file rejection, partial
+decoder resume without replaying successes, encoder failure restoration,
+public coefficient derivation, and fresh-package ZIP determinism.
+
+Static verification in this Windows worktree:
+
+```text
+python -m py_compile cosmos_umi_capstone/experiments/*.py  [per-file invocation: PASS]
+git diff --check  PASS
+```
+
+The local Windows interpreter has no NumPy installation, so the expanded
+NumPy-dependent Task 3 and full regression suites must be run by the parent in
+the configured experiment interpreter. No remote/model/SVD action was taken.
