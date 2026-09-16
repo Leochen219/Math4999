@@ -1,5 +1,6 @@
 import json
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -228,7 +229,12 @@ class InputAndResourceTests(unittest.TestCase):
 
     def test_resize_failure_is_explicit_and_not_silently_nearest(self):
         frame = np.zeros((8, 8, 1), dtype=np.float32)
-        with self.assertRaisesRegex(RuntimeError, "official.*resize"):
+        real_import = __import__
+        def unavailable(name, *args, **kwargs):
+            if name == "torch" or name.startswith("torchvision"):
+                raise ImportError("simulated unavailable official resize")
+            return real_import(name, *args, **kwargs)
+        with patch("builtins.__import__", side_effect=unavailable), self.assertRaisesRegex(RuntimeError, "official.*resize"):
             preprocess_frame(frame, size=4)
         with self.assertRaisesRegex(RuntimeError, "official.*resize"):
             preprocess_frame(frame, size=4, resize_backend=lambda *_: (_ for _ in ()).throw(RuntimeError("official resize failed")))
@@ -241,15 +247,28 @@ class InputAndResourceTests(unittest.TestCase):
         base = {"gpu_used_gib": 0, "gpu_free_gib": 100, "gpu_reserved_gib": 0,
                 "ram_available_gib": 600, "rss_gib": 1, "swap_used_gib": 0,
                 "disk_free_gib": 18, "forecast_free_gib": 20}
-        for estimate in (None, -1, "bad", float("inf")):
+        for estimate in (None, False, "0", -1, "bad", float("inf"), float("nan")):
             sample = dict(base)
-            if estimate is not None: sample["remaining_matrix_estimate_gib"] = estimate
+            sample["remaining_matrix_estimate_gib"] = estimate
             result = evaluate_resources(sample, phase="full-matrix")
             self.assertEqual(result["reason_code"], "DISK_FULL_MATRIX_INSUFFICIENT")
+        self.assertEqual(evaluate_resources({**base, "remaining_matrix_estimate_gib": 0}, phase="full-matrix")["status"], "OK")
         self.assertEqual(evaluate_resources({**base, "disk_free_gib": 18,
                                              "remaining_matrix_estimate_gib": 10}, phase="full-matrix")["reason_code"], "DISK_FULL_MATRIX_INSUFFICIENT")
         self.assertEqual(evaluate_resources({**base, "disk_free_gib": 18.001,
                                              "remaining_matrix_estimate_gib": 10}, phase="full-matrix")["status"], "OK")
+
+    def test_exact_start_smoke_and_growth_boundaries_are_safe(self):
+        startup = {"gpu_used_gib": 1, "gpu_free_gib": 100, "gpu_reserved_gib": 65,
+                   "ram_available_gib": 500, "rss_gib": 160, "swap_used_gib": 0,
+                   "disk_free_gib": 10, "forecast_free_gib": 6}
+        self.assertFalse(evaluate_resources(startup, phase="startup")["hard_stop_reasons"])
+        smoke = {**startup, "gpu_used_gib": 20, "gpu_peak_allocated_gib": 35,
+                 "gpu_peak_nvml_used_gib": 45}
+        self.assertFalse(evaluate_resources(smoke, phase="resource-smoke")["hard_stop_reasons"])
+        growth = {**startup, "gpu_cleanup_growth_gib": 2, "gpu_consecutive_growth_samples": 2,
+                  "ram_cleanup_growth_gib": 10, "ram_consecutive_growth_samples": 2}
+        self.assertFalse(evaluate_resources(growth)["hard_stop_reasons"])
 
     def test_run_status_is_canonical_and_contains_terminal_evidence(self):
         payload = build_run_status("AWAITING_REVIEW", reason_code="PILOT_COMPLETE",

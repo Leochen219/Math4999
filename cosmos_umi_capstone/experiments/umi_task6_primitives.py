@@ -321,7 +321,12 @@ def evaluate_resources(snapshot: Mapping[str, Any] | ResourceSnapshot, *, phase:
         forecast = disk - (mean_bytes * remaining_samples * 1.3) / (1024 ** 3)
     matrix_estimate = _number(snapshot, "remaining_matrix_estimate_gib", default=0.0)
     full_matrix = bool(snapshot.get("full_matrix_launch", False)) or phase == "full-matrix"
-    if full_matrix and ("remaining_matrix_estimate_gib" not in snapshot or not np.isfinite(matrix_estimate) or matrix_estimate < 0 or disk <= 1.3 * matrix_estimate + 5.0):
+    raw_matrix_estimate = snapshot.get("remaining_matrix_estimate_gib")
+    valid_matrix_estimate = ("remaining_matrix_estimate_gib" in snapshot and
+                             not isinstance(raw_matrix_estimate, bool) and
+                             isinstance(raw_matrix_estimate, numbers.Real) and
+                             np.isfinite(matrix_estimate) and matrix_estimate >= 0)
+    if full_matrix and (not valid_matrix_estimate or disk <= 1.3 * matrix_estimate + 5.0):
         hard.append(("DISK_FULL_MATRIX_INSUFFICIENT", "free disk must exceed 1.3 times remaining matrix estimate plus 5 GiB"))
 
     if phase in ("start", "startup", "preload") and gpu_used > 1:
