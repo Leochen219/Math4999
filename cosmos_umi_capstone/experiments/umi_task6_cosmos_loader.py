@@ -17,6 +17,22 @@ from typing import Any
 import numpy as np
 
 
+def _json_safe_action(action: Any) -> list[list[float]]:
+    """Validate the official action shape and convert it to JSON primitives."""
+    try:
+        raw = np.asarray(action)
+        if (raw.shape != (16, 10) or not np.issubdtype(raw.dtype, np.number) or
+                np.issubdtype(raw.dtype, np.bool_) or np.iscomplexobj(raw)):
+            raise ValueError
+    except (TypeError, ValueError) as error:
+        raise ValueError("official action must be finite numeric values with shape (16, 10)") from error
+    if not np.all(np.isfinite(raw)):
+        raise ValueError("official action must be finite numeric values with shape (16, 10)")
+    # ``tolist`` converts NumPy scalars to JSON-native Python numbers while
+    # retaining the factory's values; no FP32 narrowing is allowed here.
+    return [[item for item in row] for row in raw.tolist()]
+
+
 def _content_identity(value: Any) -> dict[str, Any]:
     """Return a non-class-only identity for a loaded encoder."""
     method = getattr(value, "actual_identity", None) or getattr(value, "content_identity", None)
@@ -230,7 +246,7 @@ def load_task6_cosmos_runtime(*, framework_root: str, checkpoint: str, vae: str,
         raise FileExistsError(f"phase setup action already exists: {action_path}")
     if not action_path.exists():
         temporary = setup_dir / ".action.json.tmp"
-        temporary.write_text(json.dumps(action, sort_keys=True), encoding="utf-8")
+        temporary.write_text(json.dumps(_json_safe_action(action), sort_keys=True, allow_nan=False), encoding="utf-8")
         os.replace(temporary, action_path)
     args.action_path = str(action_path)
     post_adapter = load_official_runtime(args, setup_dir)

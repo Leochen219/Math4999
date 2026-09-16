@@ -36,7 +36,7 @@ class Task6RunnerTests(unittest.TestCase):
         cfg = {"environment": {"name": "cpu"}, "provenance": {"source_commit": "2b17a2413bd86b2cf9b03823637108851e4ddf2d"},
                "asset_hashes": {"asset": hashlib.sha256(asset_path.read_bytes()).hexdigest()}, "asset_paths": {"asset": str(asset_path)},
                "carrier_shape": list(inputs.z0.shape), "carrier_hash": inputs.identity()["z0"], "condition_indexes": [0], "predicted_indexes": [1,2,3,4],
-               "mask_shape": list(mask.shape), "mask_hash": inputs.geometry.metadata()["mask_sha256"], "action_shape": [16,10], "action_hash": inputs.identity()["action"],
+               "mask_shape": list(mask.shape), "mask_hash": inputs.geometry.metadata()["mask_sha256"], "action_shape": [16,10], "action_hash": runtime_api._array_sha(inputs.action),
                "prompt": inputs.prompt, "direction_hashes": direction_hashes, "direction_bank_path": str(direction_path),
                "direction_bank_file_hash": hashlib.sha256(direction_path.read_bytes()).hexdigest(),
                "settings": {"num_steps":30,"guidance":1.0,"shift":10.0,"autocast":False,"tf32":False,"diffusion_cache":False,"batch_size":1},
@@ -198,6 +198,23 @@ class Task6RunnerTests(unittest.TestCase):
             result = api.run_resource_smoke(temp, lifecycle={"pre_load": lambda: None, "load": lambda: (runtime, inputs), "cleanup": lambda: None, "unload": lambda: None}, samplers={"gpu": bad, "ram": good, "disk": good})
             self.assertEqual(result["status"], "RESOURCE_STOP")
 
+    def test_monitor_latches_first_hard_stop_across_later_normal_samples(self):
+        import run_umi_task6_experiment as api
+        with tempfile.TemporaryDirectory() as temp:
+            current = {"gpu_used_gib": 80.0}
+            def gpu():
+                return {"gpu_used_gib": current["gpu_used_gib"], "gpu_free_gib": 100.0,
+                        "gpu_reserved_gib": 0.0, "ram_available_gib": 600.0,
+                        "rss_gib": 0.0, "swap_used_gib": 0.0, "disk_free_gib": 20.0}
+            monitor = api.ResourceMonitor(temp, gpu_sampler=gpu, ram_sampler=gpu, disk_sampler=gpu)
+            first = monitor.capture_sample("bad", "pre_sample", 2, Path(temp))
+            current["gpu_used_gib"] = 0.0
+            second = monitor.capture_sample("normal", "pre_sample", 1, Path(temp))
+            self.assertEqual(first["decision_status"], "HARD_STOP")
+            self.assertEqual(second["decision_status"], "HARD_STOP")
+            self.assertEqual(second["reason_code"], first["reason_code"])
+            self.assertEqual(monitor.check()["status"], "HARD_STOP")
+
     def test_stale_smoke_acceptance_is_invalidated_by_new_preflight(self):
         import run_umi_task6_experiment as api
         with tempfile.TemporaryDirectory() as temp:
@@ -222,6 +239,57 @@ class Task6RunnerTests(unittest.TestCase):
                         "disk_free_gib": 12 if state["n"] % 2 else 20}
             result = api.run_resource_smoke(temp, samplers={key: sampler for key in ("gpu", "ram", "disk")}, lifecycle=lifecycle)
             self.assertEqual(result["status"], "RESOURCE_STOP")
+
+    def test_smoke_worst_case_includes_background_ram_and_disk_rows(self):
+        import run_umi_task6_experiment as api
+        with tempfile.TemporaryDirectory() as temp:
+            _, _, _, samplers, lifecycle, _ = self.smoke_fixture(temp)
+            original = api.ResourceMonitor
+            class BackgroundOnlyMonitor:
+                def __init__(self, root, **kwargs):
+                    self.failure = None; self.last_resources = {"gpu_used_gib": 0.0, "gpu_free_gib": 100.0,
+                        "ram_available_gib": 600.0, "rss_gib": 0.0, "swap_used_gib": 0.0, "disk_free_gib": 20.0}
+                    self._gpu = [{"gpu_used_gib": 0.0, "gpu_free_gib": 100.0, "gpu_reserved_gib": 0.0,
+                                  "gpu_peak_allocated_gib": 0.0, "gpu_peak_nvml_used_gib": 0.0}]
+                    self._ram = [{"ram_available_gib": 600.0, "rss_gib": 200.0, "swap_used_gib": 1.0}]
+                    self._disk = [{"disk_free_gib": 2.0}]
+                    self._sample_rows = []
+                def start(self): return self
+                def stop(self): return None
+            api.ResourceMonitor = BackgroundOnlyMonitor
+            try:
+                result = api.run_resource_smoke(temp, samplers=samplers, lifecycle=lifecycle)
+            finally:
+                api.ResourceMonitor = original
+            self.assertEqual(result["status"], "RESOURCE_STOP")
+            self.assertTrue(result["errors"])
+            self.assertEqual(result["last_resource_snapshots"]["background_ram"][0]["swap_used_gib"], 1.0)
+            self.assertEqual(result["last_resource_snapshots"]["background_disk"][0]["disk_free_gib"], 2.0)
+
+    def test_smoke_background_disk_hard_limit_is_not_ignored(self):
+        import run_umi_task6_experiment as api
+        with tempfile.TemporaryDirectory() as temp:
+            _, _, _, samplers, lifecycle, _ = self.smoke_fixture(temp)
+            original = api.ResourceMonitor
+            class BackgroundDiskMonitor:
+                failure = None
+                last_resources = {"gpu_used_gib": 0.0, "gpu_free_gib": 100.0,
+                                  "ram_available_gib": 600.0, "rss_gib": 0.0,
+                                  "swap_used_gib": 0.0, "disk_free_gib": 20.0}
+                _gpu = []
+                _ram = [{"ram_available_gib": 600.0, "rss_gib": 0.0, "swap_used_gib": 0.0}]
+                _disk = [{"disk_free_gib": 2.0}]
+                _sample_rows = []
+                def __init__(self, root, **kwargs): pass
+                def start(self): return self
+                def stop(self): pass
+            api.ResourceMonitor = BackgroundDiskMonitor
+            try:
+                result = api.run_resource_smoke(temp, samplers=samplers, lifecycle=lifecycle)
+            finally:
+                api.ResourceMonitor = original
+            self.assertEqual(result["status"], "RESOURCE_STOP")
+            self.assertTrue(any("disk" in str(item).lower() for item in result["errors"]))
 
     def test_monitor_start_failure_writes_canonical_smoke_status(self):
         import run_umi_task6_experiment as api
@@ -318,6 +386,22 @@ class Task6RunnerTests(unittest.TestCase):
                 sample = Path(temp, "samples", name)
                 self.assertEqual(mtime, sample.stat().st_mtime_ns)
                 self.assertEqual(hashes, [(str(p.relative_to(sample)), hashlib.sha256(p.read_bytes()).hexdigest(), p.stat().st_mtime_ns) for p in sorted(sample.rglob("*")) if p.is_file()])
+
+    def test_public_resume_of_complete_raw_run_skips_generation_and_keeps_status(self):
+        with tempfile.TemporaryDirectory() as temp:
+            api, runtime, inputs, counts, _ = self.public_chain(temp)
+            safe = lambda: {"gpu_used_gib": 0, "gpu_free_gib": 100, "gpu_reserved_gib": 0,
+                            "ram_available_gib": 600, "rss_gib": 0, "swap_used_gib": 0, "disk_free_gib": 20}
+            first = api.run_pilot(runtime, inputs, temp, monitor=api.ResourceMonitor(temp, gpu_sampler=safe, ram_sampler=safe, disk_sampler=safe))
+            self.assertEqual(first["status"], "AWAITING_REVIEW")
+            status_path = Path(temp) / "run_status.json"; before = (status_path.read_bytes(), status_path.stat().st_mtime_ns)
+            runtime.execute = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("complete raw resume must skip generation"))
+            resumed_monitor = api.ResourceMonitor(temp, gpu_sampler=safe, ram_sampler=safe, disk_sampler=safe)
+            resumed_monitor.start()
+            resumed = api.run_pilot(runtime, inputs, temp, resume=True, monitor=resumed_monitor)
+            self.assertEqual(resumed, json.loads(before[0].decode()))
+            self.assertEqual((status_path.read_bytes(), status_path.stat().st_mtime_ns), before)
+            self.assertFalse(resumed_monitor._thread.is_alive())
 
 
 if __name__ == "__main__": unittest.main()

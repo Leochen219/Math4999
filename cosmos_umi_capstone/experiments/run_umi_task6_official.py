@@ -21,14 +21,16 @@ try:
         _validate_static_contract)
     from .umi_task6_primitives import STATE_CATALOG, evaluate_resources
     from .umi_task6_runtime import Task6Inputs, build_task6_hash_binding, preflight_task6, task6_binding_config
-    from .run_umi_task6_experiment import BlockedExecution, ResourceMonitor, accept_resource_smoke, run_pilot, run_resource_smoke
+    from .run_umi_task6_experiment import (_atomic_json, BlockedExecution, ResourceMonitor,
+        accept_resource_smoke, run_pilot, run_resource_smoke)
     from .umi_task6_decoder import run_task6_decoder_replays
     from .umi_fd_post_vae_bridge import sha256_array
 except ImportError:  # pragma: no cover
     from umi_task6_operational import OfficialRuntimeFactory, OperationalEvidenceError, extract_task5_directions, prepare_bridge_upload_bundle, validate_launch_contract, verify_pinned_bridge_assets, observe_live_launch, _validate_static_contract
     from umi_task6_primitives import STATE_CATALOG, evaluate_resources
     from umi_task6_runtime import Task6Inputs, build_task6_hash_binding, preflight_task6, task6_binding_config
-    from run_umi_task6_experiment import BlockedExecution, ResourceMonitor, accept_resource_smoke, run_pilot, run_resource_smoke
+    from run_umi_task6_experiment import (_atomic_json, BlockedExecution, ResourceMonitor,
+        accept_resource_smoke, run_pilot, run_resource_smoke)
     from umi_task6_decoder import run_task6_decoder_replays
     from umi_fd_post_vae_bridge import sha256_array
 
@@ -140,7 +142,7 @@ def _execute_official_impl(args: argparse.Namespace) -> dict[str, Any]:
                 "checkpoint_path": args.checkpoint, "vae_path": args.vae, "carrier_shape": list(inputs.z0.shape), "carrier_hash": identity["z0"],
                 "condition_indexes": list(inputs.geometry.condition_indexes), "predicted_indexes": list(inputs.geometry.predicted_indexes),
                 "mask_shape": list(inputs.geometry.mask.shape), "mask_hash": inputs.geometry.metadata()["mask_sha256"],
-                "action": np.asarray(inputs.action).tolist(), "action_shape": list(inputs.action.shape), "action_hash": identity["action"],
+                "action": np.asarray(inputs.action).tolist(), "action_shape": list(inputs.action.shape), "action_hash": sha256_array(inputs.action),
                 "prompt": inputs.prompt, "direction_hashes": dict(identity["directions"]), "direction_bank_path": str(bank_path),
                 "direction_bank_file_hash": __import__("hashlib").sha256(bank_path.read_bytes()).hexdigest(), "settings": binding_config["settings"],
                 "seed_config": {"seed": inputs.seed, "prepare": inputs.seed, "sampler": inputs.seed, "scheduler": inputs.seed},
@@ -172,13 +174,39 @@ def _execute_official_impl(args: argparse.Namespace) -> dict[str, Any]:
                                   lifecycle={"pre_load": lambda: None, "load": load, "cleanup": cleanup, "unload": unload})
     if args.phase != "pilot": raise BlockedExecution("unknown official Task 6 phase")
     samplers = resource_samplers(args.run_dir, gpu_index=args.gpu_index)
-    factory_result = factory.build(); runtime, inputs = factory_result[0], factory_result[1]
-    encoder = factory_result[2] if len(factory_result) > 2 else getattr(runtime, "encoder", None)
     monitor = ResourceMonitor(args.run_dir, gpu_sampler=samplers["gpu"], ram_sampler=samplers["ram"], disk_sampler=samplers["disk"])
+    monitor_started = False
+    runtime = None
     try:
+        # Start telemetry and enforce the current preload limits before the
+        # loader can import or construct any model object. The monitor stays
+        # alive through the load and is reused by the generation runner.
+        monitor.start(); monitor_started = True
+        preload = monitor.check(phase="preload", starting_new_sample=True,
+                                remaining_samples=32, run_dir=Path(args.run_dir))
+        if preload.get("status") == "HARD_STOP":
+            payload = {"status": "RESOURCE_STOP", "phase": "PILOT", "generation_started": False,
+                       "reason_code": preload.get("reason_code") or "RESOURCE_STOP",
+                       "reason": preload.get("reason") or "preload resource gate stopped"}
+            _atomic_json(Path(args.run_dir) / "run_status.json", payload)
+            try:
+                monitor.stop()
+            finally:
+                monitor_started = False
+                factory.unload()
+            return payload
+        factory_result = factory.build(); runtime, inputs = factory_result[0], factory_result[1]
+        encoder = factory_result[2] if len(factory_result) > 2 else getattr(runtime, "encoder", None)
         generation = run_pilot(runtime, inputs, args.run_dir, resume=bool(args.resume), monitor=monitor)
+        # run_pilot owns the monitor through its terminal status write.
+        monitor_started = False
     except BaseException:
-        try: runtime.cleanup()
+        if monitor_started:
+            try: monitor.stop()
+            except BaseException: pass
+            monitor_started = False
+        try:
+            if runtime is not None: runtime.cleanup()
         finally: factory.unload()
         raise
     if generation.get("status") not in {"AWAITING_REVIEW", "COMPLETE"}:
@@ -226,7 +254,9 @@ def execute_official(args: argparse.Namespace) -> dict[str, Any]:
             prior = {}
         # Never replace a completed status with a later setup error.  A failed
         # preflight/smoke/pilot gets an explicit canonical status instead.
-        preserve = prior.get("status") == "COMPLETE" or (
+        raw_complete = (prior.get("status") in {"AWAITING_REVIEW", "COMPLETE"} and
+                        len(set(prior.get("completed_samples", []))) == 32)
+        preserve = raw_complete or (
             str(getattr(args, "phase", "unknown")) == "preflight" and
             prior.get("status") == "PREFLIGHT_COMPLETE")
         if not preserve:
@@ -254,7 +284,7 @@ def parse_args(argv=None):
 
 def main(argv=None):
     try:
-        result = execute_official(parse_args(argv)); print(json.dumps(result, indent=2, default=str)); return 0 if result.get("status") in {"PASS", "AWAITING_RESOURCE_REVIEW", "AWAITING_REVIEW", "COMPLETE"} else 2
+        result = execute_official(parse_args(argv)); print(json.dumps(result, indent=2, default=str)); return 0 if result.get("status") in {"PASS", "PREFLIGHT_COMPLETE", "AWAITING_RESOURCE_REVIEW", "AWAITING_REVIEW", "COMPLETE"} else 2
     except (OperationalEvidenceError, BlockedExecution, ValueError) as error:
         print(json.dumps({"status": "BLOCKED", "reason": str(error)})); return 3
 

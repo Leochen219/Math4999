@@ -145,6 +145,15 @@ class DecoderTests(unittest.TestCase):
             raw = Path(temporary) / "raw"; self._raw(raw)
             with self.assertRaises(Exception): api.run_task6_decoder_replays(Runtime(), raw, encoder=Encoder(), decoder_root=Path(temporary) / "decoder")
 
+    def test_bound_identity_accepts_real_condition_encoder_adapter_fingerprint(self):
+        import umi_task6_cosmos_loader as loader
+        class Encoder:
+            def actual_identity(self): return {"fingerprint": "a" * 64}
+            def __call__(self, frame): return np.asarray(frame, np.float32)
+        adapter = loader.ConditionEncoderAdapter(Encoder(), device="cpu")
+        self.assertTrue(api._bound_identity(adapter.actual_identity()))
+        self.assertFalse(api._bound_identity({"type": "only.class.Name", "device": "cpu"}))
+
     def test_resume_rejects_tampered_success(self):
         class Runtime:
             decoder_state = "bf16"

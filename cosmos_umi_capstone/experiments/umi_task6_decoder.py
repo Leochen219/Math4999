@@ -75,7 +75,11 @@ def _bound_identity(value: Any) -> bool:
     """Reject absent or class-only runtime/encoder identities."""
     if value is None: return False
     if isinstance(value, Mapping):
-        content_keys = {"content_sha256", "weights_sha256", "model_state", "decoder_state", "encoder_state", "artifacts", "code", "inputs"}
+        # The concrete encoder adapter wraps its observed identity as
+        # ``encoder -> content -> fingerprint``.  Keep class/type/device
+        # metadata insufficient on its own while accepting that reviewed
+        # nested fingerprint shape alongside the established identity keys.
+        content_keys = {"content_sha256", "weights_sha256", "fingerprint", "model_state", "decoder_state", "encoder_state", "artifacts", "code", "inputs"}
         return (any(key in value and value[key] not in (None, "", {}, []) for key in content_keys)
                 or any(_bound_identity(nested) for nested in value.values() if isinstance(nested, Mapping)))
     return False

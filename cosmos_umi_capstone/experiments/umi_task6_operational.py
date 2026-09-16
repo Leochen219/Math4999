@@ -21,14 +21,14 @@ try:
     from .umi_task6_primitives import SOURCE_COMMIT, STATE_CATALOG, parse_action, preprocess_frame
     from .umi_task6_runtime import Task6Inputs, load_frozen_directions
     from .umi_fd_post_vae_bridge import sha256_array
-    from .umi_fd_post_vae_scan import sha256_tree
+    from .umi_fd_post_vae_scan import content_identity as _content_identity
     from .umi_task5_primitives import freeze_task5_directions
     from .umi_precision_storage import ProcessLock
 except ImportError:  # pragma: no cover
     from umi_task6_primitives import SOURCE_COMMIT, STATE_CATALOG, parse_action, preprocess_frame
     from umi_task6_runtime import Task6Inputs, load_frozen_directions
     from umi_fd_post_vae_bridge import sha256_array
-    from umi_fd_post_vae_scan import sha256_tree
+    from umi_fd_post_vae_scan import content_identity as _content_identity
     from umi_task5_primitives import freeze_task5_directions
     from umi_precision_storage import ProcessLock
 
@@ -42,7 +42,7 @@ BRIDGE0_FPS = 5
 PINNED_FRAME_SIZE = (256, 256)
 PILOT_GROUP = {"state": "bridge_0", "seed": 0}
 TASK6_CODE_SOURCES = ("umi_task6_runtime.py", "run_umi_task6_experiment.py", "umi_task6_primitives.py",
-    "umi_fd_post_vae_bridge.py", "umi_precision_runtime.py", "umi_precision_storage.py",
+    "umi_fd_post_vae_bridge.py", "umi_fd_post_vae_scan.py", "umi_precision_runtime.py", "umi_precision_storage.py",
     "umi_precision_official.py", "umi_task5_runtime.py", "umi_task5_primitives.py",
     "umi_task6_operational.py", "run_umi_task6_official.py", "umi_task6_cosmos_loader.py",
     "umi_task6_decoder.py", "analyze_umi_task6.py")
@@ -73,16 +73,14 @@ def sha256_file(path: str | os.PathLike[str]) -> str:
 def checkpoint_content_identity(path: str | os.PathLike[str]) -> str:
     """Return the content hash for a regular-file or directory checkpoint."""
     try:
-        candidate = Path(path)
-        if candidate.is_symlink():
-            raise OperationalEvidenceError(f"checkpoint path is an unsupported symlink: {candidate}")
-        if candidate.is_file():
-            return sha256_file(candidate)
-        if candidate.is_dir():
-            return sha256_tree(candidate)
+        return _content_identity(path)
     except OperationalEvidenceError:
         raise
     except (OSError, TypeError, ValueError) as error:
+        if "symlink" in str(error).lower():
+            raise OperationalEvidenceError(str(error)) from error
+        if "missing or unsupported" in str(error).lower():
+            raise OperationalEvidenceError(f"checkpoint path is missing or unsupported: {path}") from error
         label = str(path)
         raise OperationalEvidenceError(f"checkpoint content identity could not be observed: {label}") from error
     raise OperationalEvidenceError(f"checkpoint path is missing or unsupported: {path}")

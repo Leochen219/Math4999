@@ -242,6 +242,19 @@ class OfficialTests(unittest.TestCase):
         self.assertTrue(all(row["native_dtype"] == "float32" for row in records["B"]["tensor_evidence"]))
         self.assertIn("bfloat16", {row["native_dtype"] for row in records["A"]["tensor_evidence"]})
 
+    def test_official_execute_rejects_actual_capture_that_differs_from_requested_condition(self):
+        runtime, model = self.fixture()
+        original_prepare = runtime._prepared_for_call
+        def mutate_actual_condition(target):
+            prepared = original_prepare(target)
+            values = projection(prepared[4][0]).reshape(runtime.inputs.z_bar.shape)
+            values[runtime.inputs.geometry.mask] += 1.0
+            prepared[4][0] = runtime.ops.from_array(values.reshape(-1), prepared[4][0])
+            return prepared
+        runtime._prepared_for_call = mutate_actual_condition
+        with self.assertRaises(EvidenceError):
+            runtime.execute({"sample_id": "actual-mismatch", "group": "B", "alpha": 0., "sign": 0}, runtime.inputs, scope="full")
+
     def test_step_zero_module_stops_before_scheduler_update_and_decode(self):
         runtime, model = self.fixture()
         spec = {"sample_id": "module", "group": "B", "alpha": 0., "sign": 0}

@@ -16,11 +16,11 @@ from contextlib import contextmanager
 import numpy as np
 
 try:
-    from .umi_precision_runtime import EvidenceError, PrecisionCompatibilityError, PrecisionInputs, TensorEvidence, projection
+    from .umi_precision_runtime import EvidenceError, PrecisionCompatibilityError, PrecisionInputs, TensorEvidence, projection, validate_capture
     from .umi_fd_post_vae_scan import _clone_runtime, _cache_has_values
     from .umi_precision_identity import fingerprint, file_identity, source_identity, module_tensors, module_metadata
 except ImportError:
-    from umi_precision_runtime import EvidenceError, PrecisionCompatibilityError, PrecisionInputs, TensorEvidence, projection
+    from umi_precision_runtime import EvidenceError, PrecisionCompatibilityError, PrecisionInputs, TensorEvidence, projection, validate_capture
     from umi_fd_post_vae_scan import _clone_runtime, _cache_has_values
     from umi_precision_identity import fingerprint, file_identity, source_identity, module_tensors, module_metadata
 
@@ -199,6 +199,7 @@ class OfficialPrecisionRuntime:
         self.original_precision = model.precision
         self.original_tensor_kwargs = dict(model.tensor_kwargs)
         self._reset()
+        self._paired_noise_hash = None
 
         self._check_caches()
         with self.ops.inference():
@@ -527,4 +528,10 @@ class OfficialPrecisionRuntime:
             self._check_caches()
             record["cache"]["final_empty"] = not any(self._state().values())
         record["condition_steps_fp32"] = np.stack(record["condition_steps_fp32"])
+        # Task 6 publishes this record directly. Apply the same Task 4C
+        # evidence gate used by the validated Task 4/5 runner while the
+        # observed capture is still in memory; no invalid record can reach a
+        # successful sample publication.
+        self._paired_noise_hash = validate_capture(record, spec, inputs, scope,
+                                                    paired_noise=self._paired_noise_hash)
         return record

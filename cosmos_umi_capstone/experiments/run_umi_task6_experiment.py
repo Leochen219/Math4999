@@ -20,12 +20,12 @@ from typing import Any, Callable, Mapping
 import numpy as np
 
 try:
-    from .umi_task6_primitives import build_run_status, evaluate_resources
+    from .umi_task6_primitives import build_generation_plan, build_run_status, evaluate_resources
     from .umi_precision_storage import PrecisionSampleStore
     from .umi_task6_runtime import (PreflightError, ResourceStop, Task6Inputs, build_task6_hash_binding, task6_binding_config, preflight_task6, _run_task6_group,
                                     verify_reference_reuse)
 except ImportError:
-    from umi_task6_primitives import build_run_status, evaluate_resources
+    from umi_task6_primitives import build_generation_plan, build_run_status, evaluate_resources
     from umi_precision_storage import PrecisionSampleStore
     from umi_task6_runtime import PreflightError, ResourceStop, Task6Inputs, build_task6_hash_binding, task6_binding_config, preflight_task6, _run_task6_group, verify_reference_reuse
 
@@ -125,8 +125,27 @@ class ResourceMonitor:
         self.clock = clock; self.sleep = sleep; self._stop = threading.Event(); self.failure: Exception | None = None
         self._thread: threading.Thread | None = None; self._gpu: list[dict[str, Any]] = []; self._ram: list[dict[str, Any]] = []; self._disk: list[dict[str, Any]] = []
         self._sample_rows: list[dict[str, Any]] = []
+        self._latched_decision: dict[str, Any] | None = None
+        self._latch_lock = threading.Lock()
         self._cleanup_gpu_baseline: float | None = None; self._cleanup_rss_baseline: float | None = None
         self._cleanup_gpu_consecutive = 0; self._cleanup_ram_consecutive = 0
+
+    def _latch_decision(self, decision: Mapping[str, Any]) -> dict[str, Any]:
+        """Preserve the first hard stop or monitor failure for this run."""
+        if decision.get("status") != "HARD_STOP":
+            return dict(decision)
+        with self._latch_lock:
+            if self._latched_decision is None:
+                self._latched_decision = dict(decision)
+        self._stop.set()
+        return dict(self._latched_decision)
+
+    def _observe_row(self, row: Mapping[str, Any], *, phase: str = "pilot") -> dict[str, Any]:
+        if row.get("monitor_failure") or row.get("monitor_error"):
+            return self._latch_decision({"status": "HARD_STOP", "reason_code": "MONITOR_FAILURE",
+                                         "reason": str(row.get("monitor_failure") or row.get("monitor_error"))})
+        decision = evaluate_resources(row, phase=phase)
+        return self._latch_decision(decision) if decision.get("status") == "HARD_STOP" else decision
 
     def _poll(self):
         next_gpu = self.clock(); next_ram = next_gpu
@@ -134,11 +153,14 @@ class ResourceMonitor:
             now = self.clock()
             try:
                 if now >= next_gpu:
-                    self._gpu.append({"timestamp": now, **dict(self.gpu_sampler())}); next_gpu += 1.0
+                    row = {"timestamp": now, **dict(self.gpu_sampler())}; self._gpu.append(row); self._observe_row(row); next_gpu += 1.0
                 if now >= next_ram:
-                    self._ram.append({"timestamp": now, **dict(self.ram_sampler())}); self._disk.append({"timestamp": now, **dict(self.disk_sampler())}); next_ram += 5.0
+                    row = {"timestamp": now, **dict(self.ram_sampler())}; self._ram.append(row); self._observe_row(row)
+                    row = {"timestamp": now, **dict(self.disk_sampler())}; self._disk.append(row); self._observe_row(row); next_ram += 5.0
             except Exception as error:
-                self.failure = error; self._stop.set(); break
+                if self.failure is None: self.failure = error
+                self._latch_decision({"status": "HARD_STOP", "reason_code": "MONITOR_FAILURE", "reason": str(error)})
+                break
             self.sleep(min(max(0.0, next_gpu - now), 0.1))
 
     def start(self):
@@ -147,11 +169,12 @@ class ResourceMonitor:
         # sample before the background cadence has produced evidence.
         try:
             now = self.clock()
-            self._gpu.append({"timestamp": now, **dict(self.gpu_sampler())})
-            self._ram.append({"timestamp": now, **dict(self.ram_sampler())})
-            self._disk.append({"timestamp": now, **dict(self.disk_sampler())})
+            row = {"timestamp": now, **dict(self.gpu_sampler())}; self._gpu.append(row); self._observe_row(row)
+            row = {"timestamp": now, **dict(self.ram_sampler())}; self._ram.append(row); self._observe_row(row)
+            row = {"timestamp": now, **dict(self.disk_sampler())}; self._disk.append(row); self._observe_row(row)
         except Exception as error:
-            self.failure = error
+            if self.failure is None: self.failure = error
+            self._latch_decision({"status": "HARD_STOP", "reason_code": "MONITOR_FAILURE", "reason": str(error)})
         self._thread = threading.Thread(target=self._poll, name="task6-resource-monitor", daemon=True); self._thread.start(); return self
 
     def stop(self):
@@ -174,20 +197,34 @@ class ResourceMonitor:
 
     def check(self, *, phase: str = "pilot", starting_new_sample: bool = False,
               remaining_samples: int | None = None, run_dir: Path | None = None) -> dict[str, Any]:
-        if self.failure is not None: return {"status": "HARD_STOP", "reason_code": "MONITOR_FAILURE", "reason": str(self.failure)}
+        if self._latched_decision is not None: return dict(self._latched_decision)
+        if self.failure is not None: return self._latch_decision({"status": "HARD_STOP", "reason_code": "MONITOR_FAILURE", "reason": str(self.failure)})
         if not self.last_resources: return {"status": "HARD_STOP", "reason_code": "MONITOR_NO_SNAPSHOT", "reason": "resource monitor has not produced a sample"}
         snapshot = dict(self.last_resources)
         if remaining_samples is not None: snapshot["remaining_samples"] = int(remaining_samples)
         if run_dir is not None:
             sizes = self._validated_sample_sizes(run_dir)
             if sizes: snapshot["mean_success_sample_bytes"] = float(sum(sizes) / len(sizes))
-        return evaluate_resources(snapshot, phase=phase, starting_new_sample=starting_new_sample)
+        decision = evaluate_resources(snapshot, phase=phase, starting_new_sample=starting_new_sample)
+        return self._latch_decision(decision) if decision.get("status") == "HARD_STOP" else decision
 
     def capture_sample(self, sample_id: str, phase: str, remaining: int, run_dir: Path | None = None) -> dict[str, Any]:
         """Synchronously persist per-sample resource evidence from all samplers."""
         row = {"sample_id": str(sample_id), "phase": str(phase), "remaining_samples": int(remaining),
                "timestamp": float(self.clock())}
-        row.update(dict(self.gpu_sampler())); row.update(dict(self.ram_sampler())); row.update(dict(self.disk_sampler()))
+        if self._latched_decision is not None:
+            row.update({"decision_status": "HARD_STOP", "reason_code": self._latched_decision.get("reason_code"),
+                        "reason": self._latched_decision.get("reason")})
+            self._sample_rows.append(row)
+            return row
+        try:
+            row.update(dict(self.gpu_sampler())); row.update(dict(self.ram_sampler())); row.update(dict(self.disk_sampler()))
+        except Exception as error:
+            if self.failure is None: self.failure = error
+            decision = self._latch_decision({"status": "HARD_STOP", "reason_code": "MONITOR_FAILURE", "reason": str(error)})
+            row.update({"decision_status": "HARD_STOP", "reason_code": decision.get("reason_code"), "reason": decision.get("reason")})
+            self._sample_rows.append(row)
+            raise
         if phase == "post_cleanup":
             gpu = row.get("gpu_used_gib", row.get("gpu_allocated_gib")); rss = row.get("rss_gib", row.get("process_rss_gib"))
             if gpu is not None:
@@ -206,6 +243,8 @@ class ResourceMonitor:
             row["remaining_samples"] = int(remaining)
             row["consecutive_growth_samples"] = max(row.get("gpu_consecutive_growth_samples", 0), row.get("ram_consecutive_growth_samples", 0))
             decision = evaluate_resources(row, phase="pilot", starting_new_sample=(phase == "pre_sample"))
+            if decision.get("status") == "HARD_STOP":
+                decision = self._latch_decision(decision)
             row.update({"decision_status": decision.get("status"), "reason_code": decision.get("reason_code")})
         self._sample_rows.append(row)
         return row
@@ -331,6 +370,8 @@ def run_resource_smoke(run_dir: str | Path, *, lifecycle: Mapping[str, Callable[
         for stage in stages: by_stage.setdefault(stage, {"stage": stage, "status": "N/A", "reason": "not reached"})
         try: background.stop()
         except BaseException as error: errors.append({"stage": "monitor", "type": type(error).__name__, "message": str(error)})
+        if getattr(background, "failure", None) is not None:
+            errors.append({"stage": "monitor", "type": "MONITOR_FAILURE", "message": str(background.failure)})
         stopped = True
     if baseline and not errors and isinstance(baseline, Mapping):
         smoke_store = PrecisionSampleStore(root / "smoke_samples")
@@ -339,22 +380,62 @@ def run_resource_smoke(run_dir: str | Path, *, lifecycle: Mapping[str, Callable[
     sample_dir = root / "smoke_samples" / "baseline_smoke"
     sample_bytes = sum(path.stat().st_size for path in sample_dir.rglob("*") if path.is_file()) if sample_dir.is_dir() else 0
     forecast = sample_bytes * 31 * 1.3
-    peak_rows = list(getattr(background, "_gpu", [])) + rows
-    disk_values = [float(row["disk_free_gib"]) for row in peak_rows if row.get("disk_free_gib") is not None]
-    disk_free = min(disk_values) if disk_values else None
-    peak_alloc = max((float(row.get("gpu_peak_allocated_gib", row.get("gpu_allocated_gib", 0))) for row in peak_rows), default=0.0)
-    peak_reserved = max((float(row.get("gpu_peak_reserved_gib", row.get("gpu_reserved_gib", 0))) for row in peak_rows), default=0.0)
-    peak_nvml = max((float(row.get("gpu_peak_nvml_used_gib", row.get("gpu_used_gib", row.get("nvml_used_gib", 0)))) for row in peak_rows), default=0.0)
+    background_rows = (list(getattr(background, "_gpu", [])) + list(getattr(background, "_ram", [])) +
+                       list(getattr(background, "_disk", [])))
+    peak_rows = background_rows + rows
+    # Every background row is evidence: sampler failures and hard limits are
+    # terminal even when the synchronous lifecycle rows look healthy.
+    background_checks = ((list(getattr(background, "_gpu", [])), "resource-smoke"),
+                         (list(getattr(background, "_ram", [])), "resource-smoke"),
+                         # Disk telemetry is a continuous view of the same
+                         # start/launch storage gate; retain the reviewed
+                         # <10 GiB hard limit for every background disk row.
+                         (list(getattr(background, "_disk", [])), "preload"))
+    for rows_for_source, source_phase in background_checks:
+        for row in rows_for_source:
+            if row.get("status") == "ERROR" or row.get("monitor_failure") or row.get("monitor_error"):
+                errors.append({"stage": str(row.get("stage", "background")), "type": "MONITOR_FAILURE",
+                               "message": str(row.get("error") or row.get("monitor_failure") or row.get("monitor_error"))})
+            decision = evaluate_resources(row, phase=source_phase)
+            if decision.get("status") == "HARD_STOP":
+                errors.append({"stage": str(row.get("stage", "background")), "type": decision.get("reason_code", "RESOURCE_STOP"),
+                               "message": decision.get("reason", "background resource gate failed")})
+
+    def extreme(name, *, maximum: bool, aliases=()):
+        values = []
+        for row in peak_rows:
+            for key in (name, *aliases):
+                if row.get(key) is not None:
+                    try: values.append(float(row[key]))
+                    except (TypeError, ValueError): errors.append({"stage": str(row.get("stage", "background")), "type": "MONITOR_FAILURE", "message": f"invalid {key}"})
+                    break
+        if not values: return None
+        return (max if maximum else min)(values)
+
+    gpu_used = extreme("gpu_used_gib", maximum=True, aliases=("nvml_used_gib",))
+    gpu_free = extreme("gpu_free_gib", maximum=False, aliases=("nvml_free_gib",))
+    gpu_allocated = extreme("gpu_allocated_gib", maximum=True, aliases=("torch_allocated_gib",))
+    gpu_reserved = extreme("gpu_reserved_gib", maximum=True, aliases=("torch_reserved_gib",))
+    peak_alloc = extreme("gpu_peak_allocated_gib", maximum=True, aliases=("gpu_allocated_gib", "torch_allocated_gib")) or 0.0
+    peak_reserved = extreme("gpu_peak_reserved_gib", maximum=True, aliases=("gpu_reserved_gib", "torch_reserved_gib")) or 0.0
+    peak_nvml = extreme("gpu_peak_nvml_used_gib", maximum=True, aliases=("gpu_used_gib", "nvml_used_gib")) or 0.0
+    ram_available = extreme("ram_available_gib", maximum=False, aliases=("available_ram_gib",))
+    rss = extreme("rss_gib", maximum=True, aliases=("process_rss_gib",))
+    swap = extreme("swap_used_gib", maximum=True, aliases=("swap_gib",))
+    disk_free = extreme("disk_free_gib", maximum=False, aliases=("free_disk_gib",))
+    forecast_free = extreme("forecast_free_gib", maximum=False, aliases=("forecast_completion_free_gib",))
     by_stage.setdefault("call", {"stage": "call", "status": "N/A"})
-    by_stage["call"].update({"gpu_peak_allocated_gib": peak_alloc, "gpu_peak_reserved_gib": peak_reserved, "gpu_peak_nvml_used_gib": peak_nvml})
-    actual_rows = [row for row in peak_rows if row.get("status") != "N/A"]
-    worst = dict(max(actual_rows, key=lambda row: float(row.get("gpu_used_gib", row.get("nvml_used_gib", 0)))) if actual_rows else {})
-    if actual_rows:
-        for key in ("gpu_free_gib", "ram_available_gib", "rss_gib", "swap_used_gib", "disk_free_gib"):
-            vals = [float(row[key]) for row in actual_rows if row.get(key) is not None]
-            if vals: worst[key] = min(vals)
-    worst.update({"gpu_used_gib": peak_nvml, "gpu_reserved_gib": peak_reserved,
-                  "gpu_peak_allocated_gib": peak_alloc, "gpu_peak_nvml_used_gib": peak_nvml})
+    by_stage["call"].update({"gpu_used_gib": gpu_used, "gpu_free_gib": gpu_free,
+                              "gpu_allocated_gib": gpu_allocated, "gpu_reserved_gib": gpu_reserved,
+                              "gpu_peak_allocated_gib": peak_alloc, "gpu_peak_reserved_gib": peak_reserved,
+                              "gpu_peak_nvml_used_gib": peak_nvml, "ram_available_gib": ram_available,
+                              "rss_gib": rss, "swap_used_gib": swap, "disk_free_gib": disk_free})
+    worst = {key: value for key, value in (("gpu_used_gib", gpu_used), ("gpu_free_gib", gpu_free),
+             ("gpu_allocated_gib", gpu_allocated), ("gpu_reserved_gib", gpu_reserved),
+             ("gpu_peak_allocated_gib", peak_alloc), ("gpu_peak_reserved_gib", peak_reserved),
+             ("gpu_peak_nvml_used_gib", peak_nvml), ("ram_available_gib", ram_available),
+             ("rss_gib", rss), ("swap_used_gib", swap), ("disk_free_gib", disk_free),
+             ("forecast_free_gib", forecast_free)) if value is not None}
     if disk_free is not None: worst["disk_free_gib"] = float(disk_free)
     worst["mean_success_sample_bytes"] = sample_bytes; worst["remaining_samples"] = 31
     gate = evaluate_resources(worst, phase="resource-smoke")
@@ -430,7 +511,7 @@ def run_pilot(runtime: Any, inputs: Task6Inputs, run_dir: str | Path, *, resume:
     if monitor is None: raise BlockedExecution("pilot requires an integrated resource monitor")
     binding_config = {"schema_version": "umi-task6-v1", "group": {"state": inputs.state, "seed": inputs.seed},
                       "settings": {"num_steps": 30, "guidance": 1.0, "shift": 10.0, "autocast": False, "tf32": False, "diffusion_cache": False, "batch_size": 1}}
-    authorization = authorize_pilot(run_dir, expected_hashes=build_task6_hash_binding(runtime, inputs, binding_config))
+    authorization = authorize_pilot(run_dir, expected_hashes=build_task6_hash_binding(runtime, inputs, binding_config), resume=resume)
     if not isinstance(monitor, ResourceMonitor):
         raise BlockedExecution("pilot requires a ResourceMonitor instance")
     if not callable(getattr(runtime, "cleanup", None)) and not callable(getattr(runtime, "reset_cache", None)):
@@ -438,7 +519,8 @@ def run_pilot(runtime: Any, inputs: Task6Inputs, run_dir: str | Path, *, resume:
     return _run_task6_group(runtime, inputs, run_dir, resume=resume, authorization=authorization, monitor=monitor)
 
 
-def authorize_pilot(run_dir: str | Path, *, expected_hashes: Mapping[str, str] | None = None) -> dict[str, Any]:
+def authorize_pilot(run_dir: str | Path, *, expected_hashes: Mapping[str, str] | None = None,
+                    resume: bool = False) -> dict[str, Any]:
     """Require an explicit, hash-bound acceptance of the prior smoke run."""
     path = Path(run_dir) / "run_status.json"
     if not path.is_file(): raise BlockedExecution("pilot requires a prior resource-smoke status")
@@ -452,7 +534,14 @@ def authorize_pilot(run_dir: str | Path, *, expected_hashes: Mapping[str, str] |
         raise BlockedExecution("resource-smoke status has incomplete hash binding")
     if expected_hashes is not None and dict(expected_hashes) != hashes:
         raise BlockedExecution("pilot hashes do not match accepted resource smoke")
-    if status.get("status") not in {"AWAITING_RESOURCE_REVIEW", "RESOURCE_STOP"}:
+    expected_ids = {item["sample_id"] for item in build_generation_plan(
+        status.get("group", {}).get("state", "bridge_0"),
+        int(status.get("group", {}).get("seed", 0)))}
+    completed_ids = set(status.get("completed_samples", []))
+    raw_complete = (status.get("status") in {"AWAITING_REVIEW", "COMPLETE"} and
+                    completed_ids == expected_ids and len(completed_ids) == 32 and
+                    not status.get("failed_samples") and not status.get("skipped_samples"))
+    if status.get("status") not in {"AWAITING_RESOURCE_REVIEW", "RESOURCE_STOP"} and not (resume and raw_complete):
         raise BlockedExecution("pilot status is not resumable")
     if status.get("smoke_run_id") != acceptance.get("smoke_run_id"):
         raise BlockedExecution("pilot stop is not bound to the accepted smoke run")

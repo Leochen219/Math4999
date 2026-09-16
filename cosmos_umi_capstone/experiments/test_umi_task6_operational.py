@@ -255,6 +255,20 @@ class OperationalTask6Tests(unittest.TestCase):
         with self.assertRaises(ValueError):
             loader.resolve_bridge_fps(type("Sample", (), {"fps": 20})())
 
+    def test_loader_action_json_is_finite_exact_16_by_10_list_for_numpy_action(self):
+        import umi_task6_cosmos_loader as loader
+        action = (np.arange(160, dtype=np.float32).reshape(16, 10) / np.float32(17.0))
+        encoded = loader._json_safe_action(action)
+        self.assertIsInstance(encoded, list)
+        self.assertEqual((len(encoded), len(encoded[0])), (16, 10))
+        self.assertTrue(all(isinstance(item, float) for row in encoded for item in row))
+        np.testing.assert_array_equal(np.asarray(encoded, dtype=np.float32), action)
+        precise = np.zeros((16, 10), dtype=np.float64)
+        precise[0, 0] = 0.12345678901234567
+        self.assertEqual(loader._json_safe_action(precise)[0][0], float(precise[0, 0]))
+        for invalid in (np.full((16, 10), np.nan, np.float32), np.zeros((15, 10), np.float32)):
+            with self.assertRaises(ValueError): loader._json_safe_action(invalid)
+
     def test_official_preflight_failure_publishes_canonical_status(self):
         import run_umi_task6_official as official
         import run_umi_task6_experiment as runner
@@ -269,6 +283,32 @@ class OperationalTask6Tests(unittest.TestCase):
             status = json.loads((Path(temp) / "run_status.json").read_text())
             self.assertEqual(status["status"], "RESOURCE_STOP")
             self.assertFalse(status["generation_started"])
+
+    def test_official_derived_resume_failure_preserves_complete_raw_status(self):
+        import run_umi_task6_official as official
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            raw_status = {"status": "AWAITING_REVIEW", "phase": "PILOT", "generation_started": False,
+                          "completed_samples": [f"sample-{i}" for i in range(32)], "hashes": {}}
+            (root / "run_status.json").write_text(json.dumps(raw_status), encoding="utf-8")
+            original = official._execute_official_impl
+            official._execute_official_impl = lambda args: (_ for _ in ()).throw(RuntimeError("analysis stopped"))
+            try:
+                with self.assertRaises(RuntimeError):
+                    official.execute_official(type("Args", (), {"run_dir": temp, "phase": "pilot", "resume": True})())
+            finally:
+                official._execute_official_impl = original
+            self.assertEqual(json.loads((root / "run_status.json").read_text())["status"], "AWAITING_REVIEW")
+
+    def test_official_cli_returns_zero_for_preflight_complete(self):
+        import run_umi_task6_official as official
+        original_parse, original_execute = official.parse_args, official.execute_official
+        try:
+            official.parse_args = lambda argv=None: object()
+            official.execute_official = lambda args: {"status": "PREFLIGHT_COMPLETE"}
+            self.assertEqual(official.main([]), 0)
+        finally:
+            official.parse_args, official.execute_official = original_parse, original_execute
 
     def test_official_production_chain_preflight_then_smoke_preserves_six_hashes(self):
         import run_umi_task6_official as official
@@ -335,6 +375,94 @@ class OperationalTask6Tests(unittest.TestCase):
             finally:
                 for name, value in old.items(): setattr(official, name, value)
                 runner.build_task6_hash_binding = old_runner_binding
+
+    def test_official_pilot_rejects_unsafe_current_resources_before_factory_build(self):
+        import run_umi_task6_official as official
+        import run_umi_task6_experiment as runner
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            evidence = root / "evidence.json"; evidence.write_text('{"task5": {}, "prompt": "Put the pot to the left of the purple item."}', encoding="utf-8")
+            events = []
+            class Runtime:
+                def cleanup(self): events.append("runtime_cleanup")
+            runtime = Runtime()
+            class Factory:
+                def __init__(self, **kwargs): events.append("factory_init")
+                def build(self): events.append("factory_build"); return runtime, object(), object()
+                def unload(self): events.append("factory_unload")
+            class Monitor:
+                last_resources = {"gpu_used_gib": 2.0, "gpu_free_gib": 100.0, "ram_available_gib": 600.0,
+                                  "rss_gib": 0.0, "swap_used_gib": 0.0, "disk_free_gib": 20.0}
+                def __init__(self, *args, **kwargs): events.append("monitor_init")
+                def start(self): events.append("monitor_start"); return self
+                def check(self, **kwargs): return {"status": "HARD_STOP", "reason_code": "GPU_START_USED_HIGH", "reason": "unsafe"}
+                def stop(self): events.append("monitor_stop")
+            unsafe = lambda: {"gpu_used_gib": 2.0, "gpu_free_gib": 100.0, "ram_available_gib": 600.0,
+                              "rss_gib": 0.0, "swap_used_gib": 0.0, "disk_free_gib": 20.0}
+            (root / "action").write_text(json.dumps([[0.0] * 10 for _ in range(16)]), encoding="utf-8")
+            (root / "video").write_bytes(b"video")
+            old = {name: getattr(official, name) for name in ("_validate_static_contract", "verify_pinned_bridge_assets", "extract_task5_directions", "OfficialRuntimeFactory", "resource_samplers", "ResourceMonitor")}
+            try:
+                official._validate_static_contract = lambda contract: None
+                official.verify_pinned_bridge_assets = lambda *args, **kwargs: {"action_sha256": "a" * 64, "video_sha256": "b" * 64}
+                official.extract_task5_directions = lambda *args, **kwargs: {"bank": np.zeros((3, 1)), "manifest_sha256": "a" * 64,
+                    "plan_sha256": "b" * 64, "direction_file_sha256": {}, "direction_sha256": {}}
+                official.OfficialRuntimeFactory = Factory
+                official.resource_samplers = lambda *args, **kwargs: {"gpu": unsafe, "ram": unsafe, "disk": unsafe}
+                official.ResourceMonitor = Monitor
+                args = official.parse_args(["--phase", "pilot", "--run-dir", str(root), "--launch-contract", str(evidence),
+                    "--framework-root", str(root), "--checkpoint", str(root / "checkpoint"), "--vae", str(root / "vae"),
+                    "--action", str(root / "action"), "--video", str(root / "video"), "--task5-root", str(root)])
+                result = official._execute_official_impl(args)
+            finally:
+                for name, value in old.items(): setattr(official, name, value)
+            self.assertNotIn("factory_build", events, events)
+            self.assertEqual(result["status"], "RESOURCE_STOP")
+            self.assertLess(events.index("monitor_start"), events.index("factory_build") if "factory_build" in events else len(events), events)
+            self.assertIn("factory_unload", events)
+
+    def test_official_pilot_stops_preload_monitor_when_model_load_fails(self):
+        import run_umi_task6_official as official
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            evidence = root / "evidence.json"
+            evidence.write_text('{"task5": {}, "prompt": "Put the pot to the left of the purple item."}', encoding="utf-8")
+            (root / "action").write_text(json.dumps([[0.0] * 10 for _ in range(16)]), encoding="utf-8")
+            (root / "video").write_bytes(b"video")
+            events = []
+            class Factory:
+                def __init__(self, **kwargs): events.append("factory_init")
+                def build(self): events.append("factory_build"); raise RuntimeError("load failure")
+                def unload(self): events.append("factory_unload")
+            class Monitor:
+                last_resources = {"gpu_used_gib": 0.0, "gpu_free_gib": 100.0, "ram_available_gib": 600.0,
+                                  "rss_gib": 0.0, "swap_used_gib": 0.0, "disk_free_gib": 20.0}
+                def __init__(self, *args, **kwargs): events.append("monitor_init")
+                def start(self): events.append("monitor_start"); return self
+                def check(self, **kwargs): events.append("monitor_check"); return {"status": "OK"}
+                def stop(self): events.append("monitor_stop")
+            safe = lambda: dict(Monitor.last_resources)
+            old = {name: getattr(official, name) for name in ("_validate_static_contract", "verify_pinned_bridge_assets",
+                                                               "extract_task5_directions", "OfficialRuntimeFactory",
+                                                               "resource_samplers", "ResourceMonitor")}
+            try:
+                official._validate_static_contract = lambda contract: None
+                official.verify_pinned_bridge_assets = lambda *args, **kwargs: {"action_sha256": "a" * 64, "video_sha256": "b" * 64}
+                official.extract_task5_directions = lambda *args, **kwargs: {"bank": np.zeros((3, 1)), "manifest_sha256": "a" * 64,
+                    "plan_sha256": "b" * 64, "direction_file_sha256": {}, "direction_sha256": {}}
+                official.OfficialRuntimeFactory = Factory
+                official.resource_samplers = lambda *args, **kwargs: {key: safe for key in ("gpu", "ram", "disk")}
+                official.ResourceMonitor = Monitor
+                args = official.parse_args(["--phase", "pilot", "--run-dir", str(root), "--launch-contract", str(evidence),
+                    "--framework-root", str(root), "--checkpoint", str(root / "checkpoint"), "--vae", str(root / "vae"),
+                    "--action", str(root / "action"), "--video", str(root / "video"), "--task5-root", str(root)])
+                with self.assertRaisesRegex(RuntimeError, "load failure"):
+                    official._execute_official_impl(args)
+            finally:
+                for name, value in old.items(): setattr(official, name, value)
+            self.assertLess(events.index("monitor_start"), events.index("factory_build"), events)
+            self.assertLess(events.index("factory_build"), events.index("monitor_stop"), events)
+            self.assertEqual(events[-1], "factory_unload")
 
     def test_condition_encoder_adapter_uses_batched_torch_video_and_restores_cache(self):
         try:

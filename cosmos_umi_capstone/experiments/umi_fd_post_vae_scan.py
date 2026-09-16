@@ -109,6 +109,24 @@ def sha256_tree(path: str | Path) -> str:
     return digest.hexdigest()
 
 
+def content_identity(path: str | Path) -> str:
+    """Hash one content artifact using the reviewed file/tree semantics.
+
+    Checkpoint artifacts may be a regular file or a directory. Symlinks and
+    other path types are rejected before resolution so identity cannot be
+    redirected after validation. Directory hashing delegates to the existing
+    Task 4/5 ``sha256_tree`` algorithm.
+    """
+    candidate = Path(path)
+    if candidate.is_symlink():
+        raise ValueError(f"content artifact path is an unsupported symlink: {candidate}")
+    if candidate.is_file():
+        return sha256_file(candidate)
+    if candidate.is_dir():
+        return sha256_tree(candidate)
+    raise ValueError(f"content artifact path is missing or unsupported: {candidate}")
+
+
 def sha256_json_value(value: Any) -> str:
     payload = (json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False, separators=(",", ":")) + "\n").encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
@@ -1872,7 +1890,7 @@ def run_experiment(args: argparse.Namespace, *, execute_call: Callable[[Mapping[
 
 
 __all__ = [
-    "ALPHAS", "COMPATIBILITY_FIELDS", "DIRECTION_COUNT", "DIRECTION_SEED", "EXPECTED_CALL_COUNT", "EXPECTED_SCAN_COUNT", "FRAMEWORK_COMMIT", "GateResult", "GpuMonitor", "MODEL_SEED", "OfficialPostVaeRuntimeAdapter", "RuntimeAdapter", "RuntimeCaptureError", "SampleStore", "assert_resume_compatible", "build_call_plan", "build_run_specs", "capture_final_latent", "classify_scan_status", "evaluate_stage_a_gate", "generate_directions_for_mask", "hash_predicted_noisy_region", "parse_args", "prepare_sample_dir_for_run", "run_experiment", "run_stage_a_and_scan", "sha256_array", "sha256_file", "sha256_json_value", "sha256_tree", "stage_a_gate", "validate_call_plan", "validate_resume_compatible", "validate_resume_compatibility", "validate_runtime_metadata", "validate_sample_evidence", "write_json", "write_sha256_manifest",
+    "ALPHAS", "COMPATIBILITY_FIELDS", "DIRECTION_COUNT", "DIRECTION_SEED", "EXPECTED_CALL_COUNT", "EXPECTED_SCAN_COUNT", "FRAMEWORK_COMMIT", "GateResult", "GpuMonitor", "MODEL_SEED", "OfficialPostVaeRuntimeAdapter", "RuntimeAdapter", "RuntimeCaptureError", "SampleStore", "assert_resume_compatible", "build_call_plan", "build_run_specs", "capture_final_latent", "classify_scan_status", "content_identity", "evaluate_stage_a_gate", "generate_directions_for_mask", "hash_predicted_noisy_region", "parse_args", "prepare_sample_dir_for_run", "run_experiment", "run_stage_a_and_scan", "sha256_array", "sha256_file", "sha256_json_value", "sha256_tree", "stage_a_gate", "validate_call_plan", "validate_resume_compatible", "validate_resume_compatibility", "validate_runtime_metadata", "validate_sample_evidence", "write_json", "write_sha256_manifest",
 ]
 
 

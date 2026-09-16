@@ -26,6 +26,7 @@ try:
     from .umi_task5_primitives import freeze_task5_directions, rms64
     from .umi_task6_primitives import (ALPHAS, DIRECTION_IDS, RAW_MUTABLE_FILES, build_generation_plan,
         build_run_status, evaluate_resources, stable_hash, STATE_IDS, SEEDS, parse_action)
+    from .umi_fd_post_vae_scan import content_identity
 except ImportError:
     from umi_fd_post_vae_bridge import construct_delta, sha256_array
     from umi_precision_primitives import canonical_json, mask_geometry
@@ -33,6 +34,7 @@ except ImportError:
     from umi_precision_storage import ProcessLock, PrecisionSampleStore
     from umi_task5_primitives import freeze_task5_directions, rms64
     from umi_task6_primitives import ALPHAS, DIRECTION_IDS, RAW_MUTABLE_FILES, build_generation_plan, build_run_status, evaluate_resources, stable_hash, STATE_IDS, SEEDS, parse_action
+    from umi_fd_post_vae_scan import content_identity
 
 
 class PreflightError(ValueError):
@@ -57,7 +59,7 @@ def build_task6_hash_binding(runtime: Any, inputs: Any, config: Mapping[str, Any
     actual = runtime.actual_identity() if hasattr(runtime, "actual_identity") else {"runtime": type(runtime).__name__}
     source_root = Path(__file__).resolve().parent
     sources = [source_root / name for name in ("umi_task6_runtime.py", "run_umi_task6_experiment.py",
-        "umi_task6_primitives.py", "umi_fd_post_vae_bridge.py",
+        "umi_task6_primitives.py", "umi_fd_post_vae_bridge.py", "umi_fd_post_vae_scan.py",
         "umi_precision_runtime.py", "umi_precision_storage.py", "umi_precision_official.py",
         "umi_task5_runtime.py", "umi_task5_primitives.py", "umi_task6_operational.py",
         "run_umi_task6_official.py", "umi_task6_cosmos_loader.py", "umi_task6_decoder.py",
@@ -179,6 +181,15 @@ class Task6Inputs:
             raise ValueError("condition perturbation escaped runtime mask")
         return result
 
+    def direction_for_spec(self, spec: Mapping[str, Any]) -> np.ndarray:
+        """Return the frozen direction selected by a baseline/perturbation spec."""
+        if spec.get("kind") == "baseline":
+            return np.zeros_like(self.z_bar, dtype=np.float32)
+        direction_id = spec.get("direction_id")
+        if direction_id not in self.directions:
+            raise ValueError("unknown frozen Task 6 direction")
+        return np.array(self.directions[direction_id], dtype=np.float32, copy=True)
+
     def identity(self) -> dict[str, Any]:
         return {"z0": _sha(self.z0), "z_bar": _sha(self.z_bar), "geometry": self.geometry.metadata(),
                 "directions": {key: _array_sha(value) for key, value in self.directions.items()},
@@ -247,7 +258,14 @@ class Task6RuntimeAdapter:
         if scope not in ("full", "module"):
             raise ValueError("official runtime supports only full or module scope")
         record = dict(self.runtime.execute(request, target, scope=scope))
-        consumed = target.for_spec({**request, "state": target.state, "seed": target.seed})
+        observed_common = record.get("common_input_fp32")
+        if observed_common is not None:
+            consumed = np.asarray(projection(observed_common), dtype=np.float32)
+            if consumed.shape != target.z_bar.shape or not np.all(np.isfinite(consumed)):
+                raise ValueError("runtime common input is not an exact finite Task 6 carrier")
+            consumed = np.array(consumed, dtype=np.float32, copy=True)
+        else:
+            consumed = target.for_spec({**request, "state": target.state, "seed": target.seed})
         actual_delta = np.subtract(consumed, target.z_bar, dtype=np.float32)
         direction = np.zeros_like(target.z_bar, dtype=np.float32)
         expected_delta = np.zeros_like(target.z_bar, dtype=np.float32)
@@ -341,12 +359,13 @@ def preflight_task6(config: Mapping[str, Any], *, strict: bool = False, runtime:
         if expected_runtime != observed_runtime: failures.append("runtime_identity")
         if expected_inputs != observed_inputs: failures.append("input_identity")
         if config.get("prompt") is not None and config.get("prompt") != getattr(inputs, "prompt", None): failures.append("prompt")
-        if config.get("action_hash") is not None and config.get("action_hash") != observed_inputs.get("action"): failures.append("action_hash")
+        if config.get("action_hash") is not None:
+            actual_action_hash = _array_sha(getattr(inputs, "action", None))
+            if config.get("action_hash") != actual_action_hash: failures.append("action_hash")
         if config.get("direction_hashes") is not None and config.get("direction_hashes") != observed_inputs.get("directions"): failures.append("direction_hashes")
         if config.get("carrier_hash") is not None and config.get("carrier_hash") != observed_inputs.get("z0"): failures.append("carrier_hash")
         if config.get("z_bar_hash") is not None and config.get("z_bar_hash") != observed_inputs.get("z_bar"): failures.append("z_bar_hash")
         if config.get("mask_hash") is not None and config.get("mask_hash") != inputs.geometry.metadata().get("mask_sha256"): failures.append("mask_hash")
-        if strict and config.get("action_hash") != observed_inputs.get("action"): failures.append("action_hash")
         if strict and config.get("seed_config", {}).get("seed") != observed_inputs.get("seed"): failures.append("seed_config")
     required = ("environment", "provenance", "asset_hashes", "carrier_shape", "condition_indexes",
                 "predicted_indexes", "mask_shape", "action_shape", "direction_hashes", "settings", "seed_config")
@@ -371,6 +390,10 @@ def preflight_task6(config: Mapping[str, Any], *, strict: bool = False, runtime:
     if "action" in config:
         try:
             action = parse_action(config["action"])
+            # Action publication is bound to the Task 4C bridge's canonical
+            # dtype/shape/bytes hash. ``Task6Inputs.identity`` intentionally
+            # keeps its historical stable-hash representation for Task 5
+            # compatibility; it is not reused for this actual action hash.
             if "action_hash" in config and _array_sha(action) != str(config["action_hash"]): failures.append("action_hash")
         except Exception: failures.append("action")
     if strict and not str(config.get("prompt", "")).strip(): failures.append("prompt")
@@ -407,14 +430,22 @@ def preflight_task6(config: Mapping[str, Any], *, strict: bool = False, runtime:
         if not isinstance(assets, Mapping): failures.append("asset_hashes")
         for key, raw_path in asset_paths.items():
             path = Path(raw_path)
-            if not path.is_file(): failures.append(f"asset_paths.{key}"); continue
-            if assets.get(key) != _file_sha(path): failures.append(f"asset_hashes.{key}")
+            try:
+                observed = content_identity(path) if key == "checkpoint" else (_file_sha(path) if path.is_file() and not path.is_symlink() else None)
+            except (OSError, TypeError, ValueError):
+                observed = None
+            if observed is None: failures.append(f"asset_paths.{key}"); continue
+            if assets.get(key) != observed: failures.append(f"asset_hashes.{key}")
     for key in ("checkpoint_path", "vae_path"):
         raw_path = config.get(key)
         if raw_path is not None:
             path = Path(raw_path)
-            if not path.is_file(): failures.append(key)
-            elif isinstance(assets, Mapping) and assets.get(key.removesuffix("_path")) != _file_sha(path): failures.append(f"asset_hashes.{key.removesuffix('_path')}")
+            try:
+                observed = content_identity(path) if key == "checkpoint_path" else (_file_sha(path) if path.is_file() and not path.is_symlink() else None)
+            except (OSError, TypeError, ValueError):
+                observed = None
+            if observed is None: failures.append(key)
+            elif isinstance(assets, Mapping) and assets.get(key.removesuffix("_path")) != observed: failures.append(f"asset_hashes.{key.removesuffix('_path')}")
     if "direction_bank_path" in config:
         try:
             expected = config.get("direction_hashes")
@@ -634,7 +665,29 @@ def _run_task6_group(runtime: Any, inputs: Task6Inputs, run_dir: str | Path, *, 
                         if not record_file.is_file(): raise ValueError("successful Task 6 sample is missing sample.json")
                         record = json.loads(record_file.read_text(encoding="utf-8"))
                         if record.get("identity") != identity: raise ValueError("strict Task 6 resume identity mismatch")
-        if monitor is not None and hasattr(monitor, "start"):
+        # A completed raw run is an immutable input to decoder/analysis
+        # resume. Do not start a generation monitor or rewrite its status just
+        # to rediscover that all 32 successful samples already exist.
+        if resume and status_path.is_file():
+            existing_status = json.loads(status_path.read_text(encoding="utf-8"))
+            expected_ids = {item["sample_id"] for item in plan}
+            completed_ids = set(existing_status.get("completed_samples", []))
+            if (existing_status.get("status") in {"AWAITING_REVIEW", "COMPLETE"} and
+                    len(completed_ids) == 32 and completed_ids == expected_ids and
+                    not existing_status.get("failed_samples") and
+                    not existing_status.get("skipped_samples") and
+                    dict(existing_status.get("hashes", {})) == hashes):
+                if (monitor is not None and getattr(monitor, "_thread", None) is not None and
+                        callable(getattr(monitor, "stop", None))):
+                    try:
+                        monitor.stop()
+                    except BaseException:
+                        # The raw run is already complete; cleanup telemetry
+                        # must not rewrite its immutable status or trigger
+                        # generation on a resume attempt.
+                        pass
+                return existing_status
+        if monitor is not None and hasattr(monitor, "start") and getattr(monitor, "_thread", None) is None:
             try:
                 monitor.start()
             except Exception as error:

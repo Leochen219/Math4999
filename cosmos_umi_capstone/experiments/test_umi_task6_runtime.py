@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import json
 from pathlib import Path
 
 import numpy as np
@@ -62,6 +63,50 @@ class Task6RuntimeTests(unittest.TestCase):
                                       "mask": mask, "direction_bank": bank,
                                       "settings": {"autocast": True}})
 
+    def test_strict_preflight_accepts_directory_checkpoint_and_file_vae(self):
+        import hashlib, json
+        import umi_task6_operational as operational
+        inputs = self.inputs()
+        class Runtime:
+            def actual_identity(self): return {"runtime": "directory-checkpoint"}
+        runtime = Runtime()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            action_path = root / "action.json"
+            video_path = root / "video.mp4"
+            checkpoint = root / "checkpoint"
+            vae_path = root / "vae.bin"
+            direction_path = root / "directions.npy"
+            action = inputs.action.tolist()
+            action_path.write_text(json.dumps(action), encoding="utf-8")
+            video_path.write_bytes(b"video")
+            checkpoint.mkdir(); (checkpoint / "model.bin").write_bytes(b"model")
+            vae_path.write_bytes(b"vae")
+            np.save(direction_path, np.stack([inputs.directions[key] for key in ("v0", "v1", "v2")]), allow_pickle=False)
+            file_sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+            direction_hashes = {key: self.api._array_sha(value) for key, value in inputs.directions.items()}
+            config = {
+                "environment": {"torch": "fixture", "cuda": "fixture"},
+                "provenance": {"source_commit": operational.SOURCE_COMMIT},
+                "asset_hashes": {"action": file_sha(action_path), "video": file_sha(video_path),
+                                  "checkpoint": operational.checkpoint_content_identity(checkpoint), "vae": file_sha(vae_path)},
+                "asset_paths": {"action": str(action_path), "video": str(video_path),
+                                "checkpoint": str(checkpoint), "vae": str(vae_path)},
+                "checkpoint_path": str(checkpoint), "vae_path": str(vae_path),
+                "carrier_shape": list(inputs.z0.shape), "carrier_hash": inputs.identity()["z0"],
+                "condition_indexes": [0], "predicted_indexes": [1, 2, 3, 4],
+                "mask_shape": list(inputs.geometry.mask.shape), "mask_hash": inputs.geometry.metadata()["mask_sha256"],
+                "action": action, "action_shape": [16, 10], "action_hash": self.api._array_sha(inputs.action),
+                "prompt": inputs.prompt, "direction_hashes": direction_hashes,
+                "direction_bank_path": str(direction_path), "direction_bank_file_hash": file_sha(direction_path),
+                "settings": {"num_steps": 30, "guidance": 1.0, "shift": 10.0, "batch_size": 1,
+                             "autocast": False, "tf32": False, "diffusion_cache": False},
+                "seed_config": {"seed": 0, "prepare": 0, "sampler": 0, "scheduler": 0},
+                "observed_runtime_identity": runtime.actual_identity(), "observed_input_identity": inputs.identity(),
+            }
+            result = self.api.preflight_task6(config, strict=True, runtime=runtime, inputs=inputs)
+            self.assertEqual(result["status"], "PASS")
+
     def test_inputs_require_real_geometry_action_prompt_and_direction_manifest(self):
         carrier, indexes, mask, bank = self.fixture()
         with self.assertRaises(ValueError):
@@ -117,6 +162,20 @@ class Task6RuntimeTests(unittest.TestCase):
             self.assertEqual(record["group"], {"state":"bridge_0","seed":0})
             self.assertEqual(record["predicted_latent"].dtype, np.float32)
 
+    def test_adapter_saves_observed_common_input_and_delta_not_requested_target(self):
+        inputs = self.inputs()
+        observed = inputs.z_bar.copy()
+        observed[inputs.geometry.mask] += np.float32(0.25)
+        class StrictRuntime:
+            def __init__(self): self.inputs = inputs
+            def execute(self, spec, runtime_inputs, *, scope):
+                return {"output_full": np.zeros((1, 48, 4, 16, 16), np.float32),
+                        "common_input_fp32": observed.copy()}
+        spec = {"state": "bridge_0", "seed": 0, "kind": "baseline", "alpha": 0.0, "sign": 0}
+        record = self.api.Task6RuntimeAdapter(StrictRuntime(), inputs).execute(spec)
+        np.testing.assert_array_equal(record["consumed_input_fp32"], observed)
+        np.testing.assert_array_equal(record["actual_delta_fp32"], observed - inputs.z_bar)
+
     def test_adapter_slices_carrier_fallback_using_validated_prediction_indexes(self):
         inputs = self.inputs()
         class StrictRuntime:
@@ -169,6 +228,58 @@ class Task6RuntimeTests(unittest.TestCase):
             self.assertEqual(len(runtime.calls), 32)
             self.assertEqual(self.api._run_task6_group(runtime, inputs, temp, resume=True, authorization=self.authorization(runtime, inputs), monitor=self.Monitor())["successful_samples"], 32)
             self.assertEqual(len(runtime.calls), 32)
+
+    def test_complete_raw_resume_skips_generation_and_preserves_status_bytes(self):
+        inputs = self.inputs()
+        class Runtime:
+            provenance = {"seed": 0}
+            def __init__(self, fail=False): self.calls = 0; self.fail = fail
+            def actual_identity(self): return {"fixture": "raw-resume"}
+            def execute(self, spec, inputs, *, scope="full"):
+                self.calls += 1
+                if self.fail: raise AssertionError("generation must be skipped for a complete raw resume")
+                return {"output_full": inputs.for_spec(spec)}
+            def cleanup(self): pass
+        with tempfile.TemporaryDirectory() as temp:
+            first_runtime = Runtime()
+            first = self.api._run_task6_group(first_runtime, inputs, temp,
+                authorization=self.authorization(first_runtime, inputs), monitor=self.Monitor())
+            self.assertEqual(first["status"], "AWAITING_REVIEW"); self.assertEqual(first_runtime.calls, 32)
+            status_path = Path(temp) / "run_status.json"
+            before = (status_path.read_bytes(), status_path.stat().st_mtime_ns)
+            resumed_runtime = Runtime(fail=True)
+            resumed = self.api._run_task6_group(resumed_runtime, inputs, temp, resume=True,
+                authorization=self.authorization(resumed_runtime, inputs), monitor=self.Monitor())
+            self.assertEqual(resumed, json.loads(before[0].decode()))
+            self.assertEqual(resumed_runtime.calls, 0)
+            self.assertEqual((status_path.read_bytes(), status_path.stat().st_mtime_ns), before)
+
+    def test_complete_raw_resume_does_not_stop_an_unstarted_monitor(self):
+        inputs = self.inputs()
+        class Runtime:
+            provenance = {"seed": 0}
+            def __init__(self): self.calls = 0
+            def actual_identity(self): return {"fixture": "unstarted-monitor"}
+            def execute(self, spec, inputs, *, scope="full"):
+                self.calls += 1
+                return {"output_full": inputs.for_spec(spec)}
+            def cleanup(self): pass
+        class UnstartedMonitor:
+            _thread = None
+            failure = None
+            last_resources = {}
+            def __init__(self): self.stopped = False
+            def stop(self): self.stopped = True
+        with tempfile.TemporaryDirectory() as temp:
+            runtime = Runtime()
+            first = self.api._run_task6_group(runtime, inputs, temp,
+                authorization=self.authorization(runtime, inputs), monitor=self.Monitor())
+            self.assertEqual(first["status"], "AWAITING_REVIEW")
+            monitor = UnstartedMonitor()
+            resumed = self.api._run_task6_group(runtime, inputs, temp, resume=True,
+                authorization=self.authorization(runtime, inputs), monitor=monitor)
+            self.assertEqual(resumed["status"], "AWAITING_REVIEW")
+            self.assertFalse(monitor.stopped)
 
     def test_equivalence_requires_four_calls_and_reports_reuse(self):
         import hashlib
