@@ -10,13 +10,20 @@ class Task6RuntimeTests(unittest.TestCase):
         import umi_task6_runtime as api
         self.api = api
 
+    def inputs(self, **kwargs):
+        carrier, indexes, mask, bank = self.fixture()
+        from umi_fd_post_vae_bridge import sha256_array
+        directions = self.api.load_frozen_directions(bank, mask)
+        hashes = {key: sha256_array(value) for key, value in directions.items()}
+        return self.api.Task6Inputs(carrier, indexes, mask, bank, z_bar=carrier,
+                                    task4_reference={"fixture": True}, action=np.zeros((16, 10), np.float32),
+                                    prompt="p", direction_hashes=hashes, **kwargs)
+
     def fixture(self):
-        carrier = np.ones((1, 1, 3, 2, 2), dtype=np.float32)
+        carrier = np.ones((1, 48, 5, 16, 16), dtype=np.float32)
         mask = np.zeros_like(carrier, dtype=bool); mask[:, :, 0] = True
         bank = np.zeros((3,) + carrier.shape, dtype=np.float32)
-        bank[0, :, :, 0] = 1.0
-        bank[1, :, :, 0, 0] = np.sqrt(2.0)
-        bank[2, :, :, 0, 1] = np.sqrt(2.0)
+        bank[:, mask] = 1.0
         return carrier, [0], mask, bank
 
     def test_preflight_rejects_geometry_before_execute(self):
@@ -25,6 +32,38 @@ class Task6RuntimeTests(unittest.TestCase):
             self.api.preflight_task6({"carrier": carrier, "condition_indexes": indexes,
                                       "mask": mask, "direction_bank": bank,
                                       "settings": {"autocast": True}})
+
+    def test_inputs_require_real_geometry_action_prompt_and_direction_manifest(self):
+        carrier, indexes, mask, bank = self.fixture()
+        with self.assertRaises(ValueError):
+            self.api.Task6Inputs(carrier, indexes, mask, bank, action=np.zeros((15, 10), np.float32), prompt="p")
+        with self.assertRaises(ValueError):
+            self.api.Task6Inputs(carrier, indexes, mask, bank, action=np.zeros((16, 10), np.float32), prompt="")
+
+    def test_perturbation_realized_mask_rms_uses_s_z_and_preserves_exterior(self):
+        inputs = self.inputs()
+        for alpha in (0.001, 0.003, 0.01):
+            for sign in (-1, 1):
+                target = inputs.for_spec({"state": "bridge_0", "seed": 0, "kind": "perturbation",
+                                          "direction_id": "v0", "alpha": alpha, "sign": sign})
+                delta = target - inputs.z_bar
+                self.assertAlmostEqual(float(np.sqrt(np.mean(delta[inputs.geometry.mask].astype(np.float64) ** 2))),
+                                       alpha * inputs.s_z, places=7)
+                self.assertTrue(np.array_equal(delta[~inputs.geometry.mask], np.zeros_like(delta[~inputs.geometry.mask])))
+
+    def test_adapter_uses_official_full_scope_and_compatible_runtime_inputs(self):
+        inputs = self.inputs()
+        class StrictRuntime:
+            provenance = {"seed": 0}
+            def __init__(self): self.inputs = inputs; self.seen = None
+            def actual_identity(self): return {"runtime": "strict"}
+            def execute(self, spec, runtime_inputs, *, scope):
+                if runtime_inputs is not self.inputs: raise ValueError("identity mismatch")
+                if scope != "full": raise ValueError("scope mismatch")
+                self.seen = (spec, scope); return {"output_full": runtime_inputs.for_spec(spec)}
+        runtime = StrictRuntime(); adapter = self.api.Task6RuntimeAdapter(runtime, inputs)
+        result = adapter.execute({"kind": "baseline", "state": "bridge_0", "seed": 0}, scope="full")
+        self.assertIn("output_full", result); self.assertEqual(runtime.seen[0]["group"], "C")
 
     def test_direction_bank_is_frozen_and_extra_direction_rejected(self):
         carrier, indexes, mask, bank = self.fixture()
@@ -35,9 +74,7 @@ class Task6RuntimeTests(unittest.TestCase):
 
     def test_runner_executes_exact_plan_and_resume_is_immutable(self):
         carrier, indexes, mask, bank = self.fixture()
-        inputs = self.api.Task6Inputs(carrier, indexes, mask, bank,
-                                      z_bar=carrier, task4_reference={"fixture": True},
-                                      action=np.zeros((16, 10), np.float32), prompt="p")
+        inputs = self.inputs()
         class FakeRuntime:
             provenance = {"seed": 0, "diffusion_cache": "off"}
             def __init__(self): self.calls = []
@@ -56,18 +93,40 @@ class Task6RuntimeTests(unittest.TestCase):
             self.assertEqual(len(runtime.calls), 32)
 
     def test_equivalence_requires_four_calls_and_reports_reuse(self):
+        import hashlib
         class Runtime:
             def __init__(self, equal=True): self.calls = 0; self.equal = equal
             def execute(self, spec, inputs, *, scope="equivalence"):
                 self.calls += 1
                 return {"raw": np.array([1 if self.equal else self.calls], dtype=np.float32)}
-        result = self.api.verify_reference_reuse(Runtime(), None, execute=True)
+        with tempfile.TemporaryDirectory() as temp:
+            paths = {}
+            for name in ("baseline_pre", "baseline_post", "v0_alpha_00_plus", "v0_alpha_00_minus"):
+                path = Path(temp, name + ".npy"); np.save(path, np.array([1], dtype=np.float32)); paths[name] = path
+            manifest = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths.values()}
+            result = self.api.verify_reference_reuse(Runtime(), None, reference_artifacts=paths,
+                                                     reference_manifest=manifest, execute=True)
         self.assertTrue(result["reusable"]); self.assertEqual(result["calls"], 4)
+
+    def test_reuse_compares_each_corresponding_saved_artifact(self):
+        class Runtime:
+            def __init__(self): self.calls = 0
+            def execute(self, spec, inputs, *, scope="full"):
+                self.calls += 1
+                return {"raw": np.array([self.calls], dtype=np.float32)}
+        with tempfile.TemporaryDirectory() as temp:
+            paths = {}
+            for name in ("baseline_pre", "baseline_post", "v0_alpha_00_plus", "v0_alpha_00_minus"):
+                path = Path(temp, name + ".npy"); np.save(path, np.array([1], dtype=np.float32)); paths[name] = path
+            import hashlib
+            manifest = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths.values()}
+            result = self.api.verify_reference_reuse(Runtime(), None, reference_artifacts=paths,
+                                                     reference_manifest=manifest)
+            self.assertFalse(result["reusable"]); self.assertEqual(result["calls"], 4)
 
     def test_resource_stop_preserves_completed_samples_and_resume_numbers_incomplete_attempt(self):
         carrier, indexes, mask, bank = self.fixture()
-        inputs = self.api.Task6Inputs(carrier, indexes, mask, bank, z_bar=carrier,
-                                      action=np.zeros((16, 10), np.float32))
+        inputs = self.inputs()
         class Runtime:
             provenance = {"seed": 0}
             def __init__(self): self.calls = []
@@ -85,7 +144,7 @@ class Task6RuntimeTests(unittest.TestCase):
 
     def test_resume_refuses_tampered_success(self):
         carrier, indexes, mask, bank = self.fixture()
-        inputs = self.api.Task6Inputs(carrier, indexes, mask, bank, z_bar=carrier)
+        inputs = self.inputs()
         class Runtime:
             provenance = {"seed": 0}
             def actual_identity(self): return {"fixture": "tamper"}
