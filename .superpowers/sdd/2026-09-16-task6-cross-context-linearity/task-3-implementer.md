@@ -224,3 +224,23 @@ Round 5 also adds an OfficialPrecisionRuntime-like adapter test (model/ops
 only) proving delegation to Task 5 `replay_decode`, forged decoder-plan
 rejection, exact realized-alpha linear decoder evidence, and raw-manifest
 binding before decoder analysis. No remote/model execution was performed.
+
+## Identity and public-pipeline hardening
+
+Class/module metadata and scalar decoder state are no longer accepted as
+decoder configuration identities; a content-bearing actual identity is
+required, while the fake fixtures now provide explicit stable model/VAE
+content identities. Resume with changed runtime weights or encoder identity is
+rejected. The public E2E now runs the Task6 adapter through the public 32-sample
+runner/store, performs all 16 decoder calls, invokes `analyze_task6_run`,
+packages the deterministic review bundle, and verifies raw bytes/mtimes are
+unchanged. The package source snapshot includes `umi_task5_decoder.py`, and
+decoder manifest parsing rejects non-hex digests and unsafe paths.
+
+Bundled interpreter verification:
+
+```text
+py_compile changed experiments: PASS
+Task6 decoder + analysis + runtime focused suite: Ran 51 tests ... OK
+Focused Task6/Task5/precision runtime regression: Ran 143 tests ... OK
+```

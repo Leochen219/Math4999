@@ -611,8 +611,11 @@ def _verify_decoder_manifest_for_analysis(root: Path) -> str:
     seen = {}
     for line in path.read_text(encoding="ascii").splitlines():
         parts = line.split("  ", 1)
-        if len(parts) != 2 or parts[1] in seen: raise ValueError("malformed decoder manifest")
-        target = root / parts[1]
+        if (len(parts) != 2 or len(parts[0]) != 64 or any(char not in "0123456789abcdefABCDEF" for char in parts[0]) or
+                not parts[1] or parts[1] in seen): raise ValueError("malformed decoder manifest")
+        relative = Path(parts[1])
+        if relative.is_absolute() or ".." in relative.parts: raise ValueError("unsafe decoder manifest path")
+        target = root / relative
         if not target.is_file() or sha256_file(target) != parts[0]: raise ValueError(f"decoder artifact mismatch: {parts[1]}")
         seen[parts[1]] = parts[0]
     actual = {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file() and p.relative_to(root).as_posix() not in {"MANIFEST.sha256", ".decoder.lock"}}
@@ -785,7 +788,7 @@ def write_task6_artifacts(result: Mapping[str, Any], output_dir: str | Path, *, 
             _svg(stage / "figures" / f"{stem}.svg", chart_values, title, ylabel); _png(stage / "figures" / f"{stem}.png", chart_values, title)
         if source_dir is not None:
             source = Path(source_dir)
-            for name in ("umi_task6_decoder.py", "analyze_umi_task6.py", "umi_task6_runtime.py", "run_umi_task6_experiment.py", "umi_task6_primitives.py", "umi_task5_primitives.py", "umi_task5_runtime.py", "umi_precision_runtime.py", "umi_precision_official.py", "umi_precision_storage.py"):
+            for name in ("umi_task6_decoder.py", "umi_task5_decoder.py", "analyze_umi_task6.py", "umi_task6_runtime.py", "run_umi_task6_experiment.py", "umi_task6_primitives.py", "umi_task5_primitives.py", "umi_task5_runtime.py", "umi_precision_runtime.py", "umi_precision_official.py", "umi_precision_storage.py"):
                 if (source / name).is_file(): shutil.copyfile(source / name, stage / name)
         bundle = stage / "review_bundle.zip"
         with zipfile.ZipFile(bundle, "w", compression=zipfile.ZIP_DEFLATED) as archive:

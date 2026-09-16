@@ -46,6 +46,7 @@ class DecoderTests(unittest.TestCase):
     def test_replay_restores_decoder_state_on_failure(self):
         class Runtime:
             decoder_state = "bf16"
+            def actual_identity(self): return {"model_state": "runtime-v1", "decoder_state": "bf16"}
             def decode_prediction_latent(self, latent, *, precision):
                 self.decoder_state = precision
                 raise RuntimeError("decode failed")
@@ -57,6 +58,7 @@ class DecoderTests(unittest.TestCase):
     def test_replay_returns_float_final_frame(self):
         class Runtime:
             decoder_state = "bf16"
+            def actual_identity(self): return {"model_state": "runtime-v1", "decoder_state": "bf16"}
             def decode_prediction_latent(self, latent, *, precision):
                 return np.zeros((3, 2, 4, 4), dtype=np.float32) + .25
             def restore_decoder_state(self): pass
@@ -67,6 +69,7 @@ class DecoderTests(unittest.TestCase):
     def test_temporary_precision_state_is_restored_after_success(self):
         class Runtime:
             decoder_state = "bf16"
+            def actual_identity(self): return {"model_state": "runtime-v1", "decoder_state": "bf16"}
             def decode_prediction_latent(self, latent, *, precision):
                 self.decoder_state = "fp32" if precision == "temporary_fp32" else "bf16"
                 return np.zeros((3, 2, 2, 2), np.float32)
@@ -79,12 +82,14 @@ class DecoderTests(unittest.TestCase):
             decoder_state = "bf16"
             active = 0
             maximum = 0
+            def actual_identity(self): return {"model_state": "runtime-v1", "decoder_state": "bf16"}
             def decode_prediction_latent(self, latent, *, precision):
                 self.active += 1; self.maximum = max(self.maximum, self.active)
                 value = np.zeros((3, 2, 2, 2), np.float32) + (0.1 if precision == "native_bf16" else 0.2)
                 self.active -= 1; return value
             def restore_decoder_state(self): pass
         class Encoder:
+            def identity(self): return {"encoder_state": "encoder-v1", "code": "fixture"}
             def __call__(self, frame): return np.asarray(frame, dtype=np.float32).mean(keepdims=True)
         with tempfile.TemporaryDirectory() as temporary:
             raw = Path(temporary) / "raw"; self._raw(raw)
@@ -99,18 +104,46 @@ class DecoderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             with self.assertRaises(Exception): api.run_task6_decoder_replays(object(), Path(temporary) / "raw")
 
+    def test_class_only_runtime_and_encoder_identities_are_rejected(self):
+        class Runtime:
+            decoder_state = "bf16"
+        class Encoder:
+            def __call__(self, frame): return np.asarray(frame, np.float32)
+        with tempfile.TemporaryDirectory() as temporary:
+            raw = Path(temporary) / "raw"; self._raw(raw)
+            with self.assertRaises(Exception): api.run_task6_decoder_replays(Runtime(), raw, encoder=Encoder(), decoder_root=Path(temporary) / "decoder")
+
     def test_resume_rejects_tampered_success(self):
         class Runtime:
             decoder_state = "bf16"
             def decode_prediction_latent(self, latent, *, precision): return np.zeros((3, 2, 2, 2), np.float32)
             def restore_decoder_state(self): pass
+            def actual_identity(self): return {"model_state": "runtime-v1", "decoder_state": "bf16"}
         class Encoder:
+            def identity(self): return {"encoder_state": "encoder-v1", "code": "fixture"}
             def __call__(self, frame): return np.asarray(frame, np.float32).mean(keepdims=True)
         with tempfile.TemporaryDirectory() as temporary:
             raw = Path(temporary) / "raw"; self._raw(raw); decoder = Path(temporary) / "decoder"
             api.run_task6_decoder_replays(Runtime(), raw, encoder=Encoder(), decoder_root=decoder)
             target = next(decoder.glob("*__native_bf16/decoded_final_float32.npy")); target.write_bytes(b"tampered")
             with self.assertRaises(Exception): api.run_task6_decoder_replays(Runtime(), raw, encoder=Encoder(), decoder_root=decoder, resume=True)
+
+    def test_resume_rejects_changed_runtime_or_encoder_content_identity(self):
+        class Runtime:
+            decoder_state = "bf16"
+            def __init__(self, version): self.version = version
+            def actual_identity(self): return {"model_state": self.version, "decoder_state": "bf16"}
+            def decode_prediction_latent(self, latent, *, precision): return np.zeros((3, 2, 2, 2), np.float32)
+            def restore_decoder_state(self): pass
+        class Encoder:
+            def __init__(self, version): self.version = version
+            def identity(self): return {"encoder_state": self.version, "code": "fixture"}
+            def __call__(self, frame): return np.asarray(frame, np.float32).mean(keepdims=True)
+        with tempfile.TemporaryDirectory() as temporary:
+            raw = Path(temporary) / "raw"; self._raw(raw); decoder = Path(temporary) / "decoder"
+            api.run_task6_decoder_replays(Runtime("weights-v1"), raw, encoder=Encoder("vae-v1"), decoder_root=decoder)
+            with self.assertRaises(Exception): api.run_task6_decoder_replays(Runtime("weights-v2"), raw, encoder=Encoder("vae-v1"), decoder_root=decoder, resume=True)
+            with self.assertRaises(Exception): api.run_task6_decoder_replays(Runtime("weights-v1"), raw, encoder=Encoder("vae-v2"), decoder_root=decoder, resume=True)
 
     def test_raw_manifest_rejects_unlisted_resource_file(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -122,12 +155,14 @@ class DecoderTests(unittest.TestCase):
         class Runtime:
             decoder_state = "bf16"
             def __init__(self, fail_after=None): self.calls = 0; self.fail_after = fail_after
+            def actual_identity(self): return {"model_state": "runtime-v1", "decoder_state": "bf16"}
             def decode_prediction_latent(self, latent, *, precision):
                 self.calls += 1
                 if self.fail_after is not None and self.calls > self.fail_after: raise RuntimeError("planned stop")
                 return np.zeros((3, 2, 2, 2), np.float32)
             def restore_decoder_state(self): self.decoder_state = "bf16"
         class Encoder:
+            def identity(self): return {"encoder_state": "encoder-v1", "code": "fixture"}
             def __call__(self, frame): return np.asarray(frame, np.float32).mean(keepdims=True)
         with tempfile.TemporaryDirectory() as temporary:
             raw = Path(temporary) / "raw"; self._raw(raw); decoder = Path(temporary) / "decoder"
@@ -142,6 +177,7 @@ class DecoderTests(unittest.TestCase):
     def test_encoder_failure_restores_cache_and_keeps_primary_error(self):
         class Encoder:
             state = "clean"
+            def identity(self): return {"encoder_state": "encoder-v1", "code": "fixture"}
             def reset_cache(self): self.state = "clean"
             def __call__(self, frame): self.state = "dirty"; raise RuntimeError("encoder failed")
         with self.assertRaises(RuntimeError) as context:
@@ -156,10 +192,12 @@ class DecoderTests(unittest.TestCase):
         inputs = runtime_api.Task6Inputs(carrier, [0], mask, bank, action=np.zeros((16,10), np.float32), prompt="decoder", direction_hashes=hashes)
         class Resident:
             def __init__(self): self.inputs = inputs; self.decoder_state = "bf16"
+            def actual_identity(self): return {"model_state": "resident-v1", "decoder_state": "bf16"}
             def decode_prediction_latent(self, latent, *, precision): self.decoder_state = precision; return np.zeros((3,2,2,2), np.float32)
             def restore_decoder_state(self): self.decoder_state = "bf16"
         resident = Resident(); adapter = runtime_api.Task6RuntimeAdapter(resident, inputs)
         class Encoder:
+            def identity(self): return {"encoder_state": "encoder-v1", "code": "fixture"}
             def __call__(self, frame): return np.asarray(frame, np.float32).mean(keepdims=True)
         with tempfile.TemporaryDirectory() as temporary:
             raw = Path(temporary) / "raw"; self._raw(raw); result = api.run_task6_decoder_replays(adapter, raw, encoder=Encoder(), decoder_root=Path(temporary)/"decoder")

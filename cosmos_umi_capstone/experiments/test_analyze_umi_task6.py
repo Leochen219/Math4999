@@ -91,6 +91,11 @@ class AnalysisTests(unittest.TestCase):
             (root / "MANIFEST.sha256").write_text(f"{'0'*64}  x.txt\n", encoding="ascii")
             with self.assertRaises(ValueError): api.verify_raw_manifest(root)
 
+    def test_decoder_manifest_rejects_unsafe_path_and_nonhex_digest(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); (root / "MANIFEST.sha256").write_text("not-a-digest  ../escape\n", encoding="ascii")
+            with self.assertRaises(ValueError): api._verify_decoder_manifest_for_analysis(root)
+
     def test_difference_metrics_is_field_specific_for_shape_and_nonfinite(self):
         self.assertEqual(api.difference_metrics(np.zeros((2,)), np.zeros((3,)))["reason"], "shape_mismatch")
         self.assertEqual(api.difference_metrics(np.array([np.nan]), np.zeros((1,)))["reason"], "nonfinite")
@@ -154,10 +159,12 @@ class AnalysisTests(unittest.TestCase):
         inputs = runtime_api.Task6Inputs(carrier, [0], mask, bank, action=np.zeros((16,10), np.float32), prompt="fixture", state="bridge_0", seed=0, direction_hashes=hashes)
         class Runtime:
             def __init__(self): self.inputs = inputs; self.provenance = {"source_commit": "2b17a2413bd86b2cf9b03823637108851e4ddf2d"}
-            def actual_identity(self): return {"runtime": "public-e2e"}
+            def actual_identity(self): return {"model_state": "public-e2e-v1", "decoder_state": "bf16"}
             def execute(self, spec, runtime_inputs, *, scope="full"):
                 full = runtime_inputs.for_spec(spec); predicted = full[:, :, 1:, ...].copy(); value = float(np.mean(full))
                 return {"output_full": predicted, "decoded_final": np.full((3,2,2), value, np.float32)}
+            def decode_prediction_latent(self, latent, *, precision): return np.zeros((3, 2, 2, 2), np.float32) + (0.1 if precision == "native_bf16" else 0.2)
+            def restore_decoder_state(self): pass
             def cleanup(self): pass
         runtime = Runtime(); adapter = runtime_api.Task6RuntimeAdapter(runtime, inputs)
         with tempfile.TemporaryDirectory() as temporary:
@@ -176,6 +183,15 @@ class AnalysisTests(unittest.TestCase):
             reloaded = api._load_records(run_dir)
             result = api.analyze_task6_records(reloaded, strict=True)
             self.assertEqual(len(reloaded), 32); self.assertEqual(len(result["fits"]), 5); self.assertNotEqual(result["derivation"]["combination_coefficients"]["c01"], 1.0)
+            import umi_task6_decoder as decoder_api
+            class Encoder:
+                def identity(self): return {"encoder_state": "public-vae-v1", "code": "fixture"}
+                def __call__(self, frame): return np.asarray(frame, np.float32).mean(keepdims=True)
+            before_raw = {path.relative_to(run_dir): (path.read_bytes(), path.stat().st_mtime_ns) for path in run_dir.rglob("*") if path.is_file()}
+            decoded = decoder_api.run_task6_decoder_replays(adapter, run_dir, encoder=Encoder())
+            self.assertEqual(decoded["status"], "COMPLETE"); self.assertEqual(decoded["decoder_calls"], 16)
+            packaged = api.analyze_task6_run(run_dir, output_dir=run_dir.parent / "analysis")
+            self.assertTrue(Path(packaged["output_dir"], "review_bundle.zip").is_file()); self.assertTrue(Path(packaged["output_dir"], "umi_task5_decoder.py").is_file()); self.assertEqual(before_raw, {path.relative_to(run_dir): (path.read_bytes(), path.stat().st_mtime_ns) for path in run_dir.rglob("*") if path.is_file()})
 
     def test_decoder_analysis_reads_sixteen_records_and_emits_five_spaces(self):
         import umi_task6_decoder as decoder_api

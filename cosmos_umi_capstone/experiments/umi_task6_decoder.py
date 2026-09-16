@@ -74,22 +74,23 @@ def _bound_identity(value: Any) -> bool:
     """Reject absent or class-only runtime/encoder identities."""
     if value is None: return False
     if isinstance(value, Mapping):
-        return len(value) > 1 or any(key not in {"type", "runtime", "class"} for key in value)
+        content_keys = {"content_sha256", "weights_sha256", "model_state", "decoder_state", "encoder_state", "artifacts", "code", "inputs"}
+        return (any(key in value and value[key] not in (None, "", {}, []) for key in content_keys)
+                or any(_bound_identity(nested) for nested in value.values() if isinstance(nested, Mapping)))
     return False
 
 
 def _runtime_binding_identity(runtime: Any) -> Any:
     """Return a stable, non-class-only identity for config/resume binding."""
+    actual = getattr(runtime, "actual_identity", None)
+    if callable(actual):
+        value = actual()
+        if value is not None: return value
     value = _decoder_identity(runtime)
     if isinstance(value, Mapping): return value
-    if value is not None:
-        typ = type(runtime)
-        return {"runtime_type": f"{typ.__module__}.{typ.__qualname__}", "decoder_state": value}
+    if value is not None: return None
     model, ops = getattr(runtime, "model", None), getattr(runtime, "ops", None)
-    if model is not None or ops is not None:
-        return {"runtime_type": f"{type(runtime).__module__}.{type(runtime).__qualname__}",
-                "model_type": None if model is None else f"{type(model).__module__}.{type(model).__qualname__}",
-                "ops_type": None if ops is None else f"{type(ops).__module__}.{type(ops).__qualname__}"}
+    if model is not None or ops is not None: return None
     return None
 
 
