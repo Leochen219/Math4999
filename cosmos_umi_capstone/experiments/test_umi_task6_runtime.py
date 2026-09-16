@@ -108,7 +108,7 @@ class Task6RuntimeTests(unittest.TestCase):
         inputs = self.inputs()
         class StrictRuntime:
             def __init__(self): self.inputs = inputs
-            def execute(self, spec, runtime_inputs, *, scope): return {"output_full": np.zeros((2,), np.float32)}
+            def execute(self, spec, runtime_inputs, *, scope): return {"output_full": np.zeros((1, 48, 4, 16, 16), np.float32)}
         adapter = self.api.Task6RuntimeAdapter(StrictRuntime(), inputs)
         for spec in ({"state":"bridge_0","seed":0,"kind":"baseline","alpha":0.0,"sign":0}, {"state":"bridge_0","seed":0,"kind":"perturbation","direction_id":"v0","alpha":0.001,"sign":1}):
             record = adapter.execute(spec)
@@ -125,6 +125,14 @@ class Task6RuntimeTests(unittest.TestCase):
         record = self.api.Task6RuntimeAdapter(StrictRuntime(), inputs).execute({"state": "bridge_0", "seed": 0, "kind": "baseline", "alpha": 0.0, "sign": 0})
         self.assertEqual(record["predicted_latent"].shape[2], 4)
         self.assertEqual(record["predicted_latent_source"], "runtime_carrier_sliced_by_predicted_indexes")
+
+    def test_adapter_rejects_noncarrier_wrong_prediction_block_shape(self):
+        inputs = self.inputs()
+        class StrictRuntime:
+            def __init__(self): self.inputs = inputs
+            def execute(self, spec, runtime_inputs, *, scope): return {"output_full": np.zeros((1, 48, 3, 16, 16), np.float32)}
+        with self.assertRaises(ValueError):
+            self.api.Task6RuntimeAdapter(StrictRuntime(), inputs).execute({"state": "bridge_0", "seed": 0, "kind": "baseline", "alpha": 0.0, "sign": 0})
 
     def test_adapter_cleanup_uses_runtime_seam(self):
         inputs = self.inputs(); calls = []

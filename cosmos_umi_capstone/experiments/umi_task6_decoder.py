@@ -219,7 +219,7 @@ def _encoder_identity(encoder: Any) -> Any:
     return {"type": type(encoder).__name__}
 
 
-def _load_sample(root: Path, sample_id: str) -> tuple[np.ndarray, dict[str, Any]]:
+def _load_sample(root: Path, sample_id: str) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     sample = root / "samples" / sample_id
     status_path = sample / "status.json"
     if not status_path.is_file():
@@ -231,10 +231,13 @@ def _load_sample(root: Path, sample_id: str) -> tuple[np.ndarray, dict[str, Any]
         path = sample / name
         if not path.is_file() or sha256_file(path) != digest:
             raise EvidenceError(f"generation artifact hash mismatch: {sample_id}/{name}")
-    for name in ("output_full.npy", "sample.json"):
+    for name in ("output_full.npy", "predicted_latent.npy", "sample.json"):
         if not (sample / name).is_file():
             raise EvidenceError(f"generation sample lacks {name}: {sample_id}")
-    return np.load(sample / "output_full.npy", allow_pickle=False).astype(np.float32, copy=True), json.loads((sample / "sample.json").read_text(encoding="utf-8"))
+    predicted = np.load(sample / "predicted_latent.npy", allow_pickle=False).astype(np.float32, copy=True)
+    if predicted.shape != (1, 48, 4, 16, 16) or not np.all(np.isfinite(predicted)):
+        raise EvidenceError(f"generation predicted_latent is not an exact four-frame block: {sample_id}")
+    return np.load(sample / "output_full.npy", allow_pickle=False).astype(np.float32, copy=True), predicted, json.loads((sample / "sample.json").read_text(encoding="utf-8"))
 
 
 def _verify_raw_task6(root: Path) -> tuple[str, Mapping[str, Any]]:
@@ -339,11 +342,11 @@ def run_task6_decoder_replays(runtime: Any, run_root: str | Path, *, state: str 
                 replay_dir.rename(root / f"{spec['replay_id']}.attempt.{attempt}")
             stage = Path(tempfile.mkdtemp(prefix=f".{spec['replay_id']}.", dir=str(root)))
             try:
-                latent, source_meta = _load_sample(raw_root, spec["sample_id"])
+                latent, predicted_latent, source_meta = _load_sample(raw_root, spec["sample_id"])
                 record = replay_one(runtime, latent, precision=spec["decode_precision"])
                 direct = reencode_frame(record["decoded_final_float32"], encoder, quantize=False)
                 quant = reencode_frame(record["decoded_final_float32"], encoder, quantize=True)
-                arrays = {"decoder_input_full_latent.npy": latent, "decoded_full_float32.npy": record["decoded_full_float32"],
+                arrays = {"decoder_input_full_latent.npy": latent, "predicted_latent.npy": predicted_latent, "decoded_full_float32.npy": record["decoded_full_float32"],
                           "decoded_final_float32.npy": record["decoded_final_float32"], "direct_float_input.npy": direct["input_float32"],
                           "uint8_simulated_input.npy": quant["input_after_uint8_simulation"], "direct_condition_latent_float32.npy": direct["condition_latent_float32"],
                           "uint8_condition_latent_float32.npy": quant["condition_latent_float32"]}

@@ -255,12 +255,27 @@ class Task6RuntimeAdapter:
             else:
                 # A non-carrier output is accepted only as an already isolated
                 # prediction block from the official runtime seam.
-                if not output_full.size or not np.all(np.isfinite(output_full)): raise ValueError("runtime output_full is not a validated prediction block")
+                expected_shape = (target.z0.shape[0], target.z0.shape[1], len(target.geometry.predicted_indexes), *target.z0.shape[3:])
+                if output_full.shape != expected_shape or not np.all(np.isfinite(output_full)): raise ValueError("runtime output_full is not a validated prediction block")
                 record["predicted_latent"] = np.array(output_full, dtype=np.float32, copy=True)
                 record["predicted_latent_source"] = "runtime_prediction_block"
         else:
-            record["predicted_latent"] = np.array(record["predicted_latent"], dtype=np.float32, copy=True)
+            predicted = np.asarray(record["predicted_latent"], dtype=np.float32)
+            expected_shape = (target.z0.shape[0], target.z0.shape[1], len(target.geometry.predicted_indexes), *target.z0.shape[3:])
+            if predicted.shape != expected_shape or not np.all(np.isfinite(predicted)): raise ValueError("runtime predicted_latent has invalid predicted-block shape")
+            record["predicted_latent"] = np.array(predicted, dtype=np.float32, copy=True)
         return record
+
+    def decode_prediction_latent(self, latent: Any, *, precision: str):
+        """Public decoder seam for Task 3 replays on the resident runtime."""
+        method = getattr(self.runtime, "decode_prediction_latent", None) or getattr(self.runtime, "decode", None)
+        if not callable(method):
+            raise RuntimeError("bound runtime does not expose a validated decoder seam")
+        return method(latent, precision=precision)
+
+    def restore_decoder_state(self) -> None:
+        method = getattr(self.runtime, "restore_decoder_state", None) or getattr(self.runtime, "clear_decoder_cache", None) or getattr(self.runtime, "cleanup", None)
+        if callable(method): method()
 
     def cleanup(self) -> None:
         """Release per-call state while retaining the resident validated model."""

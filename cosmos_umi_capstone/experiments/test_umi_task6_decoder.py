@@ -18,9 +18,10 @@ class DecoderTests(unittest.TestCase):
         for sample_id in ids:
             sample = root / "samples" / sample_id; sample.mkdir(parents=True)
             np.save(sample / "output_full.npy", np.zeros((3, 2, 2, 2), np.float32), allow_pickle=False)
-            digest = hashlib.sha256((sample / "output_full.npy").read_bytes()).hexdigest()
+            np.save(sample / "predicted_latent.npy", np.zeros((1, 48, 4, 16, 16), np.float32), allow_pickle=False)
+            digest = hashlib.sha256((sample / "output_full.npy").read_bytes()).hexdigest(); predicted_digest = hashlib.sha256((sample / "predicted_latent.npy").read_bytes()).hexdigest()
             (sample / "sample.json").write_text(json.dumps({"sample_id": sample_id}), encoding="utf-8")
-            (sample / "status.json").write_text(json.dumps({"status": "success", "artifact_sha256": {"output_full.npy": digest}}), encoding="utf-8")
+            (sample / "status.json").write_text(json.dumps({"status": "success", "artifact_sha256": {"output_full.npy": digest, "predicted_latent.npy": predicted_digest}}), encoding="utf-8")
         completed = ids
         (root / "run_status.json").write_text(json.dumps({"status": "AWAITING_REVIEW", "completed_samples": completed, "group": {"state": "bridge_0", "seed": 0}}), encoding="utf-8")
         entries = []
@@ -145,6 +146,23 @@ class DecoderTests(unittest.TestCase):
         with self.assertRaises(RuntimeError) as context:
             api.reencode_frame(np.zeros((3, 2, 2), np.float32), Encoder())
         self.assertEqual(str(context.exception), "encoder failed")
+
+    def test_decoder_uses_public_task6_runtime_adapter_decoder_seam(self):
+        import umi_task6_runtime as runtime_api
+        carrier = np.ones((1,48,5,16,16), np.float32); mask = np.zeros_like(carrier, bool); mask[:, :, 0] = True
+        bank = np.zeros((3,) + carrier.shape, np.float32); bank[:, mask] = 1.0
+        directions = runtime_api._derive_frozen_directions_unpinned(bank, mask); hashes = {key: runtime_api._array_sha(value) for key, value in directions.items()}
+        inputs = runtime_api.Task6Inputs(carrier, [0], mask, bank, action=np.zeros((16,10), np.float32), prompt="decoder", direction_hashes=hashes)
+        class Resident:
+            def __init__(self): self.inputs = inputs; self.decoder_state = "bf16"
+            def decode_prediction_latent(self, latent, *, precision): self.decoder_state = precision; return np.zeros((3,2,2,2), np.float32)
+            def restore_decoder_state(self): self.decoder_state = "bf16"
+        resident = Resident(); adapter = runtime_api.Task6RuntimeAdapter(resident, inputs)
+        class Encoder:
+            def __call__(self, frame): return np.asarray(frame, np.float32).mean(keepdims=True)
+        with tempfile.TemporaryDirectory() as temporary:
+            raw = Path(temporary) / "raw"; self._raw(raw); result = api.run_task6_decoder_replays(adapter, raw, encoder=Encoder(), decoder_root=Path(temporary)/"decoder")
+            self.assertEqual(result["status"], "COMPLETE"); self.assertEqual(resident.decoder_state, "bf16")
 
 
 if __name__ == "__main__": unittest.main()

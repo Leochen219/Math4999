@@ -92,8 +92,6 @@ def _normalize_records(records: Mapping[str, Mapping[str, Any]]) -> dict[str, di
         if short in result and str(key) != short:
             raise ValueError(f"duplicate normalized Task 6 sample id: {short}")
         record = dict(original)
-        if "predicted_latent" not in record and "output_full" in record:
-            record["predicted_latent"] = record["output_full"]
         result[short] = record
     return result
 
@@ -151,7 +149,7 @@ def _derive_plan_detail(records: Mapping[str, Mapping[str, Any]]) -> dict[str, A
         if not np.array_equal(expected[~mask], directions[combo][~mask]) or not np.allclose(expected[mask], directions[combo][mask], rtol=0.0, atol=2e-6):
             raise ValueError(f"saved combination direction {combo} is inconsistent with v directions")
     for sample_id, item in records.items():
-        for field in ("z_bar", "mask", "direction", "actual_delta_fp32", "target_delta_fp32"):
+        for field in ("z_bar", "mask", "direction", "actual_delta_fp32", "target_delta_fp32", "consumed_input_fp32"):
             if field not in item: raise ValueError(f"sample {sample_id} lacks immutable Task 6 field {field}")
         if not np.array_equal(np.asarray(item["z_bar"], np.float32), z_bar) or not np.array_equal(np.asarray(item["mask"], bool), mask): raise ValueError("Task 6 samples do not share z_bar/mask")
         expected_direction = np.zeros_like(z_bar, np.float32) if sample_id.startswith("baseline_") else directions.get(sample_id.split("_alpha", 1)[0])
@@ -162,9 +160,8 @@ def _derive_plan_detail(records: Mapping[str, Mapping[str, Any]]) -> dict[str, A
         target_delta = np.asarray(item["target_delta_fp32"], np.float32); actual_delta = np.asarray(item["actual_delta_fp32"], np.float32)
         if target_delta.shape != z_bar.shape or not np.array_equal(target_delta, expected_delta): raise ValueError(f"sample {sample_id} target delta mismatch")
         if actual_delta.shape != z_bar.shape or not np.all(np.isfinite(actual_delta)) or not np.all(actual_delta[~mask] == 0.0): raise ValueError(f"sample {sample_id} consumed delta geometry mismatch")
-        if "consumed_input_fp32" in item:
-            consumed = np.asarray(item["consumed_input_fp32"], np.float32)
-            if consumed.shape != z_bar.shape or not np.array_equal(np.subtract(consumed, z_bar, dtype=np.float32), actual_delta): raise ValueError(f"sample {sample_id} consumed input does not reproduce actual delta")
+        consumed = np.asarray(item["consumed_input_fp32"], np.float32)
+        if consumed.shape != z_bar.shape or not np.all(np.isfinite(consumed)) or not np.array_equal(np.subtract(consumed, z_bar, dtype=np.float32), actual_delta): raise ValueError(f"sample {sample_id} consumed input does not reproduce actual delta")
         if "s_z" in item and not math.isclose(float(item["s_z"]), s_z, rel_tol=0.0, abs_tol=1e-7): raise ValueError(f"sample {sample_id} s_z mismatch")
     return {"s_z": s_z, "combination_coefficients": {"c01": c01, "c12": c12}}
 
@@ -273,19 +270,29 @@ def _validate_record_identity(records: Mapping[str, Mapping[str, Any]], group: M
     observed_group = None
     for sample_id, record in records.items():
         spec = record.get("spec")
-        if isinstance(spec, Mapping):
-            if spec.get("sample_id") not in (None, sample_id): raise ValueError(f"sample {sample_id} spec identity mismatch")
-            if sample_id.startswith("baseline_"):
-                if spec.get("kind") not in (None, "baseline"): raise ValueError(f"sample {sample_id} kind mismatch")
-            elif spec.get("kind") not in (None, "perturbation"): raise ValueError(f"sample {sample_id} kind mismatch")
+        if not isinstance(spec, Mapping): raise ValueError(f"sample {sample_id} spec evidence is missing")
+        spec_sample = spec.get("sample_id")
+        if spec_sample is None or str(spec_sample).split("__")[-1] != sample_id: raise ValueError(f"sample {sample_id} spec identity mismatch")
+        required_spec = {"sample_id", "kind", "state", "seed", "alpha", "sign"}
+        if sample_id.startswith("baseline_"):
+            if set(spec) < required_spec or spec.get("kind") != "baseline" or float(spec.get("alpha")) != 0.0 or int(spec.get("sign")) != 0: raise ValueError(f"sample {sample_id} baseline spec is incomplete")
+        else:
+            required_spec.add("direction_id")
+            expected_direction = sample_id.split("_alpha", 1)[0]
+            if set(spec) < required_spec or spec.get("kind") != "perturbation" or spec.get("direction_id") != expected_direction or float(spec.get("alpha")) not in ALPHAS or int(spec.get("sign")) not in (-1, 1): raise ValueError(f"sample {sample_id} perturbation spec is incomplete")
+        if spec.get("state") is None or int(spec.get("seed")) not in SEEDS: raise ValueError(f"sample {sample_id} spec group is invalid")
         item_group = record.get("group")
         if isinstance(item_group, Mapping):
             current = dict(item_group)
             if observed_group is None: observed_group = current
             elif current != observed_group: raise ValueError("Task 6 sample groups differ")
             if expected_group and current != expected_group: raise ValueError("Task 6 sample group differs from requested group")
-        if "seed" in record and observed_group is not None and int(record["seed"]) != int(observed_group.get("seed")):
-            raise ValueError(f"sample {sample_id} seed differs from group")
+        else: raise ValueError(f"sample {sample_id} group evidence is missing")
+        if "seed" not in record or "model_seed" not in record: raise ValueError(f"sample {sample_id} seed evidence is missing")
+        if int(record["seed"]) != int(observed_group.get("seed")) or int(record["model_seed"]) != int(observed_group.get("seed")):
+            raise ValueError(f"sample {sample_id} seed/model_seed differs from group")
+        if spec.get("state") != observed_group.get("state") or int(spec.get("seed")) != int(observed_group.get("seed")):
+            raise ValueError(f"sample {sample_id} spec differs from group")
 
 
 def analyze_task6_records(records: Mapping[str, Mapping[str, Any]], *, plan_detail: Mapping[str, Any] | None = None,
@@ -301,9 +308,13 @@ def analyze_task6_records(records: Mapping[str, Mapping[str, Any]], *, plan_deta
         if strict: raise
         return _status_incomplete([], reason=f"invalid sample identity: {error}")
     missing = sorted(_required_ids() - set(normalized))
+    extras = sorted(set(normalized) - _required_ids())
     if missing:
         if strict: raise ValueError("incomplete Task 6 group: " + ", ".join(missing))
         return _status_incomplete(missing)
+    if extras:
+        if strict: raise ValueError("unexpected Task 6 sample IDs: " + ", ".join(extras))
+        return _status_incomplete(extras, reason="raw group contains unexpected sample IDs")
     try:
         _validate_record_identity(normalized, group)
         derived = _derive_plan_detail(normalized); detail = dict(derived)
@@ -315,6 +326,7 @@ def analyze_task6_records(records: Mapping[str, Mapping[str, Any]], *, plan_deta
             for key in ("c01", "c12"):
                 if not math.isclose(float(detail["combination_coefficients"][key]), float(derived["combination_coefficients"][key]), rel_tol=0, abs_tol=1e-7): raise ValueError(f"{key} differs from saved directions")
         coefficients = detail["combination_coefficients"]; c01, c12 = float(coefficients["c01"]), float(coefficients["c12"])
+        if "predicted_latent" not in normalized["baseline_pre"] or "predicted_latent" not in normalized["baseline_post"]: raise ValueError("predicted_latent evidence is missing")
         y0 = np.asarray(normalized["baseline_pre"]["predicted_latent"], dtype=np.float32); ypost = np.asarray(normalized["baseline_post"]["predicted_latent"], dtype=np.float32)
         if "decoded_final" not in normalized["baseline_pre"] or "decoded_final" not in normalized["baseline_post"]: raise ValueError("decoded_final RGB evidence is missing")
         rgb0 = np.asarray(normalized["baseline_pre"]["decoded_final"], dtype=np.float32); rgbpost = np.asarray(normalized["baseline_post"]["decoded_final"], dtype=np.float32)
@@ -329,6 +341,7 @@ def analyze_task6_records(records: Mapping[str, Mapping[str, Any]], *, plan_deta
                 if not np.all(pd[~mask] == 0) or not np.all(md[~mask] == 0): raise ValueError("Task 6 actual delta changed outside mask")
                 hp, hm = _rms32_to64(pd[mask]), _rms32_to64(md[mask]); denominator = hp + hm
                 if denominator == 0: raise ValueError("Task 6 effective central-difference step is zero")
+                if "predicted_latent" not in plus or "predicted_latent" not in minus: raise ValueError("predicted_latent evidence is missing")
                 yp = np.asarray(plus["predicted_latent"], dtype=np.float32); ym = np.asarray(minus["predicted_latent"], dtype=np.float32); rp = _sub32(yp, y0); rm = _sub32(ym, y0); diff = _sub32(yp, ym); d = np.divide(diff, np.float32(denominator), dtype=np.float32); central[(direction_id, float(alpha))] = d; actual_steps[(direction_id, float(alpha))] = (denominator / 2.0); tensors[f"dactual_{direction_id}_{ordinal:02d}.npy"] = d
                 if "decoded_final" not in plus or "decoded_final" not in minus: raise ValueError("decoded_final RGB evidence is missing")
                 plus_rgb = np.asarray(plus["decoded_final"], np.float32); minus_rgb = np.asarray(minus["decoded_final"], np.float32)
@@ -472,7 +485,7 @@ def analyze_decoder_replays(run_root: str | Path, decoder_root: str | Path | Non
     spaces = {"native_bf16": "native_rgb", "temporary_fp32": "fp32_rgb"}
     for precision, rgb_space in spaces.items():
         values = {rgb_space: "decoded_final_float32", "direct_float_condition_latent": "direct_condition_latent_float32", "uint8_sim_condition_latent": "uint8_condition_latent_float32"}
-        if precision == "native_bf16": values = {"prediction_latent": "decoder_input_full_latent", **values}
+        if precision == "native_bf16": values = {"prediction_latent": "predicted_latent", **values}
         for space, key in values.items():
             source = source_records[precision]
             if any(item not in source or key not in source[item] for item in ("baseline_pre", "baseline_post")):
