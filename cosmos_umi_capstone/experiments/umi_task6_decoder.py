@@ -415,15 +415,25 @@ def run_task6_decoder_replays(runtime: Any, run_root: str | Path, *, state: str 
         for spec in plan:
             replay_dir = root / spec["replay_id"]
             if replay_dir.is_dir() and resume and (replay_dir / "record.json").is_file():
-                record = json.loads((replay_dir / "record.json").read_text(encoding="utf-8"))
-                if record.get("config_sha256") != sha256_file(config_path): raise EvidenceError("decoder success config binding mismatch")
-                for name, digest in record.get("artifact_sha256", {}).items():
-                    if not (replay_dir / name).is_file() or sha256_file(replay_dir / name) != digest: raise EvidenceError("successful decoder artifact was tampered")
+                try:
+                    record = json.loads((replay_dir / "record.json").read_text(encoding="utf-8"))
+                    if record.get("config_sha256") != sha256_file(config_path): raise EvidenceError("decoder success config binding mismatch")
+                    for name, digest in record.get("artifact_sha256", {}).items():
+                        if not (replay_dir / name).is_file() or sha256_file(replay_dir / name) != digest: raise EvidenceError("successful decoder artifact was tampered")
+                except BaseException:
+                    stop_monitor()
+                    raise
                 summary["records"].append(spec["replay_id"]); _atomic_json(status_path, summary); _decoder_manifest(root); continue
-            stopped = monitor_guard(len(plan) - len(summary["records"]))
+            try:
+                stopped = monitor_guard(len(plan) - len(summary["records"]))
+            except BaseException as error:
+                return canonical_resource_stop("MONITOR_FAILURE", str(error))
             if stopped is not None: return stopped
             if monitor is not None and callable(getattr(monitor, "capture_sample", None)):
-                row = monitor.capture_sample(spec["replay_id"], "pre_sample", len(plan) - len(summary["records"]), root)
+                try:
+                    row = monitor.capture_sample(spec["replay_id"], "pre_sample", len(plan) - len(summary["records"]), root)
+                except BaseException as error:
+                    return canonical_resource_stop("MONITOR_FAILURE", str(error))
                 if row.get("decision_status") == "HARD_STOP":
                     return canonical_resource_stop(str(row.get("reason_code") or "RESOURCE_STOP"), "decoder resource gate stopped before replay")
             if replay_dir.exists():

@@ -39,6 +39,10 @@ BRIDGE0_PROMPT = "Put the pot to the left of the purple item."
 BRIDGE0_FPS = 5
 PINNED_FRAME_SIZE = (256, 256)
 PILOT_GROUP = {"state": "bridge_0", "seed": 0}
+TASK6_CODE_SOURCES = ("umi_task6_runtime.py", "run_umi_task6_experiment.py", "umi_task6_primitives.py",
+    "umi_fd_post_vae_bridge.py", "umi_precision_runtime.py", "umi_precision_storage.py",
+    "umi_precision_official.py", "umi_task5_runtime.py", "umi_task5_primitives.py",
+    "umi_task6_operational.py", "run_umi_task6_official.py")
 
 
 class OperationalEvidenceError(ValueError):
@@ -60,6 +64,17 @@ def sha256_file(path: str | os.PathLike[str]) -> str:
     with Path(path).open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
+    return digest.hexdigest()
+
+
+def code_bundle_sha256(source_root: str | os.PathLike[str] | None = None) -> str:
+    """Hash exactly the source bundle used by the Task 6 runtime binding."""
+    root = Path(source_root).resolve() if source_root is not None else Path(__file__).resolve().parent
+    digest = hashlib.sha256()
+    for name in TASK6_CODE_SOURCES:
+        path = root / name
+        if path.is_file():
+            digest.update(name.encode("utf-8")); digest.update(b"\0"); digest.update(path.read_bytes())
     return digest.hexdigest()
 
 
@@ -206,13 +221,15 @@ def validate_launch_contract(contract: Mapping[str, Any], *, observed: Mapping[s
         raise OperationalEvidenceError(f"launch contract is missing required evidence: {missing}")
     if contract["framework_commit"] != SOURCE_COMMIT:
         raise OperationalEvidenceError("framework/dependency commit is not pinned")
+    _validate_static_contract(contract)
     group = contract["group"]
     if dict(group) != PILOT_GROUP:
         raise OperationalEvidenceError("launch contract is restricted to bridge_0 / seed 0")
     if contract["prompt"] != BRIDGE0_PROMPT or parse_action(contract["action"]).shape != (16, 10):
         raise OperationalEvidenceError("prompt/action contract mismatch")
     settings = contract["settings"]
-    expected_settings = {"num_steps": 30, "guidance": 1.0, "shift": 10.0, "batch_size": 1}
+    expected_settings = {"num_steps": 30, "guidance": 1.0, "shift": 10.0, "batch_size": 1,
+                         "autocast": False, "tf32": False, "diffusion_cache": False}
     if any(settings.get(k) != v for k, v in expected_settings.items()):
         raise OperationalEvidenceError("generation settings do not match Task 4 C")
     flags = contract["cache_flags"]
@@ -222,7 +239,7 @@ def validate_launch_contract(contract: Mapping[str, Any], *, observed: Mapping[s
     if routes != {"model": 0, "prepare": 0, "sampler": 0, "scheduler": 0}:
         raise OperationalEvidenceError("seed routes are not fully pinned")
     geometry = contract["geometry"]
-    if geometry.get("carrier_shape") != [1, 48, 5, 16, 16] or geometry.get("condition_indexes") != [0] or geometry.get("predicted_indexes") != [1, 2, 3, 4]:
+    if geometry.get("carrier_shape") != [1, 48, 5, 16, 16] or geometry.get("condition_indexes") != [0] or geometry.get("predicted_indexes") != [1, 2, 3, 4] or geometry.get("mask_shape") != [1, 48, 5, 16, 16]:
         raise OperationalEvidenceError("runtime geometry does not match official UMI path")
     for key in ("vae_sha256", "code_bundle_sha256"):
         if not isinstance(contract[key], str) or len(contract[key]) != 64:
@@ -235,6 +252,66 @@ def validate_launch_contract(contract: Mapping[str, Any], *, observed: Mapping[s
     if mismatches:
         raise OperationalEvidenceError(f"launch contract differs from observed evidence: {mismatches}")
     return {"status": "PASS", "contract": dict(contract), "observed_keys": sorted(observed)}
+
+
+def _validate_static_contract(contract: Mapping[str, Any]) -> None:
+    """Validate immutable contract fields before any runtime is loaded."""
+    assets = contract.get("bridge_asset_hashes")
+    if assets != BRIDGE0_ASSET_SHA256:
+        raise OperationalEvidenceError("bridge asset contract does not equal the pinned official hashes")
+    task5 = contract.get("task5")
+    required_task5 = {"manifest_sha256", "plan_sha256", "direction_file_sha256", "direction_sha256"}
+    if not isinstance(task5, Mapping) or not required_task5.issubset(task5):
+        raise OperationalEvidenceError("Task 5 contract evidence is incomplete")
+    for key in ("manifest_sha256", "plan_sha256"):
+        if not isinstance(task5[key], str) or len(task5[key]) != 64 or any(c not in "0123456789abcdef" for c in task5[key]):
+            raise OperationalEvidenceError(f"invalid Task 5 hash: {key}")
+    for section, names in (("direction_file_sha256", ("v0", "v1", "v2")), ("direction_sha256", ("v0", "v1", "v2", "u01", "u12"))):
+        values = task5.get(section)
+        if not isinstance(values, Mapping) or set(values) != set(names) or any(not isinstance(values[n], str) or len(values[n]) != 64 for n in names):
+            raise OperationalEvidenceError(f"Task 5 {section} evidence is incomplete")
+    identity = contract.get("checkpoint_identity")
+    if not isinstance(identity, Mapping) or set(identity) != {"sha256"} or not isinstance(identity["sha256"], str) or len(identity["sha256"]) != 64:
+        raise OperationalEvidenceError("checkpoint content identity must be an exact SHA256")
+    if not isinstance(contract.get("vae_sha256"), str) or len(contract["vae_sha256"]) != 64:
+        raise OperationalEvidenceError("VAE content identity is missing")
+    if not isinstance(contract.get("code_bundle_sha256"), str) or len(contract["code_bundle_sha256"]) != 64:
+        raise OperationalEvidenceError("code bundle identity is missing")
+
+
+def observe_live_launch(contract: Mapping[str, Any], *, runtime: Any, inputs: Any, assets: Mapping[str, Any],
+                        task5: Mapping[str, Any], checkpoint: str | os.PathLike[str], vae: str | os.PathLike[str]) -> dict[str, Any]:
+    """Build launch evidence from loaded objects and file/environment state."""
+    try:
+        import torch
+        torch_version, cuda_version = str(torch.__version__), str(torch.version.cuda)
+    except Exception as error:
+        raise OperationalEvidenceError("live torch/CUDA observation failed") from error
+    actual = runtime.actual_identity() if callable(getattr(runtime, "actual_identity", None)) else None
+    if actual is None:
+        raise OperationalEvidenceError("runtime did not expose actual content identity")
+    geometry = inputs.geometry
+    observation = {
+        "framework_commit": SOURCE_COMMIT,
+        "checkpoint_identity": {"sha256": sha256_file(checkpoint)},
+        "vae_sha256": sha256_file(vae),
+        "code_bundle_sha256": code_bundle_sha256(),
+        "torch_version": torch_version,
+        "cuda_version": cuda_version,
+        "bridge_asset_hashes": {"action": assets["action_sha256"], "video": assets["video_sha256"]},
+        "task5": {"manifest_sha256": task5["manifest_sha256"], "plan_sha256": task5["plan_sha256"],
+                  "direction_file_sha256": dict(task5["direction_file_sha256"]), "direction_sha256": dict(task5["direction_sha256"])},
+        "group": {"state": inputs.state, "seed": inputs.seed}, "prompt": inputs.prompt,
+        "action": np.asarray(inputs.action, dtype=np.float32).tolist(),
+        "settings": {"num_steps": 30, "guidance": 1.0, "shift": 10.0, "batch_size": 1,
+                     "autocast": False, "tf32": False, "diffusion_cache": False},
+        "cache_flags": {"autocast": False, "tf32": False, "diffusion_cache": False},
+        "seed_routes": {"model": int(getattr(runtime, "model_seed", inputs.seed)), "prepare": int(inputs.seed), "sampler": int(inputs.seed), "scheduler": int(inputs.seed)},
+        "geometry": {"carrier_shape": list(inputs.z0.shape), "condition_indexes": list(geometry.condition_indexes),
+                     "predicted_indexes": list(geometry.predicted_indexes), "mask_shape": list(inputs.geometry.mask.shape)},
+        "runtime_identity": actual,
+    }
+    return observation
 
 
 def import_callable(spec: str) -> Callable[..., Any]:
@@ -266,12 +343,39 @@ class OfficialRuntimeFactory:
             raise OperationalEvidenceError("framework/checkpoint/VAE path is missing")
         self.contract, self.direction_bank = dict(contract), np.asarray(direction_bank, dtype=np.float32)
         self.action, self.prompt = parse_action(action), str(prompt)
+        self._unload: Callable[[], Any] | None = None
+        _validate_static_contract(self.contract)
+        if self.contract["checkpoint_identity"]["sha256"] != sha256_file(self.checkpoint):
+            raise OperationalEvidenceError("checkpoint identity does not match the supplied path")
+        if self.contract["vae_sha256"] != sha256_file(self.vae):
+            raise OperationalEvidenceError("VAE identity does not match the supplied path")
+        if self.contract["code_bundle_sha256"] != code_bundle_sha256():
+            raise OperationalEvidenceError("code bundle identity does not match this checkout")
 
     def build(self):
         payload = self.loader(framework_root=str(self.framework_root), checkpoint=str(self.checkpoint), vae=str(self.vae),
                               device="cuda:0", model_seed=0, prompt=self.prompt, action=self.action.copy())
         if not isinstance(payload, Mapping) or not {"model", "data_batch"}.issubset(payload):
             raise OperationalEvidenceError("official loader must return model and data_batch")
+        self._unload = payload.get("unload") if callable(payload.get("unload")) else None
+        artifact_paths = payload.get("artifact_paths")
+        if not isinstance(artifact_paths, Mapping) or set(artifact_paths) != {"checkpoint", "decoder"}:
+            raise OperationalEvidenceError("official loader must bind checkpoint and decoder artifacts")
+        if Path(artifact_paths["checkpoint"]).resolve() != self.checkpoint:
+            raise OperationalEvidenceError("official loader checkpoint path differs from contract")
+        if not Path(artifact_paths["decoder"]).is_file():
+            raise OperationalEvidenceError("official loader decoder artifact is missing")
+        provenance = payload.get("provenance")
+        if (not isinstance(provenance, Mapping) or provenance.get("source_commit") != SOURCE_COMMIT or
+                "diffusion_cache_requested" not in provenance or "diffusion_cache_installed" not in provenance or
+                bool(provenance.get("diffusion_cache_requested")) or bool(provenance.get("diffusion_cache_installed"))):
+            raise OperationalEvidenceError("official loader provenance does not prove diffusion cache is disabled")
+        settings = dict(payload.get("generation_settings", {}))
+        if not {"num_steps", "guidance", "shift"}.issubset(settings):
+            raise OperationalEvidenceError("official loader must expose all generation settings")
+        settings.update({key: getattr(payload.get("model"), key) for key in ("num_steps", "guidance", "shift") if hasattr(payload.get("model"), key)})
+        if any(settings.get(key, expected) != expected for key, expected in (("num_steps", 30), ("guidance", 1.0), ("shift", 10.0))):
+            raise OperationalEvidenceError("official loader generation settings differ from Task 4 C")
         try:
             from .umi_precision_official import OfficialPrecisionRuntime
         except ImportError:  # pragma: no cover
@@ -284,7 +388,7 @@ class OfficialRuntimeFactory:
                                     state="bridge_0", seed=0,
                                     direction_hashes={k: sha256_array(v) for k, v in frozen.items()})
         runtime = OfficialPrecisionRuntime(payload["model"], payload["data_batch"], self.direction_bank,
-            provenance=dict(payload.get("provenance", {})), ops=payload.get("ops"), scheduler_class=payload.get("scheduler_class"),
+            provenance=dict(provenance), ops=payload.get("ops"), scheduler_class=payload.get("scheduler_class"),
             generation_settings=payload.get("generation_settings"), artifact_paths=payload.get("artifact_paths"),
             inputs_factory=base, model_seed=0)
         encoder = payload.get("encoder")
@@ -299,7 +403,14 @@ class OfficialRuntimeFactory:
         adapter = Task6RuntimeAdapter(runtime, runtime.inputs)
         return adapter, runtime.inputs, encoder
 
+    def unload(self) -> None:
+        """Release the loader-owned runtime without constructing another one."""
+        if self._unload is not None:
+            callback, self._unload = self._unload, None
+            callback()
+
 
 __all__ = ["BRIDGE0_ASSET_SHA256", "BRIDGE0_FPS", "BRIDGE0_PROMPT", "OfficialRuntimeFactory", "OperationalEvidenceError",
            "PINNED_FRAME_SIZE", "PILOT_GROUP", "extract_task5_directions", "import_callable", "prepare_bridge_upload_bundle",
-           "sha256_file", "state_asset", "validate_launch_contract", "verify_pinned_bridge_assets"]
+           "code_bundle_sha256", "observe_live_launch", "sha256_file", "state_asset", "validate_launch_contract",
+           "verify_pinned_bridge_assets"]

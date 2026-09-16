@@ -42,6 +42,12 @@ class OperationalTask6Tests(unittest.TestCase):
         contract = self.contract(); observed = dict(contract)
         contract["group"] = {"state": "bridge_384", "seed": 0}
         with self.assertRaises(self.op.OperationalEvidenceError): self.op.validate_launch_contract(contract, observed=observed)
+
+    def test_static_contract_requires_all_task5_and_bridge_hashes(self):
+        contract = self.contract(); contract["task5"] = {"manifest_sha256": "a" * 64}
+        with self.assertRaises(self.op.OperationalEvidenceError): self.op.validate_launch_contract(contract, observed=contract)
+        contract = self.contract(); contract["bridge_asset_hashes"]["video"] = "0" * 64
+        with self.assertRaises(self.op.OperationalEvidenceError): self.op.validate_launch_contract(contract, observed=contract)
         contract = self.contract(); observed = dict(contract); observed["cuda_version"] = "wrong"
         with self.assertRaises(self.op.OperationalEvidenceError): self.op.validate_launch_contract(contract, observed=observed)
 
@@ -80,10 +86,10 @@ class OperationalTask6Tests(unittest.TestCase):
                 "vae_sha256": "a" * 64, "torch_version": "2.10.0+cu130", "cuda_version": "13.0", "code_bundle_sha256": "b" * 64,
                 "bridge_asset_hashes": {"action": "a" * 64, "video": "b" * 64}, "task5": {"manifest_sha256": "c" * 64},
                 "group": {"state": "bridge_0", "seed": 0}, "prompt": self.op.BRIDGE0_PROMPT,
-                "action": [[0.0] * 10 for _ in range(16)], "settings": {"num_steps": 30, "guidance": 1.0, "shift": 10.0, "batch_size": 1},
+                "action": [[0.0] * 10 for _ in range(16)], "settings": {"num_steps": 30, "guidance": 1.0, "shift": 10.0, "batch_size": 1, "autocast": False, "tf32": False, "diffusion_cache": False},
                 "cache_flags": {"autocast": False, "tf32": False, "diffusion_cache": False},
                 "seed_routes": {"model": 0, "prepare": 0, "sampler": 0, "scheduler": 0},
-                "geometry": {"carrier_shape": [1, 48, 5, 16, 16], "condition_indexes": [0], "predicted_indexes": [1, 2, 3, 4]}}
+                "geometry": {"carrier_shape": [1, 48, 5, 16, 16], "condition_indexes": [0], "predicted_indexes": [1, 2, 3, 4], "mask_shape": [1, 48, 5, 16, 16]}}
 
 
 if __name__ == "__main__": unittest.main()
