@@ -24,7 +24,7 @@ try:
     from .umi_precision_runtime import projection
     from .umi_precision_storage import ProcessLock, PrecisionSampleStore
     from .umi_task5_primitives import freeze_task5_directions, rms64
-    from .umi_task6_primitives import (ALPHAS, DIRECTION_IDS, build_generation_plan,
+    from .umi_task6_primitives import (ALPHAS, DIRECTION_IDS, RAW_MUTABLE_FILES, build_generation_plan,
         build_run_status, evaluate_resources, stable_hash, STATE_IDS, SEEDS, parse_action)
 except ImportError:
     from umi_fd_post_vae_bridge import construct_delta, sha256_array
@@ -32,7 +32,7 @@ except ImportError:
     from umi_precision_runtime import projection
     from umi_precision_storage import ProcessLock, PrecisionSampleStore
     from umi_task5_primitives import freeze_task5_directions, rms64
-    from umi_task6_primitives import ALPHAS, DIRECTION_IDS, build_generation_plan, build_run_status, evaluate_resources, stable_hash, STATE_IDS, SEEDS, parse_action
+    from umi_task6_primitives import ALPHAS, DIRECTION_IDS, RAW_MUTABLE_FILES, build_generation_plan, build_run_status, evaluate_resources, stable_hash, STATE_IDS, SEEDS, parse_action
 
 
 class PreflightError(ValueError):
@@ -211,6 +211,11 @@ class Task6RuntimeAdapter:
     @property
     def model_seed(self):
         return getattr(self.runtime, "model_seed", self.inputs.seed)
+
+    @property
+    def fps(self):
+        """Resolved sample fps from the bound official runtime payload."""
+        return getattr(self.runtime, "fps", None)
 
     def actual_identity(self):
         method = getattr(self.runtime, "actual_identity", None)
@@ -517,7 +522,7 @@ def _write_manifest(root: Path) -> None:
     """Write the root raw-evidence manifest without self-reference."""
     lines = []
     for path in sorted(root.rglob("*")):
-        if path.is_file() and path.relative_to(root).as_posix() not in {"MANIFEST.sha256", ".runner.lock"}:
+        if path.is_file() and path.relative_to(root).as_posix() not in {"MANIFEST.sha256", ".runner.lock"} and path.relative_to(root).as_posix() not in RAW_MUTABLE_FILES:
             lines.append(f"{_file_sha(path)}  {path.relative_to(root).as_posix()}")
     _atomic_text(root / "MANIFEST.sha256", "\n".join(lines) + "\n")
 
@@ -525,7 +530,7 @@ def _write_manifest(root: Path) -> None:
 def _validate_immutable_manifest(root: Path) -> None:
     manifest = root / "MANIFEST.sha256"
     if not manifest.is_file(): return
-    mutable = {"run_status.json", "invocation_history.jsonl", "gpu_samples.csv", "ram_samples.csv", "disk_samples.csv", "sample_resource_snapshots.csv", "sample_resource_snapshots.jsonl"}
+    mutable = RAW_MUTABLE_FILES
     for line in manifest.read_text(encoding="ascii").splitlines():
         parts = line.split(None, 1)
         if len(parts) != 2: raise ValueError("malformed immutable manifest")

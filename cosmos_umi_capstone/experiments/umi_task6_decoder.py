@@ -7,6 +7,7 @@ The decoder is restored in a ``finally`` block even when a replay fails.
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -19,10 +20,10 @@ import numpy as np
 
 try:
     from .umi_precision_runtime import EvidenceError, projection
-    from .umi_task6_primitives import ALPHAS, build_decoder_replay_plan, build_generation_plan
+    from .umi_task6_primitives import ALPHAS, RAW_MUTABLE_FILES, build_decoder_replay_plan, build_generation_plan
 except ImportError:  # pragma: no cover
     from umi_precision_runtime import EvidenceError, projection
-    from umi_task6_primitives import ALPHAS, build_decoder_replay_plan, build_generation_plan
+    from umi_task6_primitives import ALPHAS, RAW_MUTABLE_FILES, build_decoder_replay_plan, build_generation_plan
 
 try:
     from .umi_precision_storage import ProcessLock
@@ -294,10 +295,12 @@ def _verify_raw_task6(root: Path) -> tuple[str, Mapping[str, Any]]:
         relative = Path(parts[1])
         if relative.is_absolute() or ".." in relative.parts or relative.as_posix() in {"MANIFEST.sha256", ".runner.lock"}:
             raise EvidenceError("unsafe raw manifest path")
+        if parts[1] in RAW_MUTABLE_FILES:
+            continue
         target = root / relative
         if not target.is_file() or sha256_file(target) != parts[0]: raise EvidenceError(f"raw manifest mismatch: {parts[1]}")
         seen.add(parts[1])
-    actual = {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file() and p.relative_to(root).as_posix() not in {"MANIFEST.sha256", ".runner.lock"}}
+    actual = {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file() and p.relative_to(root).as_posix() not in {"MANIFEST.sha256", ".runner.lock"} and p.relative_to(root).as_posix() not in RAW_MUTABLE_FILES}
     if seen != actual: raise EvidenceError("raw manifest inventory mismatch")
     for sample_id in expected:
         sample = root / "samples" / sample_id; state_path = sample / "status.json"
@@ -384,7 +387,11 @@ def run_task6_decoder_replays(runtime: Any, run_root: str | Path, *, state: str 
             if main_path.is_file():
                 try:
                     main = json.loads(main_path.read_text(encoding="utf-8"))
-                    main.update({"status": "RESOURCE_STOP", "reason_code": code, "reason": reason,
+                    # Keep the generation terminal status authoritative.  The
+                    # decoder is derived work; only its namespace is mutable,
+                    # so raw completion remains analyzable after a decoder
+                    # resource stop.
+                    main.update({"decoder_reason_code": code, "decoder_reason": reason,
                                  "decoder_calls": int(summary.get("decoder_calls", 0)),
                                  "decoder_status": "RESOURCE_STOP"})
                     _atomic_json(main_path, main)
@@ -404,7 +411,20 @@ def run_task6_decoder_replays(runtime: Any, run_root: str | Path, *, state: str 
             if decision.get("status") == "HARD_STOP":
                 return canonical_resource_stop(str(decision.get("reason_code") or "RESOURCE_STOP"), str(decision.get("reason") or "decoder resource gate stopped"))
         return None
-    with ProcessLock(root / ".decoder.lock"):
+    @contextmanager
+    def monitor_lifecycle():
+        """Flush monitor evidence and terminal status on every exit path."""
+        try:
+            yield
+        finally:
+            stop_monitor()
+            if summary.get("status") == "running":
+                summary.update({"status": "INTERRUPTED", "reason_code": "UNHANDLED_EXIT",
+                                "reason": "decoder exited before publishing a terminal result"})
+                _atomic_json(status_path, summary)
+                _decoder_manifest(root)
+
+    with monitor_lifecycle(), ProcessLock(root / ".decoder.lock"):
         if monitor is not None and callable(getattr(monitor, "start", None)):
             try:
                 monitor.start(); monitor_started = True
@@ -476,9 +496,6 @@ def run_task6_decoder_replays(runtime: Any, run_root: str | Path, *, state: str 
         if summary.get("secondary_errors"):
             summary.update({"status": "RESOURCE_STOP", "reason_code": "MONITOR_FAILURE", "reason": "decoder resource monitor failed during shutdown"})
         _atomic_json(status_path, summary); _decoder_manifest(root); return summary
-    # The monitor is normally stopped by the canonical status path below.  A
-    # finally block is kept outside the lock in the implementation's next
-    # revision; this branch is retained for API compatibility.
 
 
 __all__ = ["decoder_replay_plan", "reencode_frame", "replay_one", "run_task6_decoder_replays",

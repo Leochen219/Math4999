@@ -25,11 +25,11 @@ import numpy as np
 
 try:
     from .umi_task5_primitives import ALPHAS, DIRECTION_IDS
-    from .umi_task6_primitives import STATE_IDS, SEEDS
+    from .umi_task6_primitives import RAW_MUTABLE_FILES, STATE_IDS, SEEDS
     from .umi_task6_decoder import sha256_file, decoder_replay_plan, _decoder_code_sha256
 except ImportError:  # pragma: no cover
     from umi_task5_primitives import ALPHAS, DIRECTION_IDS
-    from umi_task6_primitives import STATE_IDS, SEEDS
+    from umi_task6_primitives import RAW_MUTABLE_FILES, STATE_IDS, SEEDS
     from umi_task6_decoder import sha256_file, decoder_replay_plan, _decoder_code_sha256
 
 
@@ -415,10 +415,11 @@ def verify_raw_manifest(root: str | Path) -> dict[str, Any]:
             raise ValueError("malformed Task 6 raw manifest")
         rel = Path(parts[1]);
         if rel.is_absolute() or ".." in rel.parts: raise ValueError("unsafe raw manifest path")
+        if parts[1] in RAW_MUTABLE_FILES: continue
         target = root / rel
         if not target.is_file() or sha256_file(target) != parts[0]: raise ValueError(f"raw manifest mismatch: {parts[1]}")
         entries[parts[1]] = parts[0]
-    actual = _manifest_entries(root)
+    actual = _manifest_entries(root, exclude=set(RAW_MUTABLE_FILES))
     if entries != actual: raise ValueError("raw manifest inventory mismatch")
     return {"sha256": sha256_file(path), "entries": entries}
 
@@ -807,7 +808,13 @@ def write_task6_artifacts(result: Mapping[str, Any], output_dir: str | Path, *, 
     return {"output_dir": str(output), "manifest": str(output / "MANIFEST.sha256"), "review_bundle_bytes": (output / "review_bundle.zip").stat().st_size, "idempotent": False}
 
 
-def analyze_task6_run(run_dir: str | Path, output_dir: str | Path | None = None) -> dict[str, Any]:
+def analyze_task6_run(run_dir: str | Path, output_dir: str | Path | None = None, *,
+                      decoder_root: str | Path | None = None,
+                      output_root: str | Path | None = None) -> dict[str, Any]:
+    if output_root is not None:
+        if output_dir is not None and Path(output_dir).resolve() != Path(output_root).resolve():
+            raise ValueError("output_dir and output_root disagree")
+        output_dir = output_root
     root = Path(run_dir).resolve(); status_path = root / "run_status.json"
     if not status_path.is_file(): raise ValueError("Task 6 run_status.json is missing")
     status = json.loads(status_path.read_text(encoding="utf-8"))
@@ -816,7 +823,8 @@ def analyze_task6_run(run_dir: str | Path, output_dir: str | Path | None = None)
     raw_manifest = verify_raw_manifest(root)
     records = _load_records(root)
     result = analyze_task6_records(records, group=status.get("group"), plan_detail=status.get("plan_detail"))
-    decoder = analyze_decoder_replays(root, expected_raw_manifest_sha=raw_manifest["sha256"], expected_group=status.get("group"))
+    decoder = analyze_decoder_replays(root, decoder_root=decoder_root,
+                                      expected_raw_manifest_sha=raw_manifest["sha256"], expected_group=status.get("group"))
     if result.get("status") != "COMPLETE" or len(result.get("fits", [])) != 5 or len(result.get("additivity", [])) != 6 or len(result.get("predictions", [])) != 24:
         raise ValueError("public Task 6 analysis requires exact 5 direction, 6 additivity, and 24 holdout results")
     if decoder.get("status") != "COMPLETE" or int(decoder.get("decoder_calls", 0)) != 16:

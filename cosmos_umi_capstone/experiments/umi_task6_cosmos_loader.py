@@ -226,10 +226,19 @@ def load_task6_cosmos_runtime(*, framework_root: str, checkpoint: str, vae: str,
         "asset_source_commit": "2b17a2413bd86b2cf9b03823637108851e4ddf2d",
         "diffusion_cache_requested": False, "diffusion_cache_installed": False, "seed": 0, "prompt": prompt}
     runtime_model = post_adapter.model
+    # The verified UMI VAE path owns both encode/decode on tokenizer_vision_gen;
+    # bind that object first so round-trip conditions use the same artifact as
+    # the generated latent.  tokenizer_vision is only a compatibility fallback
+    # for older framework revisions and must still pass the adapter checks.
+    condition_encoder = getattr(runtime_model, "tokenizer_vision_gen", None)
+    if condition_encoder is None:
+        condition_encoder = getattr(runtime_model, "tokenizer_vision", None)
     runtime = {"model": runtime_model, "data_batch": data_batch, "ops": ops,
+        "fps": 5,
         "generation_settings": {"num_steps": 30, "guidance": 1.0, "shift": 10.0},
         "artifact_paths": {"checkpoint": str(Path(checkpoint).resolve()), "decoder": str(Path(vae).resolve())},
-        "provenance": provenance, "encoder": ConditionEncoderAdapter(getattr(runtime_model, "tokenizer_vision", None), device=device)}
+        "provenance": {**provenance, "condition_encoder": "tokenizer_vision_gen" if getattr(runtime_model, "tokenizer_vision_gen", None) is not None else "tokenizer_vision"},
+        "encoder": ConditionEncoderAdapter(condition_encoder, device=device)}
     def unload():
         cleanup = getattr(post_adapter, "cleanup", None)
         if callable(cleanup): cleanup()

@@ -100,6 +100,18 @@ class DecoderTests(unittest.TestCase):
             after = {p.relative_to(raw): (p.read_bytes(), p.stat().st_mtime_ns) for p in raw.rglob("*") if p.is_file()}
             self.assertEqual(before, after); self.assertTrue((decoder / "MANIFEST.sha256").is_file())
 
+    def test_raw_manifest_remains_valid_after_decoder_monitor_writes_root_telemetry(self):
+        import run_umi_task6_experiment as runner
+        with tempfile.TemporaryDirectory() as temporary:
+            raw = Path(temporary) / "raw"; self._raw(raw)
+            safe = lambda: {"gpu_used_gib": 0, "gpu_free_gib": 100, "ram_available_gib": 600,
+                            "rss_gib": 0, "swap_used_gib": 0, "disk_free_gib": 20}
+            monitor = runner.ResourceMonitor(raw, gpu_sampler=safe, ram_sampler=safe, disk_sampler=safe)
+            monitor.start(); monitor.stop()
+            raw_status = raw / "run_status.json"; raw_status.write_text('{"status":"AWAITING_REVIEW","completed_samples":' + json.dumps([item["sample_id"] for item in api.build_generation_plan()]) + ',"group":{"state":"bridge_0","seed":0},"decoder_status":"RESOURCE_STOP"}')
+            manifest_sha, status = api._verify_raw_task6(raw)
+            self.assertTrue(manifest_sha); self.assertEqual(len(status["completed_samples"]), 32)
+
     def test_encoder_is_mandatory(self):
         with tempfile.TemporaryDirectory() as temporary:
             with self.assertRaises(Exception): api.run_task6_decoder_replays(object(), Path(temporary) / "raw")

@@ -25,6 +25,14 @@ TERMINAL_STATUSES = frozenset({
     "AWAITING_RESOURCE_REVIEW", "AWAITING_REVIEW", "COMPLETE", "FAILED",
     "SKIPPED", "RESOURCE_STOP", "INTERRUPTED",
 })
+# These root-relative control/monitor files are intentionally mutable after a
+# generation run (decoder monitoring may append to them or update status).
+# They are excluded from the raw immutable evidence manifest everywhere.
+RAW_MUTABLE_FILES = frozenset({
+    "run_status.json", "invocation_history.jsonl", "gpu_samples.csv",
+    "ram_samples.csv", "disk_samples.csv", "sample_resource_snapshots.csv",
+    "sample_resource_snapshots.jsonl",
+})
 
 
 @dataclass(frozen=True)

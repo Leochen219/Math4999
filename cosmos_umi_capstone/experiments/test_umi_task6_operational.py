@@ -147,7 +147,7 @@ class OperationalTask6Tests(unittest.TestCase):
             action.write_text(json.dumps([[0.0] * 10 for _ in range(16)])); video.write_bytes(b"video"); checkpoint.write_bytes(b"model"); vae.write_bytes(b"vae")
             contract = {"framework_commit": "1" * 40, "asset_source_commit": op.SOURCE_COMMIT,
                 "checkpoint_identity": {"sha256": "a" * 64}, "vae_sha256": "b" * 64, "torch_version": "fixture", "cuda_version": "fixture", "code_bundle_sha256": "c" * 64,
-                "bridge_asset_hashes": dict(op.BRIDGE0_ASSET_SHA256), "task5": {"manifest_sha256": "f" * 64, "plan_sha256": "0" * 64,
+                "bridge_asset_hashes": dict(op.BRIDGE0_ASSET_SHA256), "fps": 5, "task5": {"manifest_sha256": "f" * 64, "plan_sha256": "0" * 64,
                     "direction_file_sha256": {k: "1" * 64 for k in ("v0", "v1", "v2")}, "direction_sha256": {k: "2" * 64 for k in direction_hashes}},
                 "group": {"state": "bridge_0", "seed": 0}, "prompt": inputs.prompt, "action": [[0.0] * 10 for _ in range(16)],
                 "settings": {"num_steps": 30, "guidance": 1.0, "shift": 10.0, "batch_size": 1, "autocast": False, "tf32": False, "diffusion_cache": False},
@@ -204,10 +204,26 @@ class OperationalTask6Tests(unittest.TestCase):
         self.assertEqual(encoder.cache, {})
         adapter.reset_cache()
         self.assertEqual(encoder.cache, {})
-        self.assertIn("weights", adapter.actual_identity())
+        self.assertIn("weights", adapter.actual_identity()["encoder"]["content"])
+
+    def test_raw_manifest_excludes_mutable_status_and_resource_outputs(self):
+        import umi_task6_runtime as runtime_api
+        import analyze_umi_task6 as analyzer
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); (root / "immutable.json").write_text("evidence")
+            (root / "run_status.json").write_text('{"status":"AWAITING_REVIEW"}')
+            runtime_api._write_manifest(root)
+            manifest = (root / "MANIFEST.sha256").read_text()
+            self.assertNotIn("run_status.json", manifest)
+            safe = lambda: {"gpu_used_gib": 0, "gpu_free_gib": 100, "ram_available_gib": 600,
+                            "rss_gib": 0, "swap_used_gib": 0, "disk_free_gib": 20}
+            monitor = __import__("run_umi_task6_experiment").ResourceMonitor(root, gpu_sampler=safe, ram_sampler=safe, disk_sampler=safe)
+            monitor.start(); monitor.stop()
+            (root / "run_status.json").write_text('{"status":"RESOURCE_STOP"}')
+            analyzer.verify_raw_manifest(root)
 
     def contract(self):
-        return {"framework_commit": "1" * 40, "asset_source_commit": "2b17a2413bd86b2cf9b03823637108851e4ddf2d", "checkpoint_identity": {"sha256": "x"},
+        return {"framework_commit": "1" * 40, "asset_source_commit": "2b17a2413bd86b2cf9b03823637108851e4ddf2d", "checkpoint_identity": {"sha256": "x"}, "fps": 5,
                 "vae_sha256": "a" * 64, "torch_version": "2.10.0+cu130", "cuda_version": "13.0", "code_bundle_sha256": "b" * 64,
                 "bridge_asset_hashes": {"action": "a" * 64, "video": "b" * 64}, "task5": {"manifest_sha256": "c" * 64},
                 "group": {"state": "bridge_0", "seed": 0}, "prompt": self.op.BRIDGE0_PROMPT,

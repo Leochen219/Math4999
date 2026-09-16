@@ -133,6 +133,7 @@ def _execute_official_impl(args: argparse.Namespace) -> dict[str, Any]:
             identity = inputs.identity()
             binding_config = task6_binding_config(inputs)
             strict_config = {"environment": {"torch": live["torch_version"], "cuda": live["cuda_version"]},
+                "fps": live["fps"],
                 "provenance": dict(getattr(runtime, "provenance", {})), "asset_hashes": {"action": assets["action_sha256"], "video": assets["video_sha256"],
                     "checkpoint": live["checkpoint_identity"]["sha256"], "vae": live["vae_sha256"]},
                 "asset_paths": {"action": args.action, "video": args.video, "checkpoint": args.checkpoint, "vae": args.vae},
@@ -188,8 +189,10 @@ def _execute_official_impl(args: argparse.Namespace) -> dict[str, Any]:
         try: runtime.cleanup()
         finally: factory.unload()
         raise OperationalEvidenceError("official loader must expose a condition encoder for decoder replay")
-    decoder_monitor = ResourceMonitor(args.run_dir, gpu_sampler=samplers["gpu"], ram_sampler=samplers["ram"], disk_sampler=samplers["disk"])
     decoder_root = Path(args.decoder_root) if args.decoder_root else Path(args.run_dir).parent / (Path(args.run_dir).name + "_decoder")
+    # Decoder telemetry is derived evidence and must not mutate the raw
+    # generation monitor files or its immutable manifest.
+    decoder_monitor = ResourceMonitor(decoder_root, gpu_sampler=samplers["gpu"], ram_sampler=samplers["ram"], disk_sampler=samplers["disk"])
     decoder = run_task6_decoder_replays(runtime, args.run_dir, encoder=encoder, resume=bool(args.resume), decoder_root=decoder_root,
                                         monitor=decoder_monitor, main_status_path=Path(args.run_dir) / "run_status.json")
     if decoder.get("status") != "COMPLETE":

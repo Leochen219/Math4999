@@ -227,7 +227,7 @@ def extract_task5_directions(task5_root: str | os.PathLike[str], *, expected_man
             "task5_root": str(root)}
 
 
-REQUIRED_CONTRACT_KEYS = frozenset({"framework_commit", "asset_source_commit", "checkpoint_identity", "vae_sha256", "torch_version", "cuda_version",
+REQUIRED_CONTRACT_KEYS = frozenset({"framework_commit", "asset_source_commit", "checkpoint_identity", "vae_sha256", "torch_version", "cuda_version", "fps",
     "code_bundle_sha256", "bridge_asset_hashes", "task5", "group", "prompt", "action", "settings", "cache_flags", "seed_routes", "geometry"})
 
 
@@ -242,6 +242,8 @@ def validate_launch_contract(contract: Mapping[str, Any], *, observed: Mapping[s
         raise OperationalEvidenceError("launch contract is restricted to bridge_0 / seed 0")
     if contract["prompt"] != BRIDGE0_PROMPT or parse_action(contract["action"]).shape != (16, 10):
         raise OperationalEvidenceError("prompt/action contract mismatch")
+    if contract.get("fps") != BRIDGE0_FPS:
+        raise OperationalEvidenceError("Bridge sample fps must be exactly 5")
     settings = contract["settings"]
     expected_settings = {"num_steps": 30, "guidance": 1.0, "shift": 10.0, "batch_size": 1,
                          "autocast": False, "tf32": False, "diffusion_cache": False}
@@ -320,6 +322,7 @@ def observe_live_launch(contract: Mapping[str, Any], *, runtime: Any, inputs: An
         "code_bundle_sha256": code_bundle_sha256(),
         "torch_version": torch_version,
         "cuda_version": cuda_version,
+        "fps": _observed_fps(runtime, inputs),
         "bridge_asset_hashes": {"action": assets["action_sha256"], "video": assets["video_sha256"]},
         "task5": {"manifest_sha256": task5["manifest_sha256"], "plan_sha256": task5["plan_sha256"],
                   "direction_file_sha256": dict(task5["direction_file_sha256"]), "direction_sha256": dict(task5["direction_sha256"])},
@@ -334,6 +337,19 @@ def observe_live_launch(contract: Mapping[str, Any], *, runtime: Any, inputs: An
         "runtime_identity": actual,
     }
     return observation
+
+
+def _observed_fps(runtime: Any, inputs: Any) -> int:
+    """Read the resolved sample/data-batch fps, never a caller default."""
+    candidates = [getattr(runtime, "fps", None), getattr(runtime, "sample_fps", None),
+                  getattr(getattr(runtime, "sample_args", None), "fps", None),
+                  getattr(getattr(inputs, "sample_args", None), "fps", None)]
+    for value in candidates:
+        if value is not None:
+            try: result = int(value)
+            except (TypeError, ValueError): continue
+            if result > 0: return result
+    raise OperationalEvidenceError("live runtime did not expose resolved sample fps")
 
 
 def _live_framework_commit(framework_root: str | os.PathLike[str] | None) -> str:
@@ -443,6 +459,9 @@ class OfficialRuntimeFactory:
             provenance=dict(provenance), ops=payload.get("ops"), scheduler_class=payload.get("scheduler_class"),
             generation_settings=payload.get("generation_settings"), artifact_paths=payload.get("artifact_paths"),
             inputs_factory=base, model_seed=0)
+        if payload.get("fps") != BRIDGE0_FPS:
+            raise OperationalEvidenceError("official loader must expose resolved Bridge fps=5")
+        runtime.fps = int(payload["fps"])
         encoder = payload.get("encoder")
         if encoder is None:
             encoder = getattr(runtime, "encoder", None)
