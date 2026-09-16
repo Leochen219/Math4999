@@ -1,4 +1,5 @@
 import json
+import hashlib
 import tempfile
 import time
 import unittest
@@ -8,6 +9,47 @@ import numpy as np
 
 
 class Task6RunnerTests(unittest.TestCase):
+    def public_chain(self, temp, *, execute_error=None, cleanup_error=None):
+        import hashlib
+        import umi_task6_runtime as runtime_api
+        import run_umi_task6_experiment as api
+        carrier = np.ones((1, 48, 5, 16, 16), np.float32)
+        mask = np.zeros_like(carrier, dtype=bool); mask[:, :, 0] = True
+        bank = np.zeros((3,) + carrier.shape, np.float32); bank[:, mask] = 1
+        direction_map = runtime_api._derive_frozen_directions_unpinned(bank, mask)
+        direction_hashes = {key: runtime_api._array_sha(value) for key, value in direction_map.items()}
+        inputs = runtime_api.Task6Inputs(carrier, [0], mask, bank, action=np.zeros((16, 10), np.float32), prompt="pilot", direction_hashes=direction_hashes)
+        counts = {"execute": 0, "pilot_execute": 0, "cleanup": 0}; phase = {"name": "smoke"}
+        class Runtime:
+            provenance = {"source_commit": "2b17a2413bd86b2cf9b03823637108851e4ddf2d"}
+            def actual_identity(self): return {"fixture": "public"}
+            def execute(self, spec, runtime_inputs, *, scope="full"):
+                counts["execute"] += 1
+                if phase["name"] == "pilot": counts["pilot_execute"] += 1
+                if phase["name"] == "pilot" and execute_error is not None and counts["pilot_execute"] == 1: raise execute_error
+                return {"output_full": np.array([counts["execute"]], np.float32)}
+            def cleanup(self):
+                counts["cleanup"] += 1
+                if phase["name"] == "pilot" and cleanup_error is not None: raise cleanup_error
+        runtime = Runtime(); direction_path = Path(temp, "directions.npy"); np.save(direction_path, bank)
+        asset_path = Path(temp, "asset.bin"); asset_path.write_bytes(b"asset")
+        cfg = {"environment": {"name": "cpu"}, "provenance": {"source_commit": "2b17a2413bd86b2cf9b03823637108851e4ddf2d"},
+               "asset_hashes": {"asset": hashlib.sha256(asset_path.read_bytes()).hexdigest()}, "asset_paths": {"asset": str(asset_path)},
+               "carrier_shape": list(inputs.z0.shape), "carrier_hash": inputs.identity()["z0"], "condition_indexes": [0], "predicted_indexes": [1,2,3,4],
+               "mask_shape": list(mask.shape), "mask_hash": inputs.geometry.metadata()["mask_sha256"], "action_shape": [16,10], "action_hash": inputs.identity()["action"],
+               "prompt": inputs.prompt, "direction_hashes": direction_hashes, "direction_bank_path": str(direction_path),
+               "direction_bank_file_hash": hashlib.sha256(direction_path.read_bytes()).hexdigest(),
+               "settings": {"num_steps":30,"guidance":1.0,"shift":10.0,"autocast":False,"tf32":False,"diffusion_cache":False,"batch_size":1},
+               "seed_config": {"seed":0,"prepare":0,"sampler":0,"scheduler":0}, "observed_runtime_identity": runtime.actual_identity(), "observed_input_identity": inputs.identity()}
+        evidence = Path(temp, "preflight.json"); evidence.write_text(json.dumps(cfg))
+        api.execute_task6(api.parse_args(["--phase", "preflight", "--run-dir", temp, "--preflight-json", str(evidence)]), runtime=runtime, inputs=inputs)
+        phase["name"] = "smoke"
+        safe = lambda: {"gpu_used_gib":0,"gpu_free_gib":100,"gpu_reserved_gib":0,"ram_available_gib":600,"rss_gib":0,"swap_used_gib":0,"disk_free_gib":20}
+        api.run_resource_smoke(temp, lifecycle={"pre_load": lambda: None, "load": lambda: (runtime, inputs), "cleanup": lambda: None, "unload": lambda: None}, samplers={key: safe for key in ("gpu", "ram", "disk")})
+        api.accept_resource_smoke(temp, hashes=json.loads(Path(temp, "run_status.json").read_text())["hashes"])
+        phase["name"] = "pilot"
+        return api, runtime, inputs, counts, phase
+
     def smoke_fixture(self, temp, *, gpu=None, runtime=None, inputs=None, lifecycle_log=None):
         import run_umi_task6_experiment as api
         runtime = runtime or type("Runtime", (), {"actual_identity": lambda self: {"fixture": "runtime"}, "execute": lambda self, spec, inputs, *, scope: {"output_full": np.zeros(8, np.float32)}})()
@@ -192,6 +234,47 @@ class Task6RunnerTests(unittest.TestCase):
             finally:
                 api.ResourceMonitor.start = original
             self.assertEqual(result["status"], "RESOURCE_STOP")
+
+    def test_public_pilot_execute_failure_cleans_and_records_post_cleanup(self):
+        with tempfile.TemporaryDirectory() as temp:
+            api, runtime, inputs, counts, _ = self.public_chain(temp, execute_error=RuntimeError("execute"))
+            safe = lambda: {"gpu_used_gib":0,"gpu_free_gib":100,"gpu_reserved_gib":0,"ram_available_gib":600,"rss_gib":0,"swap_used_gib":0,"disk_free_gib":20}
+            result = api.run_pilot(runtime, inputs, temp, monitor=api.ResourceMonitor(temp, gpu_sampler=safe, ram_sampler=safe, disk_sampler=safe))
+            self.assertIn(result["status"], {"FAILED", "RESOURCE_STOP"}); self.assertEqual(counts["cleanup"], 1)
+            self.assertFalse(any(json.loads((sample / "status.json").read_text()).get("status") == "success" for sample in (Path(temp) / "samples").glob("*") if (sample / "status.json").is_file()))
+            self.assertTrue(Path(temp, "sample_resource_snapshots.jsonl").is_file())
+
+    def test_public_pilot_cleanup_failure_stops_without_mixed_lists(self):
+        with tempfile.TemporaryDirectory() as temp:
+            api, runtime, inputs, counts, _ = self.public_chain(temp, cleanup_error=RuntimeError("cleanup"))
+            safe = lambda: {"gpu_used_gib":0,"gpu_free_gib":100,"gpu_reserved_gib":0,"ram_available_gib":600,"rss_gib":0,"swap_used_gib":0,"disk_free_gib":20}
+            result = api.run_pilot(runtime, inputs, temp, monitor=api.ResourceMonitor(temp, gpu_sampler=safe, ram_sampler=safe, disk_sampler=safe))
+            self.assertEqual(result["status"], "RESOURCE_STOP"); self.assertEqual(result["reason_code"], "RESOURCE_CLEANUP_FAILURE")
+            self.assertEqual(counts["cleanup"], 1); self.assertFalse(set(result["completed_samples"]) & set(result["failed_samples"]))
+
+    def test_public_pilot_two_success_stop_and_resume_preserves_samples(self):
+        with tempfile.TemporaryDirectory() as temp:
+            api, runtime, inputs, counts, _ = self.public_chain(temp)
+            def disk():
+                return {"gpu_used_gib": 0, "gpu_free_gib": 100, "gpu_reserved_gib": 0, "ram_available_gib": 600,
+                        "rss_gib": 0, "swap_used_gib": 0, "disk_free_gib": 20 if counts["cleanup"] < 2 else 4}
+            safe = lambda: {**disk(), "disk_free_gib": 20}
+            first_monitor = api.ResourceMonitor(temp, gpu_sampler=disk, ram_sampler=disk, disk_sampler=disk)
+            first = api.run_pilot(runtime, inputs, temp, monitor=first_monitor)
+            self.assertEqual(first["status"], "RESOURCE_STOP"); self.assertEqual(counts["pilot_execute"], 2)
+            first_samples = {}
+            for sample in sorted((Path(temp) / "samples").iterdir()):
+                state = json.loads((sample / "status.json").read_text())
+                if state.get("status") == "success":
+                    first_samples[sample.name] = ([(str(p.relative_to(sample)), hashlib.sha256(p.read_bytes()).hexdigest()) for p in sorted(sample.rglob("*")) if p.is_file()], sample.stat().st_mtime_ns)
+            self.assertEqual(len(first_samples), 2); self.assertTrue(first.get("smoke_run_id")); self.assertTrue(Path(temp, "MANIFEST.sha256").is_file())
+            second = api.run_pilot(runtime, inputs, temp, resume=True,
+                                   monitor=api.ResourceMonitor(temp, gpu_sampler=safe, ram_sampler=safe, disk_sampler=safe))
+            self.assertEqual(second["status"], "AWAITING_REVIEW"); self.assertEqual(counts["pilot_execute"], 32)
+            for name, (hashes, mtime) in first_samples.items():
+                sample = Path(temp, "samples", name)
+                self.assertEqual(mtime, sample.stat().st_mtime_ns)
+                self.assertEqual(hashes, [(str(p.relative_to(sample)), hashlib.sha256(p.read_bytes()).hexdigest()) for p in sorted(sample.rglob("*")) if p.is_file()])
 
 
 if __name__ == "__main__": unittest.main()

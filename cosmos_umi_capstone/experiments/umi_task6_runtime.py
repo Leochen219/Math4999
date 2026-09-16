@@ -589,17 +589,20 @@ def _run_task6_group(runtime: Any, inputs: Task6Inputs, run_dir: str | Path, *, 
                     stream.write(canonical_json({"sample_id": spec["sample_id"], "identity": identity, "started_at_unix": time.time()}) + "\n")
             except Exception as error:
                 payload = write_status("FAILED", type(error).__name__, str(error)); _write_manifest(root); return payload
-            cleanup_attempted = False
+            cleanup_attempted = False; cleanup_failure = None
             try:
                 record = dict(runtime.execute(spec, inputs, scope="full"))
                 if "output_full" not in record: raise ValueError("runtime did not return output_full")
                 record.update({"status": "success", "identity": identity, "spec": spec})
                 arrays = {key + ".npy": value for key, value in record.items() if isinstance(value, np.ndarray)}
                 samples.write_success(spec["sample_id"], {key: value for key, value in record.items() if not isinstance(value, np.ndarray)}, artifacts=arrays)
-                completed.append(spec["sample_id"])
                 cleanup = getattr(runtime, "cleanup", None) or getattr(runtime, "reset_cache", None)
                 if callable(cleanup):
-                    cleanup_attempted = True; cleanup()
+                    cleanup_attempted = True
+                    try: cleanup()
+                    except Exception as error:
+                        cleanup_failure = error; raise
+                completed.append(spec["sample_id"])
                 if monitor is not None and hasattr(monitor, "capture_sample"):
                     try: capture_decision = monitor.capture_sample(spec["sample_id"], "post_cleanup", 32 - len(completed), root)
                     except Exception as error:
@@ -644,8 +647,8 @@ def _run_task6_group(runtime: Any, inputs: Task6Inputs, run_dir: str | Path, *, 
                     # failure record cannot be published after a hard stop.
                     pass
                 message = str(error); lower = (type(error).__name__ + " " + message).lower()
-                terminal_status = "RESOURCE_STOP" if "outofmemory" in lower or "cuda oom" in lower else "FAILED"
-                reason_code = "CUDA_OOM" if terminal_status == "RESOURCE_STOP" else type(error).__name__
+                terminal_status = "RESOURCE_STOP" if cleanup_failure is not None or "outofmemory" in lower or "cuda oom" in lower else "FAILED"
+                reason_code = "RESOURCE_CLEANUP_FAILURE" if cleanup_failure is not None else ("CUDA_OOM" if terminal_status == "RESOURCE_STOP" else type(error).__name__)
                 payload = write_status(terminal_status, reason_code, message); _write_manifest(root); return payload
         if len(completed) != 32:
             payload = write_status("FAILED", "INCOMPLETE_GROUP", "group did not produce exactly 32 successes"); _write_manifest(root); return payload
