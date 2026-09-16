@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -51,10 +52,52 @@ class AnalysisTests(unittest.TestCase):
             (root / "MANIFEST.sha256").write_text(f"{'0'*64}  x.txt\n", encoding="ascii")
             with self.assertRaises(ValueError): api.verify_raw_manifest(root)
 
+    def test_difference_metrics_is_field_specific_for_shape_and_nonfinite(self):
+        self.assertEqual(api.difference_metrics(np.zeros((2,)), np.zeros((3,)))["reason"], "shape_mismatch")
+        self.assertEqual(api.difference_metrics(np.array([np.nan]), np.zeros((1,)))["reason"], "nonfinite")
+
+    def test_cross_group_table_marks_absent_groups_not_run(self):
+        rows = api.summarize_cross_groups({})
+        self.assertEqual(len(rows), 6)
+        self.assertTrue(all(row["status"] == "NOT_RUN" for row in rows))
+
+    def test_tampered_package_is_not_returned_as_idempotent(self):
+        records, frozen = _linear_records()
+        with tempfile.TemporaryDirectory() as temporary:
+            raw = Path(temporary) / "raw"; raw.mkdir(); (raw / "MANIFEST.sha256").write_text("", encoding="ascii")
+            result = api.analyze_task6_records(records, plan_detail={"combination_coefficients": {"c01": frozen["c01"], "c12": frozen["c12"]}}, strict=True)
+            # A raw-less package is sufficient to exercise package tamper detection.
+            output = Path(temporary) / "analysis"; api.write_task6_artifacts(result, output)
+            (output / "experiment_report.md").write_text("tampered", encoding="utf-8")
+            with self.assertRaises(FileExistsError): api.write_task6_artifacts(result, output)
+
     def test_float64_reduction_does_not_change_raw_fixture(self):
         records, frozen = _linear_records(); before = records["bridge_0__seed_0__baseline_pre"]["output_full"].copy()
         api.analyze_task6_records(records, plan_detail={"combination_coefficients": {"c01": frozen["c01"], "c12": frozen["c12"]}})
         np.testing.assert_array_equal(before, records["bridge_0__seed_0__baseline_pre"]["output_full"])
+
+    def test_package_is_outside_raw_and_manifest_valid(self):
+        records, frozen = _linear_records()
+        with tempfile.TemporaryDirectory() as temporary:
+            raw = Path(temporary) / "raw"; raw.mkdir()
+            completed = []
+            for key, record in records.items():
+                sid = key.split("__")[-1]; sample = raw / "samples" / sid; sample.mkdir(parents=True); completed.append(sid)
+                arrays = {name: value for name, value in record.items() if isinstance(value, np.ndarray)}
+                for name, value in arrays.items(): np.save(sample / f"{name}.npy", value, allow_pickle=False)
+                (sample / "sample.json").write_text(json.dumps({"sample_id": sid}), encoding="utf-8")
+                hashes = {f"{name}.npy": hashlib.sha256((sample / f"{name}.npy").read_bytes()).hexdigest() for name in arrays}
+                (sample / "status.json").write_text(json.dumps({"status": "success", "artifact_sha256": hashes}), encoding="utf-8")
+            status = {"status": "AWAITING_REVIEW", "completed_samples": completed, "group": {"state": "bridge_0", "seed": 0}}
+            (raw / "run_status.json").write_text(json.dumps(status), encoding="utf-8")
+            entries = []
+            for path in sorted(raw.rglob("*")):
+                if path.is_file(): entries.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.relative_to(raw).as_posix()}\n")
+            (raw / "MANIFEST.sha256").write_text("".join(entries), encoding="ascii")
+            result = api.analyze_task6_records(records, plan_detail={"combination_coefficients": {"c01": frozen["c01"], "c12": frozen["c12"]}}, strict=True)
+            output = Path(temporary) / "analysis"; published = api.write_task6_artifacts(result, output, raw_root=raw)
+            self.assertTrue((output / "review_bundle.zip").is_file()); self.assertEqual(api.verify_analysis_manifest(output)["sha256"], Path(published["manifest"]).read_bytes() and api.verify_analysis_manifest(output)["sha256"])
+            self.assertTrue(api.write_task6_artifacts(result, output, raw_root=raw)["idempotent"])
 
 
 if __name__ == "__main__": unittest.main()

@@ -26,10 +26,12 @@ import numpy as np
 try:
     from .analyze_umi_task5 import analyze_task5_records
     from .umi_task5_primitives import ALPHAS, DIRECTION_IDS
+    from .umi_task6_primitives import STATE_IDS, SEEDS
     from .umi_task6_decoder import sha256_file
 except ImportError:  # pragma: no cover
     from analyze_umi_task5 import analyze_task5_records
     from umi_task5_primitives import ALPHAS, DIRECTION_IDS
+    from umi_task6_primitives import STATE_IDS, SEEDS
     from umi_task6_decoder import sha256_file
 
 
@@ -53,7 +55,7 @@ def difference_metrics(left: Any, right: Any) -> dict[str, float | None]:
     lhs = np.asarray(left, dtype=np.float32); rhs = np.asarray(right, dtype=np.float32)
     if lhs.shape != rhs.shape: return {"status": "N/A", "reason": "shape_mismatch", "rms": None, "max_abs": None, "mean_abs": None}
     if not np.all(np.isfinite(lhs)) or not np.all(np.isfinite(rhs)): return {"status": "N/A", "reason": "nonfinite", "rms": None, "max_abs": None, "mean_abs": None}
-    diff = lhs.astype(np.float64) - rhs.astype(np.float64); absolute = np.abs(diff)
+    diff32 = np.subtract(lhs, rhs, dtype=np.float32); diff = diff32.astype(np.float64); absolute = np.abs(diff)
     return {"status": "OK", "reason": None, "rms": float(np.sqrt(np.mean(diff * diff, dtype=np.float64))),
             "max_abs": float(np.max(absolute)), "mean_abs": float(np.mean(absolute, dtype=np.float64))}
 
@@ -111,6 +113,20 @@ def _status_incomplete(missing: list[str], *, reason: str = "raw group is incomp
                         "additivity_total": 6, "prediction_total": 24}}
 
 
+def summarize_cross_groups(group_results: Mapping[str, Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Return all six approved groups; absent groups are explicitly NOT_RUN."""
+    rows = []
+    for state in STATE_IDS:
+        for seed in SEEDS:
+            group_id = f"{state}__seed_{seed}"; result = group_results.get(group_id)
+            rows.append({"group_id": group_id, "state": state, "seed": seed,
+                         "status": "NOT_RUN" if result is None else result.get("status", "INCOMPLETE"),
+                         "direction_pass": None if result is None else result.get("summary", {}).get("direction_candidates_pass"),
+                         "max_additivity_error": None if result is None else result.get("summary", {}).get("max_additivity_error"),
+                         "max_holdout_error": None if result is None else result.get("summary", {}).get("max_holdout_error")})
+    return rows
+
+
 def analyze_task6_records(records: Mapping[str, Mapping[str, Any]], *, plan_detail: Mapping[str, Any] | None = None,
                           group: Mapping[str, Any] | None = None, strict: bool = False) -> dict[str, Any]:
     """Recompute the unchanged Task 5 metrics from one Task 6 group.
@@ -136,11 +152,14 @@ def analyze_task6_records(records: Mapping[str, Mapping[str, Any]], *, plan_deta
     result["summary"] = {**dict(result.get("summary", {})), "additivity_total": 6, "prediction_total": 24,
                           "max_additivity_error": max((row.get("relative_error") or 0.0 for row in result.get("additivity", [])), default=None),
                           "max_holdout_error": max((row.get("relative_error") or 0.0 for row in result.get("predictions", [])), default=None)}
+    group_id = f"{result.get('group', {}).get('state', '')}__seed_{result.get('group', {}).get('seed', '')}" if result.get("group") else ""
+    result["cross_group_status"] = summarize_cross_groups({group_id: result}) if group_id != "__seed_" else summarize_cross_groups({})
     return result
 
 
-def _manifest_entries(root: Path, *, exclude: set[str] | None = None) -> dict[str, str]:
-    excluded = set(exclude or ()) | {"MANIFEST.sha256", "review_bundle.zip"}
+def _manifest_entries(root: Path, *, exclude: set[str] | None = None, include_bundle: bool = False) -> dict[str, str]:
+    excluded = set(exclude or ()) | {"MANIFEST.sha256"}
+    if not include_bundle: excluded.add("review_bundle.zip")
     return {path.relative_to(root).as_posix(): sha256_file(path)
             for path in sorted(root.rglob("*")) if path.is_file() and path.name not in excluded}
 
@@ -186,13 +205,16 @@ def _load_records(root: Path) -> dict[str, dict[str, Any]]:
     return records
 
 
-def analyze_decoder_replays(run_root: str | Path) -> dict[str, Any]:
+def analyze_decoder_replays(run_root: str | Path, decoder_root: str | Path | None = None) -> dict[str, Any]:
     """Read decoder replay records without touching the model."""
-    root = Path(run_root) / "decoder"
+    raw = Path(run_root).resolve()
+    root = Path(decoder_root).resolve() if decoder_root is not None else raw.parent / (raw.name + "_decoder")
     status_path = root / "status.json"
     if not status_path.is_file(): return {"status": "NOT_RUN", "metrics": [], "reason": "decoder status is absent"}
     status = json.loads(status_path.read_text(encoding="utf-8"))
     if status.get("status") != "COMPLETE": return {"status": "NOT_RUN", "metrics": [], "reason": "decoder stopped or incomplete", "status_record": status}
+    try: decoder_manifest_sha = _verify_decoder_manifest_for_analysis(root)
+    except ValueError as error: return {"status": "INVALID", "metrics": [], "reason": str(error)}
     records: dict[str, dict[str, Any]] = {}
     for path in sorted(root.iterdir()):
         if not path.is_dir() or not (path / "record.json").is_file(): continue
@@ -200,25 +222,70 @@ def analyze_decoder_replays(run_root: str | Path) -> dict[str, Any]:
         for array_path in path.glob("*.npy"): record[array_path.stem] = np.load(array_path, allow_pickle=False)
         records[path.name] = record
     if len(records) != 16: return {"status": "INCOMPLETE", "metrics": [], "reason": f"expected 16 decoder records, found {len(records)}"}
-    rows = []
+    rows = []; space_rows: list[dict[str, Any]] = []
     for name, record in sorted(records.items()):
         arrays = [value for key, value in record.items() if key.endswith("float32") and isinstance(value, np.ndarray)]
         row = {"replay_id": name, "precision": record.get("spec", {}).get("decode_precision", record.get("precision")),
                "status": record.get("status", "success"), "elapsed_seconds": record.get("elapsed_seconds")}
         if "decoded_final_float32" in record: row["decoded_final_rms"] = float(np.sqrt(np.mean(np.asarray(record["decoded_final_float32"], dtype=np.float64) ** 2)))
-        if "roundtrip_direct_condition_latent" in record:
-            row["roundtrip_direct_latent_rms"] = float(np.sqrt(np.mean(np.asarray(record["roundtrip_direct_condition_latent"], dtype=np.float64) ** 2)))
-        if "roundtrip_uint8_condition_latent" in record:
-            row["roundtrip_uint8_latent_rms"] = float(np.sqrt(np.mean(np.asarray(record["roundtrip_uint8_condition_latent"], dtype=np.float64) ** 2)))
-        if "decoded_final_float32" in record and "roundtrip_uint8_input" in record:
-            row["uint8_input_rms"] = rms64(record["roundtrip_uint8_input"])
+        if "direct_condition_latent_float32" in record:
+            row["roundtrip_direct_latent_rms"] = rms64(record["direct_condition_latent_float32"])
+        if "uint8_condition_latent_float32" in record:
+            row["roundtrip_uint8_latent_rms"] = rms64(record["uint8_condition_latent_float32"])
+        if "uint8_simulated_input" in record:
+            row["uint8_input_rms"] = rms64(record["uint8_simulated_input"])
         rows.append(row)
     by_id = {row["replay_id"]: row for row in rows}
     for row in rows:
         twin = row["replay_id"].replace("__native_bf16", "__temporary_fp32") if "native_bf16" in row["replay_id"] else row["replay_id"].replace("__temporary_fp32", "__native_bf16")
         row["paired_precision_replay_id"] = twin if twin in by_id else None
-    return {"status": "COMPLETE", "metrics": rows, "decoder_calls": 16,
+    # Five spaces are kept separate. Decoder spaces only contain the baseline
+    # and six v0 signed amplitudes; no other directions are inferred here.
+    source_records: dict[str, dict[str, dict[str, Any]]] = {"native_bf16": {}, "temporary_fp32": {}}
+    for path in sorted(root.iterdir()):
+        if not path.is_dir() or not (path / "record.json").is_file(): continue
+        meta = json.loads((path / "record.json").read_text(encoding="utf-8")); spec = meta.get("spec", {})
+        logical = str(spec.get("sample_id", path.name)).split("__")[-1]
+        source_records[str(spec.get("decode_precision"))][logical] = {**meta, **{p.stem: np.load(p, allow_pickle=False) for p in path.glob("*.npy")}}
+    spaces = {"native_bf16": "native_rgb", "temporary_fp32": "fp32_rgb"}
+    for precision, rgb_space in spaces.items():
+        values = {rgb_space: "decoded_final_float32", "direct_float_condition_latent": "direct_condition_latent_float32", "uint8_sim_condition_latent": "uint8_condition_latent_float32"}
+        for space, key in values.items():
+            source = source_records[precision]
+            if any(item not in source or key not in source[item] for item in ("baseline_pre", "baseline_post")): continue
+            base = source["baseline_pre"][key]; post = source["baseline_post"][key]; floor = difference_metrics(post, base)
+            alpha_rows = []
+            for ordinal, alpha in enumerate(ALPHAS):
+                plus = source.get(f"v0_alpha_{ordinal:02d}_plus", {}).get(key); minus = source.get(f"v0_alpha_{ordinal:02d}_minus", {}).get(key)
+                if plus is None or minus is None: continue
+                p = difference_metrics(plus, base); m = difference_metrics(minus, base); central = difference_metrics(plus, minus)
+                central_step = float(2.0 * alpha); d = None if central["rms"] is None else central["rms"] / central_step
+                alpha_rows.append({"space": space, "precision": precision, "direction_id": "v0", "alpha": float(alpha), "plus_response_rms": p["rms"], "minus_response_rms": m["rms"], "baseline_floor_rms": floor["rms"], "central_difference_rms": d, "status": "N/A" if p["rms"] is None or m["rms"] is None else "OK"})
+            space_rows.extend(alpha_rows)
+    # Native-vs-FP32 RGB and direct-float-vs-uint8 condition latent contrasts.
+    for logical in sorted(set(source_records["native_bf16"]) & set(source_records["temporary_fp32"])):
+        n = source_records["native_bf16"][logical]; f = source_records["temporary_fp32"][logical]
+        if "decoded_final_float32" in n and "decoded_final_float32" in f:
+            metric = difference_metrics(n["decoded_final_float32"], f["decoded_final_float32"]); space_rows.append({"space": "native_vs_fp32_rgb", "sample_id": logical, **metric})
+        if "direct_condition_latent_float32" in n and "uint8_condition_latent_float32" in n:
+            metric = difference_metrics(n["direct_condition_latent_float32"], n["uint8_condition_latent_float32"]); space_rows.append({"space": "direct_vs_uint8_condition_latent", "sample_id": logical, **metric})
+    return {"status": "COMPLETE", "metrics": rows, "space_metrics": space_rows, "decoder_calls": 16, "decoder_manifest_sha256": decoder_manifest_sha,
             "reason": "8 selected latents decoded serially at native BF16 and temporary FP32"}
+
+
+def _verify_decoder_manifest_for_analysis(root: Path) -> str:
+    path = root / "MANIFEST.sha256"
+    if not path.is_file(): raise ValueError("decoder manifest is missing")
+    seen = {}
+    for line in path.read_text(encoding="ascii").splitlines():
+        parts = line.split("  ", 1)
+        if len(parts) != 2 or parts[1] in seen: raise ValueError("malformed decoder manifest")
+        target = root / parts[1]
+        if not target.is_file() or sha256_file(target) != parts[0]: raise ValueError(f"decoder artifact mismatch: {parts[1]}")
+        seen[parts[1]] = parts[0]
+    actual = {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file() and p.name not in {"MANIFEST.sha256", ".decoder.lock", "status.json"}}
+    if set(seen) != actual: raise ValueError("decoder manifest inventory mismatch")
+    return sha256_file(path)
 
 
 def _png(path: Path, series: list[tuple[float, float]], title: str) -> None:
@@ -281,19 +348,20 @@ def _report(result: Mapping[str, Any], decoder: Mapping[str, Any]) -> str:
 
 
 def _write_manifest(root: Path) -> Path:
-    entries = _manifest_entries(root)
+    entries = _manifest_entries(root, include_bundle=True)
     _atomic_text(root / "MANIFEST.sha256", "".join(f"{digest}  {name}\n" for name, digest in sorted(entries.items())))
     return root / "MANIFEST.sha256"
 
 
-def _package_valid(root: Path, raw_manifest_sha: str) -> bool:
+def _package_valid(root: Path, raw_manifest_sha: str, decoder_manifest_sha: str | None = None) -> bool:
     marker = root / "analysis_provenance.json"
     manifest = root / "MANIFEST.sha256"
     if not marker.is_file() or not manifest.is_file(): return False
     try:
         value = json.loads(marker.read_text(encoding="utf-8"))
         verify_analysis_manifest(root)
-        return value.get("raw_manifest_sha256") == raw_manifest_sha
+        return (value.get("raw_manifest_sha256") == raw_manifest_sha and value.get("decoder_manifest_sha256") == decoder_manifest_sha
+                and value.get("analysis_code_sha256") == sha256_file(Path(__file__)))
     except Exception: return False
 
 
@@ -305,11 +373,11 @@ def verify_analysis_manifest(root: str | Path) -> dict[str, Any]:
         parts = line.split("  ", 1)
         if len(parts) != 2 or len(parts[0]) != 64 or parts[1] in entries: raise ValueError("malformed analysis manifest")
         relative = Path(parts[1])
-        if relative.is_absolute() or ".." in relative.parts or relative.name in {"MANIFEST.sha256", "review_bundle.zip"}: raise ValueError("unsafe analysis manifest entry")
+        if relative.is_absolute() or ".." in relative.parts or relative.name == "MANIFEST.sha256": raise ValueError("unsafe analysis manifest entry")
         target = root / relative
         if not target.is_file() or sha256_file(target) != parts[0]: raise ValueError(f"analysis artifact mismatch: {parts[1]}")
         entries[parts[1]] = parts[0]
-    if entries != _manifest_entries(root): raise ValueError("analysis manifest inventory mismatch")
+    if entries != _manifest_entries(root, include_bundle=True): raise ValueError("analysis manifest inventory mismatch")
     return {"sha256": sha256_file(manifest), "entries": entries}
 
 
@@ -317,8 +385,13 @@ def write_task6_artifacts(result: Mapping[str, Any], output_dir: str | Path, *, 
                           decoder: Mapping[str, Any] | None = None, source_dir: str | Path | None = None) -> dict[str, Any]:
     output = Path(output_dir)
     raw = Path(raw_root) if raw_root is not None else None
+    if raw is not None:
+        try: output.resolve().relative_to(raw.resolve())
+        except ValueError: pass
+        else: raise ValueError("analysis output must be outside immutable raw run")
     raw_snapshot = verify_raw_manifest(raw) if raw is not None else {"sha256": None, "entries": {}}
-    if output.exists() and _package_valid(output, raw_snapshot["sha256"]):
+    decoder_manifest_sha = (decoder or {}).get("decoder_manifest_sha256") if decoder else None
+    if output.exists() and _package_valid(output, raw_snapshot["sha256"], decoder_manifest_sha):
         return {"output_dir": str(output), "manifest": str(output / "MANIFEST.sha256"), "idempotent": True}
     if output.exists() and any(output.iterdir()): raise FileExistsError("analysis output exists but is stale or tampered")
     parent = output.parent; parent.mkdir(parents=True, exist_ok=True)
@@ -327,14 +400,37 @@ def write_task6_artifacts(result: Mapping[str, Any], output_dir: str | Path, *, 
         (stage / "figures").mkdir(); (stage / "analysis_tensors").mkdir()
         tensors = result.get("tensors", {})
         for name, value in tensors.items(): np.save(stage / "analysis_tensors" / Path(name).name, np.asarray(value, dtype=np.float32), allow_pickle=False)
-        _rows_csv(stage / "point_metrics.csv", result.get("points", [])); _rows_csv(stage / "difference_metrics.csv", result.get("derivatives", [])); _rows_csv(stage / "fit_metrics.csv", result.get("fits", [])); _rows_csv(stage / "window_decisions.csv", result.get("fits", []) + result.get("image_fits", [])); _rows_csv(stage / "additivity_metrics.csv", result.get("additivity", [])); _rows_csv(stage / "prediction_metrics.csv", result.get("predictions", [])); _rows_csv(stage / "failure_amplitudes.csv", [{"direction_id": row.get("direction_id"), "alpha": row.get("alpha"), "status": row.get("candidate_status"), "failure_reasons": row.get("failure_reasons", "")} for row in result.get("fits", [])]); _rows_csv(stage / "decoder_metrics.csv", (decoder or {}).get("metrics", [])); _rows_csv(stage / "decoder_roundtrip_metrics.csv", (decoder or {}).get("metrics", []))
+        _rows_csv(stage / "point_metrics.csv", result.get("points", [])); _rows_csv(stage / "difference_metrics.csv", result.get("derivatives", [])); _rows_csv(stage / "fit_metrics.csv", result.get("fits", [])); _rows_csv(stage / "window_decisions.csv", result.get("fits", []) + result.get("image_fits", [])); _rows_csv(stage / "additivity_metrics.csv", result.get("additivity", [])); _rows_csv(stage / "prediction_metrics.csv", result.get("predictions", [])); _rows_csv(stage / "failure_amplitudes.csv", [{"direction_id": row.get("direction_id"), "alpha": row.get("alpha"), "status": row.get("candidate_status"), "failure_reasons": row.get("failure_reasons", "")} for row in result.get("fits", [])]); _rows_csv(stage / "decoder_metrics.csv", (decoder or {}).get("metrics", [])); _rows_csv(stage / "decoder_roundtrip_metrics.csv", (decoder or {}).get("metrics", [])); _rows_csv(stage / "decoder_space_metrics.csv", (decoder or {}).get("space_metrics", [])); _rows_csv(stage / "roundtrip_metrics.csv", [row for row in (decoder or {}).get("space_metrics", []) if "roundtrip" in str(row.get("space", ""))]); _rows_csv(stage / "pairwise_precision_metrics.csv", [row for row in (decoder or {}).get("space_metrics", []) if "vs_" in str(row.get("space", ""))]); _rows_csv(stage / "cross_group_status.csv", result.get("cross_group_status", summarize_cross_groups({})))
         _json(stage / "task6_summary.json", {key: value for key, value in result.items() if key != "tensors"}); _json(stage / "decoder_summary.json", decoder or {"status": "NOT_RUN"})
-        provenance = {"schema_version": "umi-task6-analysis-v1", "raw_manifest_sha256": raw_snapshot["sha256"], "raw_root": str(raw) if raw else None}
+        source_hash = sha256_file(Path(__file__))
+        provenance = {"schema_version": "umi-task6-analysis-v1", "raw_manifest_sha256": raw_snapshot["sha256"], "decoder_manifest_sha256": decoder_manifest_sha, "analysis_code_sha256": source_hash, "raw_root": str(raw) if raw else None}
         _json(stage / "analysis_provenance.json", provenance); _json(stage / "provenance.json", provenance); _json(stage / "config.json", {"alphas": list(ALPHAS), "directions": list(DIRECTION_IDS), "spaces": ["prediction_latent", "native_rgb", "fp32_rgb", "float_roundtrip_condition_latent", "uint8_simulated_roundtrip_condition_latent"]})
-        _atomic_text(stage / "math_note.md", _math_note()); _atomic_text(stage / "experiment_report.md", _report(result, decoder or {"status": "NOT_RUN"})); _atomic_text(stage / "resource_report.md", "# Resource report\n\nResource evidence remains in the immutable raw run directory.\n")
+        _atomic_text(stage / "math_note.md", _math_note()); _atomic_text(stage / "experiment_report.md", _report(result, decoder or {"status": "NOT_RUN"}))
+        resource_lines = ["# Resource report", ""]
+        if raw is not None:
+            status_path = raw / "run_status.json"
+            if status_path.is_file():
+                raw_status = json.loads(status_path.read_text(encoding="utf-8")); resource_lines += [f"- terminal status: `{raw_status.get('status')}`", f"- completed samples: {len(raw_status.get('completed_samples', []))}"]
+            for filename in ("gpu_samples.csv", "ram_samples.csv", "disk_samples.csv"):
+                path = raw / filename
+                if path.is_file():
+                    with path.open(encoding="utf-8", newline="") as stream:
+                        rows = list(csv.DictReader(stream))
+                    numeric: dict[str, list[float]] = {}
+                    for item in rows:
+                        for key, value in item.items():
+                            try: numeric.setdefault(key, []).append(float(value))
+                            except (TypeError, ValueError): pass
+                    summary = "; ".join(f"{key}=[{min(values):.3g},{max(values):.3g}]" for key, values in sorted(numeric.items()) if values and key not in {"timestamp", "time"})
+                    resource_lines.append(f"- {filename}: {len(rows)} samples" + (f"; {summary}" if summary else ""))
+        if len(resource_lines) == 2: resource_lines.append("- resource CSVs were not available")
+        _atomic_text(stage / "resource_report.md", "\n".join(resource_lines) + "\n")
         # A compact response chart; all raw tensors remain outside the zip.
         values = [(float(row.get("alpha", i)), float(row.get("response_rms", 0.0) or 0.0)) for i, row in enumerate(result.get("points", [])) if row.get("response_rms") is not None]
-        _svg(stage / "figures" / "response.svg", values, "Task 6 response", "RMS response"); _png(stage / "figures" / "response.png", values, "Task 6 response")
+        charts = [("response", "Task 6 response", "RMS response"), ("additivity", "Task 6 additivity", "relative error"), ("holdout", "Task 6 holdout prediction", "relative error"), ("decoder_precision", "Decoder native vs FP32", "RMS"), ("roundtrip_quantization", "Float vs uint8 round trip", "RMS")]
+        for stem, title, ylabel in charts:
+            chart_values = values if stem == "response" else [(float(i), float(row.get("relative_error", row.get("rms", 0.0)) or 0.0)) for i, row in enumerate((result.get("additivity", []) if stem == "additivity" else result.get("predictions", []) if stem == "holdout" else (decoder or {}).get("space_metrics", [])))][:64]
+            _svg(stage / "figures" / f"{stem}.svg", chart_values, title, ylabel); _png(stage / "figures" / f"{stem}.png", chart_values, title)
         if source_dir is not None:
             source = Path(source_dir)
             for name in ("umi_task6_decoder.py", "analyze_umi_task6.py"):
@@ -359,12 +455,15 @@ def analyze_task6_run(run_dir: str | Path, output_dir: str | Path | None = None)
     root = Path(run_dir).resolve(); status_path = root / "run_status.json"
     if not status_path.is_file(): raise ValueError("Task 6 run_status.json is missing")
     status = json.loads(status_path.read_text(encoding="utf-8"))
-    if (root / "MANIFEST.sha256").is_file(): verify_raw_manifest(root)
+    if status.get("status") not in {"AWAITING_REVIEW", "COMPLETE"} or len(status.get("completed_samples", [])) != 32:
+        raise ValueError("public Task 6 analysis rejects stopped or partial raw runs")
+    raw_manifest = verify_raw_manifest(root)
     records = _load_records(root)
     result = analyze_task6_records(records, group=status.get("group"), plan_detail=status.get("plan_detail"))
     decoder = analyze_decoder_replays(root)
-    destination = Path(output_dir) if output_dir is not None else root / "task6_analysis"
+    destination = Path(output_dir) if output_dir is not None else root.parent / (root.name + "_analysis")
     published = write_task6_artifacts(result, destination, raw_root=root, decoder=decoder, source_dir=Path(__file__).parent)
+    if verify_raw_manifest(root)["sha256"] != raw_manifest["sha256"]: raise ValueError("raw evidence changed during analysis")
     return {"status": result.get("status"), "decoder_status": decoder.get("status"), **published}
 
 
