@@ -426,8 +426,12 @@ def run_task6_decoder_replays(runtime: Any, run_root: str | Path, *, state: str 
 
     with monitor_lifecycle(), ProcessLock(root / ".decoder.lock"):
         if monitor is not None and callable(getattr(monitor, "start", None)):
+            # A monitor may create a worker and then raise while publishing its
+            # initial sample. Mark it started before invocation so the outer
+            # lifecycle guard always joins and flushes it.
+            monitor_started = True
             try:
-                monitor.start(); monitor_started = True
+                monitor.start()
             except BaseException as error:
                 return canonical_resource_stop("MONITOR_FAILURE", str(error))
         _atomic_json(status_path, summary)

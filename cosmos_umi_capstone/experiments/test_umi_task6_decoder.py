@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import hashlib
 import json
 import tempfile
+import threading
 from unittest import mock
 from pathlib import Path
 
@@ -111,6 +112,25 @@ class DecoderTests(unittest.TestCase):
             raw_status = raw / "run_status.json"; raw_status.write_text('{"status":"AWAITING_REVIEW","completed_samples":' + json.dumps([item["sample_id"] for item in api.build_generation_plan()]) + ',"group":{"state":"bridge_0","seed":0},"decoder_status":"RESOURCE_STOP"}')
             manifest_sha, status = api._verify_raw_task6(raw)
             self.assertTrue(manifest_sha); self.assertEqual(len(status["completed_samples"]), 32)
+
+    def test_monitor_start_failure_after_worker_creation_is_joined_and_flushed(self):
+        class Runtime:
+            def actual_identity(self): return {"model_state": "runtime-v1", "decoder_state": "bf16"}
+        class Encoder:
+            def identity(self): return {"encoder_state": "encoder-v1", "weights_sha256": "a" * 64}
+            def __call__(self, frame): return np.asarray(frame, np.float32)
+        class HalfStartedMonitor:
+            def __init__(self): self.started = False; self.stopped = False; self.event = threading.Event(); self.thread = None
+            def start(self):
+                self.thread = threading.Thread(target=self.event.wait); self.thread.start(); self.started = True
+                raise RuntimeError("initial telemetry failed")
+            def stop(self): self.event.set(); self.thread.join(timeout=2); self.stopped = True
+        with tempfile.TemporaryDirectory() as temporary:
+            raw = Path(temporary) / "raw"; self._raw(raw); monitor = HalfStartedMonitor()
+            result = api.run_task6_decoder_replays(Runtime(), raw, encoder=Encoder(),
+                decoder_root=Path(temporary) / "decoder", monitor=monitor)
+            self.assertEqual(result["status"], "RESOURCE_STOP")
+            self.assertTrue(monitor.started and monitor.stopped and not monitor.thread.is_alive())
 
     def test_encoder_is_mandatory(self):
         with tempfile.TemporaryDirectory() as temporary:

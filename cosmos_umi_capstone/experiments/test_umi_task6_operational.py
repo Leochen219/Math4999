@@ -100,6 +100,12 @@ class OperationalTask6Tests(unittest.TestCase):
         self.assertEqual(scan.resolved_sample_fps(type("Args", (), {})()), 20)
         self.assertEqual(scan.resolved_sample_fps(type("Args", (), {"fps": 5})()), 5)
 
+    def test_loader_rejects_resolved_sample_fps_other_than_bridge_contract(self):
+        import umi_task6_cosmos_loader as loader
+        self.assertEqual(loader.resolve_bridge_fps(type("Sample", (), {"fps": 5})()), 5)
+        with self.assertRaises(ValueError):
+            loader.resolve_bridge_fps(type("Sample", (), {"fps": 20})())
+
     def test_official_preflight_failure_publishes_canonical_status(self):
         import run_umi_task6_official as official
         import run_umi_task6_experiment as runner
@@ -196,11 +202,14 @@ class OperationalTask6Tests(unittest.TestCase):
                 self.cache["active"] = 1
                 return value.float()
         encoder = Encoder(); adapter = loader.ConditionEncoderAdapter(encoder, device="cpu")
-        frame = np.full((3, 8, 8), 0.25, np.float32)
+        frame = np.array([np.zeros((8, 8)), np.full((8, 8), 0.5), np.ones((8, 8))], np.float32)
         result = adapter(frame)
         self.assertEqual(tuple(result.shape), (1, 3, 1, 8, 8))
         self.assertEqual(str(result.dtype), "torch.float32")
         self.assertEqual(tuple(encoder.calls[0].shape), (1, 3, 1, 8, 8))
+        self.assertEqual(float(encoder.calls[0].min()), -1.0)
+        self.assertEqual(float(encoder.calls[0].max()), 1.0)
+        self.assertEqual(float(encoder.calls[0][0, 1, 0, 0, 0]), 0.0)
         self.assertEqual(encoder.cache, {})
         adapter.reset_cache()
         self.assertEqual(encoder.cache, {})

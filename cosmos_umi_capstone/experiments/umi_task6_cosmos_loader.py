@@ -116,6 +116,10 @@ class ConditionEncoderAdapter:
         if array.shape[0] not in (1, 3) or not np.all(np.isfinite(array)) or np.min(array) < 0 or np.max(array) > 1:
             raise ValueError("condition frame must be finite [0,1] CHW")
         value = torch.from_numpy(np.ascontiguousarray(array)).to(device=self.device, dtype=torch.float32)[None, :, None, :, :]
+        # Cosmos normalizes RGB immediately before VAE encoding. Keep report
+        # inputs in [0,1], but prove the actual encoder boundary receives the
+        # corresponding [-1,1] tensor.
+        value = value.mul(2.0).sub(1.0)
         self.reset_cache()
         primary_error = None
         try:
@@ -185,6 +189,17 @@ def _framework_commit(framework: Path) -> str:
     return head
 
 
+def resolve_bridge_fps(sample_args: Any) -> int:
+    """Validate the fps resolved by OmniSampleOverrides, not a literal."""
+    try:
+        value = int(getattr(sample_args, "fps"))
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError("resolved official sample args do not expose fps") from error
+    if value != 5:
+        raise ValueError(f"Bridge sample fps must resolve to 5, got {value}")
+    return value
+
+
 def load_task6_cosmos_runtime(*, framework_root: str, checkpoint: str, vae: str, device: str,
                               model_seed: int, prompt: str, action: Any, video: str | None = None,
                               contract: dict[str, Any] | None = None, run_dir: str | Path | None = None,
@@ -219,12 +234,14 @@ def load_task6_cosmos_runtime(*, framework_root: str, checkpoint: str, vae: str,
         os.replace(temporary, action_path)
     args.action_path = str(action_path)
     post_adapter = load_official_runtime(args, setup_dir)
-    data_batch, _ = load_official_data_batch(post_adapter, args, setup_dir)
+    data_batch, sample_args = load_official_data_batch(post_adapter, args, setup_dir)
+    resolved_fps = resolve_bridge_fps(sample_args)
     ops = TorchOps()
     provenance = {"framework_root": str(framework), "framework_commit": _framework_commit(framework), "checkpoint_path": str(Path(checkpoint).resolve()),
         "vae_path": str(Path(vae).resolve()), "sampler": "unipc", "precision": "bfloat16",
         "asset_source_commit": "2b17a2413bd86b2cf9b03823637108851e4ddf2d",
-        "diffusion_cache_requested": False, "diffusion_cache_installed": False, "seed": 0, "prompt": prompt}
+        "diffusion_cache_requested": False, "diffusion_cache_installed": False, "seed": 0, "prompt": prompt,
+        "fps": resolved_fps}
     runtime_model = post_adapter.model
     # The verified UMI VAE path owns both encode/decode on tokenizer_vision_gen;
     # bind that object first so round-trip conditions use the same artifact as
@@ -233,8 +250,8 @@ def load_task6_cosmos_runtime(*, framework_root: str, checkpoint: str, vae: str,
     condition_encoder = getattr(runtime_model, "tokenizer_vision_gen", None)
     if condition_encoder is None:
         condition_encoder = getattr(runtime_model, "tokenizer_vision", None)
-    runtime = {"model": runtime_model, "data_batch": data_batch, "ops": ops,
-        "fps": 5,
+    runtime = {"model": runtime_model, "data_batch": data_batch,
+        "fps": resolved_fps,
         "generation_settings": {"num_steps": 30, "guidance": 1.0, "shift": 10.0},
         "artifact_paths": {"checkpoint": str(Path(checkpoint).resolve()), "decoder": str(Path(vae).resolve())},
         "provenance": {**provenance, "condition_encoder": "tokenizer_vision_gen" if getattr(runtime_model, "tokenizer_vision_gen", None) is not None else "tokenizer_vision"},
@@ -252,4 +269,4 @@ def load_task6_cosmos_runtime(*, framework_root: str, checkpoint: str, vae: str,
     return runtime
 
 
-__all__ = ["ConditionEncoderAdapter", "build_loader_args", "load_task6_cosmos_runtime"]
+__all__ = ["ConditionEncoderAdapter", "build_loader_args", "load_task6_cosmos_runtime", "resolve_bridge_fps"]
