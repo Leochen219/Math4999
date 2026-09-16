@@ -41,6 +41,12 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual(len(result["additivity"]), 6)
         self.assertEqual(len(result["predictions"]), 24)
 
+    def test_plan_detail_is_derived_from_nontrivial_saved_directions(self):
+        records, frozen = _linear_records()
+        detail = api._derive_plan_detail(api._normalize_records(records))
+        self.assertAlmostEqual(detail["combination_coefficients"]["c01"], frozen["c01"])
+        self.assertAlmostEqual(detail["combination_coefficients"]["c12"], frozen["c12"])
+
     def test_missing_and_stopped_are_not_reported_as_scientific_failures(self):
         result = api.analyze_task6_records({"baseline_pre": {}}, strict=False)
         self.assertEqual(result["status"], "INCOMPLETE")

@@ -65,3 +65,31 @@ does not claim scientific results without a completed pilot; missing/stopped
 groups are reported as incomplete/not-run evidence. The controller should
 independently review the Task 5 delegation against the official runtime before
 remote execution.
+
+## Review round 2 hardening
+
+The implementation now derives `s_z` and `c01/c12` from saved `z_bar`, mask,
+and frozen direction tensors rather than defaulting scientific values. Task 6
+residuals, responses, finite differences, additivity, and holdout predictions
+use explicit FP32 subtraction and FP64 reductions; Task 5 source is unchanged.
+Decoder inputs validate the completed 32-sample raw status and raw manifest,
+and the derived decoder root binds raw manifest, group, runtime, encoder, plan,
+config, and artifact hashes. Status and config are refreshed into the decoder
+manifest after every published replay, allowing strict partial resume without
+overwriting successes.
+
+Additional verification:
+
+```text
+python -m unittest discover -s cosmos_umi_capstone/experiments -p 'test_umi_task6_decoder.py' -v
+Ran 8 tests ... OK
+python -m unittest discover -s cosmos_umi_capstone/experiments -p 'test_analyze_umi_task6.py' -v
+Ran 9 tests ... OK
+python -m py_compile cosmos_umi_capstone/experiments/umi_task6_decoder.py cosmos_umi_capstone/experiments/analyze_umi_task6.py
+git diff --check
+```
+
+The public analysis path rejects stopped/partial generation runs and missing,
+invalid, or unbound decoder evidence. Packages bind raw and decoder manifests,
+fixed configuration, and hashes of relevant Task 6/5 runtime sources. No
+remote execution or Task 4 work was performed.

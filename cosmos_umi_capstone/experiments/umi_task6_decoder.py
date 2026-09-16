@@ -120,9 +120,15 @@ def reencode_frame(frame: Any, encoder: Any, *, quantize: bool = False) -> dict[
     """Re-encode a saved float RGB frame directly or after uint8 simulation."""
     original = np.asarray(frame, dtype=np.float32).copy()
     input_frame = simulate_uint8(original) if quantize else original
+    before = _encoder_identity(encoder)
+    reset = getattr(encoder, "reset_cache", None) or getattr(encoder, "clear_cache", None)
+    if callable(reset): reset()
     latent = _call_encoder(encoder, input_frame)
+    if callable(reset): reset()
+    after = _encoder_identity(encoder)
+    if before != after: raise EvidenceError("condition encoder state was not restored")
     return {"input_float32": original, "input_after_uint8_simulation": input_frame,
-            "condition_latent_float32": latent, "quantized": bool(quantize)}
+            "condition_latent_float32": latent, "quantized": bool(quantize), "encoder_identity_before": before, "encoder_identity_after": after}
 
 
 def _decode(runtime: Any, latent: np.ndarray, precision: str) -> tuple[Any, Callable[[], None] | None]:
@@ -152,17 +158,17 @@ def replay_one(runtime: Any, latent: Any, *, precision: str) -> dict[str, Any]:
     before = _decoder_identity(runtime)
     cleanup = getattr(runtime, "restore_decoder_state", None)
     started = time.perf_counter()
+    result = None; primary = None; restore_error = None
     try:
         decoded, _ = _decode(runtime, np.asarray(latent, dtype=np.float32), precision)
         output = np.asarray(decoded, dtype=np.float32).copy()
         if not output.size or not np.all(np.isfinite(output)):
             raise EvidenceError("decoder output is nonfinite or empty")
-        after = _decoder_identity(runtime)
-        if before is not None and after is not None and before != after:
-            raise EvidenceError("decoder state identity changed during replay")
-        return {"status": "success", "precision": precision, "elapsed_seconds": time.perf_counter() - started,
+        result = {"status": "success", "precision": precision, "elapsed_seconds": time.perf_counter() - started,
                 "decoded_full_float32": output, "decoded_final_float32": _final_frame(output),
-                "decoder_state_before": before, "decoder_state_after": after}
+                "decoder_state_before": before}
+    except BaseException as error:
+        primary = error
     finally:
         try:
             if callable(cleanup):
@@ -170,10 +176,18 @@ def replay_one(runtime: Any, latent: Any, *, precision: str) -> dict[str, Any]:
             else:
                 clear = getattr(runtime, "clear_decoder_cache", None)
                 if callable(clear): clear()
-        except Exception:
-            # Restoration failures must be visible to the caller, including
-            # when the decode itself raised.  Never silently continue.
-            raise
+        except BaseException as error:
+            restore_error = error
+    after = _decoder_identity(runtime)
+    if before is not None and after is not None and before != after:
+        restore_error = EvidenceError("decoder state identity was not restored")
+    if primary is not None:
+        if restore_error is not None: setattr(primary, "restoration_error", restore_error)
+        raise primary
+    if restore_error is not None: raise restore_error
+    assert result is not None
+    result["decoder_state_after"] = after
+    return result
 
 
 def _decoder_identity(runtime: Any) -> Any:
@@ -210,10 +224,28 @@ def _load_sample(root: Path, sample_id: str) -> tuple[np.ndarray, dict[str, Any]
     return np.load(sample / "output_full.npy", allow_pickle=False).astype(np.float32, copy=True), json.loads((sample / "sample.json").read_text(encoding="utf-8"))
 
 
+def _verify_raw_task6(root: Path) -> tuple[str, Mapping[str, Any]]:
+    status_path = root / "run_status.json"
+    if not status_path.is_file(): raise EvidenceError("Task 6 raw status is missing")
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    if status.get("status") not in {"AWAITING_REVIEW", "COMPLETE"} or len(status.get("completed_samples", [])) != 32:
+        raise EvidenceError("decoder requires a completed 32-sample Task 6 raw run")
+    manifest = root / "MANIFEST.sha256"
+    if not manifest.is_file(): raise EvidenceError("Task 6 raw manifest is missing")
+    mutable = {"run_status.json", "invocation_history.jsonl", "gpu_samples.csv", "ram_samples.csv", "disk_samples.csv", "sample_resource_snapshots.csv", "sample_resource_snapshots.jsonl"}
+    for line in manifest.read_text(encoding="ascii").splitlines():
+        parts = line.split(None, 1)
+        if len(parts) != 2: raise EvidenceError("malformed raw manifest")
+        target = root / parts[1].strip()
+        if target.name in mutable: continue
+        if not target.is_file() or sha256_file(target) != parts[0]: raise EvidenceError(f"raw manifest mismatch: {parts[1]}")
+    return sha256_file(manifest), status
+
+
 def _decoder_manifest(root: Path) -> Path:
     entries = []
     for path in sorted(root.rglob("*")):
-        if path.is_file() and path.name not in {"MANIFEST.sha256", ".decoder.lock", "status.json"}:
+        if path.is_file() and path.name not in {"MANIFEST.sha256", ".decoder.lock"}:
             entries.append(f"{sha256_file(path)}  {path.relative_to(root).as_posix()}\n")
     path = root / "MANIFEST.sha256"; _atomic_text(path, "".join(entries)); return path
 
@@ -228,7 +260,7 @@ def _verify_decoder_manifest(root: Path) -> str:
             raise EvidenceError("malformed decoder manifest")
         seen.add(parts[1]); target = root / relative
         if not target.is_file() or sha256_file(target) != parts[0]: raise EvidenceError(f"decoder manifest mismatch: {parts[1]}")
-    actual = {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file() and p.name not in {"MANIFEST.sha256", ".decoder.lock", "status.json"}}
+    actual = {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file() and p.name not in {"MANIFEST.sha256", ".decoder.lock"}}
     if actual != seen: raise EvidenceError("decoder manifest inventory mismatch")
     return sha256_file(path)
 
@@ -239,11 +271,13 @@ def run_task6_decoder_replays(runtime: Any, run_root: str | Path, *, state: str 
     """Run exactly 16 serial replays in a derived tree, never in raw_root."""
     raw_root = Path(run_root).resolve()
     if encoder is None: raise EvidenceError("Task 6 decoder requires a condition encoder")
+    raw_manifest_sha, raw_status = _verify_raw_task6(raw_root)
     root = Path(decoder_root).resolve() if decoder_root is not None else raw_root.parent / (raw_root.name + "_decoder")
     root.mkdir(parents=True, exist_ok=True)
     plan = decoder_replay_plan(state, seed); status_path = root / "status.json"
     config = {"schema_version": "umi-task6-decoder-v2", "state": state, "seed": seed, "plan": plan,
-              "runtime_identity": _decoder_identity(runtime), "encoder_identity": _encoder_identity(encoder),
+              "runtime_identity": _decoder_identity(runtime), "encoder_identity": _encoder_identity(encoder), "raw_manifest_sha256": raw_manifest_sha,
+              "raw_group": raw_status.get("group"),
               "source": str(Path(__file__).resolve())}
     config_text = json.dumps(config, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
     config_path = root / "decoder_config.json"
@@ -257,13 +291,15 @@ def run_task6_decoder_replays(runtime: Any, run_root: str | Path, *, state: str 
                "selected_latents": 8, "failures": 0, "records": [], "config_sha256": sha256_file(config_path)}
     with ProcessLock(root / ".decoder.lock"):
         _atomic_json(status_path, summary)
+        _decoder_manifest(root)
         for spec in plan:
             replay_dir = root / spec["replay_id"]
             if replay_dir.is_dir() and resume and (replay_dir / "record.json").is_file():
                 record = json.loads((replay_dir / "record.json").read_text(encoding="utf-8"))
+                if record.get("config_sha256") != sha256_file(config_path): raise EvidenceError("decoder success config binding mismatch")
                 for name, digest in record.get("artifact_sha256", {}).items():
                     if not (replay_dir / name).is_file() or sha256_file(replay_dir / name) != digest: raise EvidenceError("successful decoder artifact was tampered")
-                summary["records"].append(spec["replay_id"]); continue
+                summary["records"].append(spec["replay_id"]); _atomic_json(status_path, summary); _decoder_manifest(root); continue
             if replay_dir.exists():
                 attempt = 1
                 while (root / f"{spec['replay_id']}.attempt.{attempt}").exists(): attempt += 1
@@ -283,13 +319,13 @@ def run_task6_decoder_replays(runtime: Any, run_root: str | Path, *, state: str 
                 metadata.update({"status": "success", "spec": spec, "source_sample": source_meta, "config_sha256": sha256_file(config_path),
                                  "artifact_sha256": {name: sha256_file(stage / name) for name in arrays}})
                 _atomic_json(stage / "record.json", metadata); os.replace(stage, replay_dir); stage = None
-                summary["decoder_calls"] += 1; summary["records"].append(spec["replay_id"])
+                summary["decoder_calls"] += 1; summary["records"].append(spec["replay_id"]); _atomic_json(status_path, summary); _decoder_manifest(root)
             except Exception as error:
-                summary["failures"] += 1; summary.update({"status": "BLOCKED", "error": {"type": type(error).__name__, "message": str(error)}}); _atomic_json(status_path, summary); return summary
+                summary["failures"] += 1; summary.update({"status": "BLOCKED", "error": {"type": type(error).__name__, "message": str(error)}}); _atomic_json(status_path, summary); _decoder_manifest(root); return summary
             finally:
                 if stage is not None and stage.exists():
                     import shutil; shutil.rmtree(stage, ignore_errors=True)
-            _atomic_json(status_path, summary)
+            _atomic_json(status_path, summary); _decoder_manifest(root)
         summary.update({"status": "COMPLETE", "decoder_calls": 16}); _atomic_json(status_path, summary); _decoder_manifest(root); return summary
 
 

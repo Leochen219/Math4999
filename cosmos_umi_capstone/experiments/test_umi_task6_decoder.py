@@ -21,6 +21,12 @@ class DecoderTests(unittest.TestCase):
             digest = hashlib.sha256((sample / "output_full.npy").read_bytes()).hexdigest()
             (sample / "sample.json").write_text(json.dumps({"sample_id": sample_id}), encoding="utf-8")
             (sample / "status.json").write_text(json.dumps({"status": "success", "artifact_sha256": {"output_full.npy": digest}}), encoding="utf-8")
+        completed = [f"sample_{i:02d}" for i in range(32)]
+        (root / "run_status.json").write_text(json.dumps({"status": "AWAITING_REVIEW", "completed_samples": completed, "group": {"state": "bridge_0", "seed": 0}}), encoding="utf-8")
+        entries = []
+        for path in sorted(root.rglob("*")):
+            if path.is_file() and path.name != "MANIFEST.sha256": entries.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.relative_to(root).as_posix()}\n")
+        (root / "MANIFEST.sha256").write_text("".join(entries), encoding="ascii")
 
     def test_exactly_eight_latents_and_sixteen_serial_replays(self):
         logical = api.select_decoder_latents()
@@ -55,6 +61,16 @@ class DecoderTests(unittest.TestCase):
         result = api.replay_one(Runtime(), np.zeros((2,)), precision="native_bf16")
         self.assertEqual(result["decoded_final_float32"].shape, (3, 4, 4))
         self.assertEqual(result["decoded_full_float32"].dtype, np.float32)
+
+    def test_temporary_precision_state_is_restored_after_success(self):
+        class Runtime:
+            decoder_state = "bf16"
+            def decode_prediction_latent(self, latent, *, precision):
+                self.decoder_state = "fp32" if precision == "temporary_fp32" else "bf16"
+                return np.zeros((3, 2, 2, 2), np.float32)
+            def restore_decoder_state(self): self.decoder_state = "bf16"
+        runtime = Runtime(); result = api.replay_one(runtime, np.zeros((2,)), precision="temporary_fp32")
+        self.assertEqual(runtime.decoder_state, "bf16"); self.assertEqual(result["decoder_state_after"], "bf16")
 
     def test_end_to_end_is_serial_and_does_not_mutate_raw_tree(self):
         class Runtime:
