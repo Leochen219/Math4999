@@ -6,15 +6,189 @@ it is intentionally not a second implementation of model construction.
 from __future__ import annotations
 
 import gc
+import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
+
+
+def _content_identity(value: Any) -> dict[str, Any]:
+    """Return a non-class-only identity for a loaded encoder."""
+    method = getattr(value, "actual_identity", None) or getattr(value, "content_identity", None)
+    if callable(method):
+        observed = method()
+        if not isinstance(observed, dict) or not observed:
+            raise ValueError("condition encoder identity must contain content evidence")
+        return {"type": f"{type(value).__module__}.{type(value).__qualname__}", "content": observed}
+    if hasattr(value, "state_dict") or hasattr(value, "named_parameters"):
+        try:
+            from .umi_precision_identity import fingerprint
+        except ImportError:  # pragma: no cover
+            from umi_precision_identity import fingerprint
+        return {"type": f"{type(value).__module__}.{type(value).__qualname__}", "fingerprint": fingerprint(value)}
+    attrs = getattr(value, "__dict__", None)
+    if not isinstance(attrs, dict) or not attrs:
+        raise ValueError("condition encoder does not expose a content identity")
+    try:
+        from .umi_precision_identity import fingerprint
+    except ImportError:  # pragma: no cover
+        from umi_precision_identity import fingerprint
+    return {"type": f"{type(value).__module__}.{type(value).__qualname__}", "fingerprint": fingerprint(value)}
+
+
+class ConditionEncoderAdapter:
+    """Strict VAE-condition encoder seam used by decoder round trips.
+
+    The official UMI encoder consumes a batched five-dimensional video tensor;
+    callers of the decoder store a single CHW float32 frame.  This adapter is
+    the only conversion boundary and clears encoder caches for every request.
+    """
+    def __init__(self, encoder: Any, *, device: str = "cuda"):
+        if encoder is None:
+            raise ValueError("official model has no tokenizer_vision encoder")
+        self.encoder = encoder
+        self.device = str(device)
+        self._identity = _content_identity(encoder)
+        if not any(callable(getattr(encoder, name, None)) for name in ("encode", "encode_image", "__call__")):
+            raise ValueError("condition encoder must expose encode/encode_image/call")
+        self.reset_cache()
+
+    def actual_identity(self) -> dict[str, Any]:
+        # Recompute after reset so a changed model or VAE cannot pass resume.
+        observed = _content_identity(self.encoder)
+        return {"adapter": "ConditionEncoderAdapter", "device": self.device,
+                "encoder": observed, "bound": self._identity}
+
+    def _clear_one(self, owner: Any) -> None:
+        for name in ("reset_cache", "clear_cache", "clear"):
+            method = getattr(owner, name, None)
+            if callable(method):
+                method()
+                return
+
+    def reset_cache(self) -> None:
+        self._clear_one(self.encoder)
+        for name in ("_enc_cache", "_dec_cache", "cache", "_cache"):
+            value = getattr(self.encoder, name, None)
+            if hasattr(value, "clear"):
+                value.clear()
+            if value is not None and hasattr(value, "__len__") and len(value) != 0:
+                raise RuntimeError("condition encoder cache did not clear")
+
+    @staticmethod
+    def _first_tensor(value: Any) -> Any:
+        if hasattr(value, "detach") and hasattr(value, "shape"):
+            return value
+        if isinstance(value, dict):
+            for item in value.values():
+                try:
+                    return ConditionEncoderAdapter._first_tensor(item)
+                except TypeError:
+                    continue
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                try:
+                    return ConditionEncoderAdapter._first_tensor(item)
+                except TypeError:
+                    continue
+        for name in ("latent", "latents", "sample"):
+            item = getattr(value, name, None)
+            if item is not None:
+                return ConditionEncoderAdapter._first_tensor(item)
+        if isinstance(value, np.ndarray):
+            return value
+        raise TypeError("condition encoder returned no tensor")
+
+    def __call__(self, frame: Any) -> Any:
+        import torch
+        array = np.asarray(frame, dtype=np.float32)
+        if array.ndim == 4 and array.shape[0] == 1:
+            array = array[0]
+        if array.ndim != 3:
+            raise ValueError("condition frame must be CHW or HWC")
+        if array.shape[0] not in (1, 3) and array.shape[-1] in (1, 3):
+            array = np.transpose(array, (2, 0, 1))
+        if array.shape[0] not in (1, 3) or not np.all(np.isfinite(array)) or np.min(array) < 0 or np.max(array) > 1:
+            raise ValueError("condition frame must be finite [0,1] CHW")
+        value = torch.from_numpy(np.ascontiguousarray(array)).to(device=self.device, dtype=torch.float32)[None, :, None, :, :]
+        self.reset_cache()
+        primary_error = None
+        try:
+            method = getattr(self.encoder, "encode", None) or getattr(self.encoder, "encode_image", None)
+            if method is None:
+                method = self.encoder
+            try:
+                encoded = method(value)
+            except (TypeError, ValueError) as first:
+                # A few installed tokenizer wrappers expose the same encoder
+                # with a keyword-only device argument.
+                try:
+                    encoded = method(value, device=self.device)
+                except TypeError:
+                    primary_error = first
+                    raise
+            result = self._first_tensor(encoded)
+            if isinstance(result, np.ndarray):
+                result = torch.from_numpy(result)
+            result = result.detach().to(device=self.device, dtype=torch.float32)
+            if not torch.isfinite(result).all():
+                raise ValueError("condition encoder produced nonfinite latent")
+            return result
+        finally:
+            try:
+                self.reset_cache()
+            except BaseException:
+                if primary_error is None:
+                    raise
+
+
+
+def build_loader_args(*, framework_root: str | Path, checkpoint: str | Path, vae: str | Path,
+                      video: str | Path, prompt: str, action: Any, setup_dir: str | Path,
+                      phase: str, resume: bool) -> SimpleNamespace:
+    """Build the exact sample namespace without importing Cosmos."""
+    setup = Path(setup_dir).resolve()
+    return SimpleNamespace(framework_root=str(Path(framework_root).resolve()), checkpoint_path=str(Path(checkpoint).resolve()),
+        vae_path=str(Path(vae).resolve()), input_path=str(Path(video).resolve()) if video else None,
+        action_path=None, prompt=str(prompt), action_chunk_index=0, gpu_index=0, direction_seed=20260912,
+        model_seed=0, alphas=[0.001, 0.003, 0.01], num_steps=30, sampler="unipc", precision="bfloat16",
+        parallelism_preset="latency", diffusion_cache=False, batch_size=1, fps=5,
+        run_dir=str(setup), resume=bool(resume), phase=str(phase), stage_a_only=False, use_torch_compile=False)
+
+
+def _make_setup_dir(run_dir: str | Path | None, phase: str, *, resume: bool) -> Path:
+    if not run_dir:
+        raise ValueError("official loader requires the current run_dir")
+    root = Path(run_dir).resolve()
+    setup = root.parent / f".{root.name}.task6_setup" / str(phase)
+    if setup.exists() and not resume:
+        raise FileExistsError(f"phase setup already exists: {setup}")
+    setup.mkdir(parents=True, exist_ok=bool(resume))
+    return setup
+
+
+def _framework_commit(framework: Path) -> str:
+    try:
+        head = subprocess.run(["git", "-C", str(framework), "rev-parse", "HEAD"], check=True,
+                              capture_output=True, text=True).stdout.strip().lower()
+        dirty = subprocess.run(["git", "-C", str(framework), "status", "--porcelain"], check=True,
+                               capture_output=True, text=True).stdout.strip()
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ValueError("framework root is not a readable git checkout") from error
+    if len(head) != 40 or dirty:
+        raise ValueError("framework checkout is dirty or has no valid HEAD")
+    return head
+
 
 def load_task6_cosmos_runtime(*, framework_root: str, checkpoint: str, vae: str, device: str,
                               model_seed: int, prompt: str, action: Any, video: str | None = None,
-                              contract: dict[str, Any] | None = None) -> dict[str, Any]:
+                              contract: dict[str, Any] | None = None, run_dir: str | Path | None = None,
+                              phase: str = "unknown", resume: bool = False) -> dict[str, Any]:
     if device != "cuda:0" or int(model_seed) != 0:
         raise ValueError("Task 6 official loader is pinned to cuda:0/model seed 0")
     framework = Path(framework_root).resolve()
@@ -30,32 +204,32 @@ def load_task6_cosmos_runtime(*, framework_root: str, checkpoint: str, vae: str,
     except ImportError:  # pragma: no cover
         from umi_fd_post_vae_scan import _clone_runtime, load_official_data_batch, load_official_runtime
         from umi_precision_official import OfficialPrecisionRuntime, TorchOps
-    setup_dir = Path(video).resolve().parent / ".task6_framework_setup" if video else framework / ".task6_framework_setup"
-    setup_dir.mkdir(parents=True, exist_ok=True)
-    args = SimpleNamespace(framework_root=str(framework), checkpoint_path=str(Path(checkpoint).resolve()),
-        vae_path=str(Path(vae).resolve()), input_path=str(Path(video).resolve()) if video else None,
-        action_path=None, prompt=str(prompt), action_chunk_index=0, gpu_index=0, direction_seed=20260912,
-        model_seed=0, alphas=[0.001, 0.003, 0.01], num_steps=30, sampler="unipc", precision="bfloat16",
-        parallelism_preset="latency", diffusion_cache=False, batch_size=1, run_dir=str(setup_dir),
-        resume=False, stage_a_only=False, use_torch_compile=False)
+    setup_dir = _make_setup_dir(run_dir, phase, resume=resume)
+    args = build_loader_args(framework_root=framework, checkpoint=checkpoint, vae=vae, video=video,
+                             prompt=prompt, action=action, setup_dir=setup_dir, phase=phase, resume=resume)
     # The official sample loader reads the paired action from a path.  Materialize
     # the exact action passed by the factory in the temporary setup directory.
     import json
     action_path = setup_dir / "action.json"
-    action_path.write_text(json.dumps(action), encoding="utf-8")
+    if action_path.exists() and not resume:
+        raise FileExistsError(f"phase setup action already exists: {action_path}")
+    if not action_path.exists():
+        temporary = setup_dir / ".action.json.tmp"
+        temporary.write_text(json.dumps(action, sort_keys=True), encoding="utf-8")
+        os.replace(temporary, action_path)
     args.action_path = str(action_path)
     post_adapter = load_official_runtime(args, setup_dir)
     data_batch, _ = load_official_data_batch(post_adapter, args, setup_dir)
     ops = TorchOps()
-    provenance = {"framework_root": str(framework), "checkpoint_path": str(Path(checkpoint).resolve()),
+    provenance = {"framework_root": str(framework), "framework_commit": _framework_commit(framework), "checkpoint_path": str(Path(checkpoint).resolve()),
         "vae_path": str(Path(vae).resolve()), "sampler": "unipc", "precision": "bfloat16",
-        "asset_source_commit": "2b17a2413bd86b2cf9b03823637108851e4ddf2d", "source_commit": "2b17a2413bd86b2cf9b03823637108851e4ddf2d",
+        "asset_source_commit": "2b17a2413bd86b2cf9b03823637108851e4ddf2d",
         "diffusion_cache_requested": False, "diffusion_cache_installed": False, "seed": 0, "prompt": prompt}
     runtime_model = post_adapter.model
     runtime = {"model": runtime_model, "data_batch": data_batch, "ops": ops,
         "generation_settings": {"num_steps": 30, "guidance": 1.0, "shift": 10.0},
         "artifact_paths": {"checkpoint": str(Path(checkpoint).resolve()), "decoder": str(Path(vae).resolve())},
-        "provenance": provenance, "encoder": getattr(runtime_model, "tokenizer_vision", None)}
+        "provenance": provenance, "encoder": ConditionEncoderAdapter(getattr(runtime_model, "tokenizer_vision", None), device=device)}
     def unload():
         cleanup = getattr(post_adapter, "cleanup", None)
         if callable(cleanup): cleanup()
@@ -69,4 +243,4 @@ def load_task6_cosmos_runtime(*, framework_root: str, checkpoint: str, vae: str,
     return runtime
 
 
-__all__ = ["load_task6_cosmos_runtime"]
+__all__ = ["ConditionEncoderAdapter", "build_loader_args", "load_task6_cosmos_runtime"]

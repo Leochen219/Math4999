@@ -42,7 +42,8 @@ PILOT_GROUP = {"state": "bridge_0", "seed": 0}
 TASK6_CODE_SOURCES = ("umi_task6_runtime.py", "run_umi_task6_experiment.py", "umi_task6_primitives.py",
     "umi_fd_post_vae_bridge.py", "umi_precision_runtime.py", "umi_precision_storage.py",
     "umi_precision_official.py", "umi_task5_runtime.py", "umi_task5_primitives.py",
-    "umi_task6_operational.py", "run_umi_task6_official.py", "umi_task6_cosmos_loader.py")
+    "umi_task6_operational.py", "run_umi_task6_official.py", "umi_task6_cosmos_loader.py",
+    "umi_task6_decoder.py", "analyze_umi_task6.py")
 
 
 class OperationalEvidenceError(ValueError):
@@ -287,7 +288,7 @@ def _validate_static_contract(contract: Mapping[str, Any]) -> None:
             raise OperationalEvidenceError(f"invalid Task 5 hash: {key}")
     for section, names in (("direction_file_sha256", ("v0", "v1", "v2")), ("direction_sha256", ("v0", "v1", "v2", "u01", "u12"))):
         values = task5.get(section)
-        if not isinstance(values, Mapping) or set(values) != set(names) or any(not isinstance(values[n], str) or len(values[n]) != 64 for n in names):
+        if not isinstance(values, Mapping) or set(values) != set(names) or any(not isinstance(values[n], str) or len(values[n]) != 64 or any(c not in "0123456789abcdefABCDEF" for c in values[n]) for n in names):
             raise OperationalEvidenceError(f"Task 5 {section} evidence is incomplete")
     identity = contract.get("checkpoint_identity")
     if not isinstance(identity, Mapping) or set(identity) != {"sha256"} or not isinstance(identity["sha256"], str) or len(identity["sha256"]) != 64:
@@ -299,7 +300,8 @@ def _validate_static_contract(contract: Mapping[str, Any]) -> None:
 
 
 def observe_live_launch(contract: Mapping[str, Any], *, runtime: Any, inputs: Any, assets: Mapping[str, Any],
-                        task5: Mapping[str, Any], checkpoint: str | os.PathLike[str], vae: str | os.PathLike[str]) -> dict[str, Any]:
+                        task5: Mapping[str, Any], checkpoint: str | os.PathLike[str], vae: str | os.PathLike[str],
+                        framework_root: str | os.PathLike[str]) -> dict[str, Any]:
     """Build launch evidence from loaded objects and file/environment state."""
     try:
         import torch
@@ -311,7 +313,7 @@ def observe_live_launch(contract: Mapping[str, Any], *, runtime: Any, inputs: An
         raise OperationalEvidenceError("runtime did not expose actual content identity")
     geometry = inputs.geometry
     observation = {
-        "framework_commit": _live_framework_commit(contract.get("framework_root")),
+        "framework_commit": _live_framework_commit(framework_root),
         "asset_source_commit": SOURCE_COMMIT,
         "checkpoint_identity": {"sha256": sha256_file(checkpoint)},
         "vae_sha256": sha256_file(vae),
@@ -372,7 +374,8 @@ class OfficialRuntimeFactory:
     """
     def __init__(self, *, loader: str | Callable[..., Mapping[str, Any]], framework_root: str | os.PathLike[str],
                  checkpoint: str | os.PathLike[str], vae: str | os.PathLike[str], contract: Mapping[str, Any],
-                 direction_bank: Any, action: Any, prompt: str):
+                 direction_bank: Any, action: Any, prompt: str, video: str | os.PathLike[str] | None = None,
+                 phase: str = "unknown", run_dir: str | os.PathLike[str] | None = None, resume: bool = False):
         self.loader = import_callable(loader) if isinstance(loader, str) else loader
         if not callable(self.loader): raise OperationalEvidenceError("explicit official loader is required")
         self.framework_root, self.checkpoint, self.vae = Path(framework_root).resolve(), Path(checkpoint).resolve(), Path(vae).resolve()
@@ -380,6 +383,13 @@ class OfficialRuntimeFactory:
             raise OperationalEvidenceError("framework/checkpoint/VAE path is missing")
         self.contract, self.direction_bank = dict(contract), np.asarray(direction_bank, dtype=np.float32)
         self.action, self.prompt = parse_action(action), str(prompt)
+        self.video = None if video is None else Path(video).resolve()
+        self.phase, self.run_dir, self.resume = str(phase), None if run_dir is None else Path(run_dir).resolve(), bool(resume)
+        if self.video is None or not self.video.is_file():
+            raise OperationalEvidenceError("pinned bridge video path is missing")
+        observed_framework = _live_framework_commit(self.framework_root)
+        if observed_framework != str(self.contract["framework_commit"]).lower():
+            raise OperationalEvidenceError("framework checkout HEAD differs from launch contract")
         self._unload: Callable[[], Any] | None = None
         _validate_static_contract(self.contract)
         if self.contract["checkpoint_identity"]["sha256"] != sha256_file(self.checkpoint):
@@ -390,9 +400,12 @@ class OfficialRuntimeFactory:
             raise OperationalEvidenceError("code bundle identity does not match this checkout")
 
     def build(self):
+        if self.video is None:
+            raise OperationalEvidenceError("official loader requires the pinned bridge video path")
         payload = self.loader(framework_root=str(self.framework_root), checkpoint=str(self.checkpoint), vae=str(self.vae),
                               device="cuda:0", model_seed=0, prompt=self.prompt, action=self.action.copy(),
-                              video=self.contract.get("bridge_video_path"), contract=dict(self.contract))
+                              video=str(self.video), contract=dict(self.contract), run_dir=self.run_dir,
+                              phase=self.phase, resume=self.resume)
         if not isinstance(payload, Mapping) or not {"model", "data_batch"}.issubset(payload):
             raise OperationalEvidenceError("official loader must return model and data_batch")
         self._unload = payload.get("unload") if callable(payload.get("unload")) else None
@@ -404,7 +417,8 @@ class OfficialRuntimeFactory:
         if not Path(artifact_paths["decoder"]).is_file():
             raise OperationalEvidenceError("official loader decoder artifact is missing")
         provenance = payload.get("provenance")
-        if (not isinstance(provenance, Mapping) or provenance.get("source_commit") != SOURCE_COMMIT or
+        if (not isinstance(provenance, Mapping) or provenance.get("asset_source_commit") != SOURCE_COMMIT or
+                (provenance.get("framework_commit") is not None and provenance.get("framework_commit") != self.contract["framework_commit"]) or
                 "diffusion_cache_requested" not in provenance or "diffusion_cache_installed" not in provenance or
                 bool(provenance.get("diffusion_cache_requested")) or bool(provenance.get("diffusion_cache_installed"))):
             raise OperationalEvidenceError("official loader provenance does not prove diffusion cache is disabled")
@@ -432,6 +446,9 @@ class OfficialRuntimeFactory:
         encoder = payload.get("encoder")
         if encoder is None:
             encoder = getattr(runtime, "encoder", None)
+        if encoder is None or not callable(getattr(encoder, "actual_identity", None)):
+            raise OperationalEvidenceError("official loader must expose a content-identified condition encoder")
+        encoder.actual_identity()
         # The adapter is the public seam that adds the immutable Task 6
         # evidence schema (z_bar/mask/delta/predicted block) to every record.
         try:

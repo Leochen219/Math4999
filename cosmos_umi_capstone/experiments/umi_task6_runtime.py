@@ -60,7 +60,8 @@ def build_task6_hash_binding(runtime: Any, inputs: Any, config: Mapping[str, Any
         "umi_task6_primitives.py", "umi_fd_post_vae_bridge.py",
         "umi_precision_runtime.py", "umi_precision_storage.py", "umi_precision_official.py",
         "umi_task5_runtime.py", "umi_task5_primitives.py", "umi_task6_operational.py",
-        "run_umi_task6_official.py", "umi_task6_cosmos_loader.py") if (source_root / name).is_file()]
+        "run_umi_task6_official.py", "umi_task6_cosmos_loader.py", "umi_task6_decoder.py",
+        "analyze_umi_task6.py") if (source_root / name).is_file()]
     code_digest = hashlib.sha256()
     for source in sources:
         code_digest.update(source.name.encode("utf-8")); code_digest.update(b"\0"); code_digest.update(source.read_bytes())

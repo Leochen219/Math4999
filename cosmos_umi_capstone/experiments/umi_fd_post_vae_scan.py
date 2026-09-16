@@ -1632,6 +1632,11 @@ def load_official_runtime(args: argparse.Namespace, run_dir: Path) -> OfficialPo
     return adapter
 
 
+def resolved_sample_fps(args: argparse.Namespace) -> int:
+    """Use official default 20, while Bridge contracts explicitly pin 5."""
+    return int(getattr(args, "fps", 20))
+
+
 def load_official_data_batch(adapter: OfficialPostVaeRuntimeAdapter, args: argparse.Namespace, run_dir: Path) -> tuple[Any, Any]:
     """Build the official sample args/data batch from the CLI input/action/prompt."""
     if not args.input_path or not args.action_path:
@@ -1640,7 +1645,7 @@ def load_official_data_batch(adapter: OfficialPostVaeRuntimeAdapter, args: argpa
     from cosmos_framework.inference.inference import get_sample_data  # type: ignore[import-not-found]
     sample = {
         "name": "umi_fd_post_vae_scan", "model_mode": "forward_dynamics", "domain_name": "umi",
-        "view_point": "ego_view", "fps": 20, "image_size": 256, "action_chunk_size": 16,
+        "view_point": "ego_view", "fps": resolved_sample_fps(args), "image_size": 256, "action_chunk_size": 16,
         "prompt": args.prompt, "vision_path": str(Path(args.input_path).resolve()),
         "action_path": str(Path(args.action_path).resolve()), "seed": MODEL_SEED, "guidance": 1.0, "shift": 10.0,
     }

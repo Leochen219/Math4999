@@ -83,6 +83,129 @@ class OperationalTask6Tests(unittest.TestCase):
     def test_loader_spec_requires_module_function(self):
         with self.assertRaises(self.op.OperationalEvidenceError): self.op.import_callable("not-a-spec")
 
+    def test_cosmos_loader_args_pin_bridge_fps_and_isolated_setup(self):
+        import umi_task6_cosmos_loader as loader
+        with tempfile.TemporaryDirectory() as temp:
+            setup = Path(temp) / "run" / "loader_setup"
+            args = loader.build_loader_args(framework_root=Path(temp), checkpoint=Path(temp) / "model",
+                vae=Path(temp) / "vae", video=Path(temp) / "video.mp4", prompt="p",
+                action=np.zeros((16, 10), np.float32), setup_dir=setup, phase="preflight", resume=False)
+            self.assertEqual(args.fps, 5)
+            self.assertEqual(Path(args.run_dir), setup)
+            self.assertEqual(args.phase, "preflight")
+            self.assertTrue(str(setup).endswith("loader_setup"))
+
+    def test_official_sample_fps_preserves_default_and_bridge_override(self):
+        import umi_fd_post_vae_scan as scan
+        self.assertEqual(scan.resolved_sample_fps(type("Args", (), {})()), 20)
+        self.assertEqual(scan.resolved_sample_fps(type("Args", (), {"fps": 5})()), 5)
+
+    def test_official_preflight_failure_publishes_canonical_status(self):
+        import run_umi_task6_official as official
+        import run_umi_task6_experiment as runner
+        with tempfile.TemporaryDirectory() as temp:
+            original = official._execute_official_impl
+            official._execute_official_impl = lambda args: (_ for _ in ()).throw(RuntimeError("loader resource failure"))
+            try:
+                with self.assertRaises(RuntimeError):
+                    official.execute_official(type("Args", (), {"run_dir": temp, "phase": "preflight"})())
+            finally:
+                official._execute_official_impl = original
+            status = json.loads((Path(temp) / "run_status.json").read_text())
+            self.assertEqual(status["status"], "RESOURCE_STOP")
+            self.assertFalse(status["generation_started"])
+
+    def test_official_production_chain_preflight_then_smoke_preserves_six_hashes(self):
+        import run_umi_task6_official as official
+        import run_umi_task6_experiment as runner
+        import umi_task6_runtime as runtime_api
+        import umi_task6_operational as op
+        carrier = np.ones((1, 48, 5, 16, 16), np.float32)
+        mask = np.zeros_like(carrier, dtype=bool); mask[:, :, 0] = True
+        bank = np.zeros((3,) + carrier.shape, np.float32); bank[:, mask] = 1.0
+        frozen = runtime_api._derive_frozen_directions_unpinned(bank, mask)
+        direction_hashes = {name: runtime_api._array_sha(value) for name, value in frozen.items()}
+        inputs = runtime_api.Task6Inputs(carrier, [0], mask, bank, action=np.zeros((16, 10), np.float32),
+            prompt=official.BRIDGE0_PROMPT if hasattr(official, "BRIDGE0_PROMPT") else "Put the pot to the left of the purple item.",
+            state="bridge_0", seed=0, direction_hashes=direction_hashes)
+        class Runtime:
+            model_seed = 0
+            provenance = {"asset_source_commit": "2b17a2413bd86b2cf9b03823637108851e4ddf2d"}
+            def actual_identity(self): return {"model": "fixture-content-v1"}
+            def execute(self, spec, bound, *, scope="full"): return {"output_full": np.zeros((1, 48, 5, 16, 16), np.float32)}
+            def cleanup(self): pass
+        runtime = Runtime(); runtime.inputs = inputs
+        safe = lambda: {"gpu_used_gib": 0, "gpu_free_gib": 100, "gpu_reserved_gib": 0,
+                        "ram_available_gib": 600, "rss_gib": 0, "swap_used_gib": 0, "disk_free_gib": 20}
+        class Factory:
+            phases = []
+            def __init__(self, **kwargs): self.phases.append((kwargs["phase"], kwargs["run_dir"])); self.kwargs = kwargs
+            def build(self): return runtime, inputs, object()
+            def unload(self): pass
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); action = root / "action.json"; video = root / "video.mp4"; checkpoint = root / "model"; vae = root / "vae"
+            action.write_text(json.dumps([[0.0] * 10 for _ in range(16)])); video.write_bytes(b"video"); checkpoint.write_bytes(b"model"); vae.write_bytes(b"vae")
+            contract = {"framework_commit": "1" * 40, "asset_source_commit": op.SOURCE_COMMIT,
+                "checkpoint_identity": {"sha256": "a" * 64}, "vae_sha256": "b" * 64, "torch_version": "fixture", "cuda_version": "fixture", "code_bundle_sha256": "c" * 64,
+                "bridge_asset_hashes": dict(op.BRIDGE0_ASSET_SHA256), "task5": {"manifest_sha256": "f" * 64, "plan_sha256": "0" * 64,
+                    "direction_file_sha256": {k: "1" * 64 for k in ("v0", "v1", "v2")}, "direction_sha256": {k: "2" * 64 for k in direction_hashes}},
+                "group": {"state": "bridge_0", "seed": 0}, "prompt": inputs.prompt, "action": [[0.0] * 10 for _ in range(16)],
+                "settings": {"num_steps": 30, "guidance": 1.0, "shift": 10.0, "batch_size": 1, "autocast": False, "tf32": False, "diffusion_cache": False},
+                "cache_flags": {"autocast": False, "tf32": False, "diffusion_cache": False}, "seed_routes": {"model": 0, "prepare": 0, "sampler": 0, "scheduler": 0},
+                "geometry": {"carrier_shape": [1, 48, 5, 16, 16], "condition_indexes": [0], "predicted_indexes": [1, 2, 3, 4], "mask_shape": [1, 48, 5, 16, 16]}}
+            launch = root / "launch.json"; launch.write_text(json.dumps(contract))
+            task5 = {"bank": bank, "manifest_sha256": "f" * 64, "plan_sha256": "0" * 64,
+                     "direction_file_sha256": {k: "1" * 64 for k in ("v0", "v1", "v2")}, "direction_sha256": {k: "2" * 64 for k in direction_hashes}}
+            observed = dict(contract); observed.update({"checkpoint_identity": {"sha256": "a" * 64}, "vae_sha256": "b" * 64,
+                "torch_version": "fixture", "cuda_version": "fixture", "runtime_identity": runtime.actual_identity()})
+            old = {name: getattr(official, name) for name in ("OfficialRuntimeFactory", "verify_pinned_bridge_assets", "extract_task5_directions", "observe_live_launch", "validate_launch_contract", "resource_samplers", "preflight_task6", "build_task6_hash_binding")}
+            old_runner_binding = runner.build_task6_hash_binding
+            try:
+                official.OfficialRuntimeFactory = Factory
+                official.verify_pinned_bridge_assets = lambda *args, **kwargs: {"action_sha256": "d" * 64, "video_sha256": "e" * 64}
+                official.extract_task5_directions = lambda *args, **kwargs: task5
+                official.observe_live_launch = lambda *args, **kwargs: observed
+                official.validate_launch_contract = lambda *args, **kwargs: {"status": "PASS"}
+                official.resource_samplers = lambda *args, **kwargs: {"gpu": safe, "ram": safe, "disk": safe}
+                official.preflight_task6 = lambda *args, **kwargs: {"status": "PASS"}
+                six = {name: name + "-hash" for name in ("code", "model", "config", "direction", "input", "noise")}
+                official.build_task6_hash_binding = lambda *args, **kwargs: six
+                runner.build_task6_hash_binding = lambda *args, **kwargs: six
+                pre = official.execute_official(official.parse_args(["--phase", "preflight", "--run-dir", str(root), "--launch-contract", str(launch),
+                    "--framework-root", str(root), "--checkpoint", str(checkpoint), "--vae", str(vae), "--action", str(action), "--video", str(video), "--task5-root", str(root)]))
+                self.assertEqual(pre["status"], "PREFLIGHT_COMPLETE"); self.assertEqual(set(pre["hashes"]), set(six))
+                smoke = official.execute_official(official.parse_args(["--phase", "resource-smoke", "--run-dir", str(root), "--launch-contract", str(launch),
+                    "--framework-root", str(root), "--checkpoint", str(checkpoint), "--vae", str(vae), "--action", str(action), "--video", str(video), "--task5-root", str(root)]))
+                self.assertEqual(smoke["hashes"], six); self.assertEqual([phase for phase, _ in Factory.phases], ["preflight", "resource-smoke"])
+            finally:
+                for name, value in old.items(): setattr(official, name, value)
+                runner.build_task6_hash_binding = old_runner_binding
+
+    def test_condition_encoder_adapter_uses_batched_torch_video_and_restores_cache(self):
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("bundled CPU test runtime has no torch; official CUDA path exercises this seam")
+        import umi_task6_cosmos_loader as loader
+        class Encoder:
+            def __init__(self): self.calls = []; self.cache = {"stale": 1}; self.weight = np.array([1, 2], np.float32)
+            def actual_identity(self): return {"weights": self.weight.tolist()}
+            def reset_cache(self): self.cache.clear()
+            def encode(self, value):
+                self.calls.append(value)
+                self.cache["active"] = 1
+                return value.float()
+        encoder = Encoder(); adapter = loader.ConditionEncoderAdapter(encoder, device="cpu")
+        frame = np.full((3, 8, 8), 0.25, np.float32)
+        result = adapter(frame)
+        self.assertEqual(tuple(result.shape), (1, 3, 1, 8, 8))
+        self.assertEqual(str(result.dtype), "torch.float32")
+        self.assertEqual(tuple(encoder.calls[0].shape), (1, 3, 1, 8, 8))
+        self.assertEqual(encoder.cache, {})
+        adapter.reset_cache()
+        self.assertEqual(encoder.cache, {})
+        self.assertIn("weights", adapter.actual_identity())
+
     def contract(self):
         return {"framework_commit": "1" * 40, "asset_source_commit": "2b17a2413bd86b2cf9b03823637108851e4ddf2d", "checkpoint_identity": {"sha256": "x"},
                 "vae_sha256": "a" * 64, "torch_version": "2.10.0+cu130", "cuda_version": "13.0", "code_bundle_sha256": "b" * 64,

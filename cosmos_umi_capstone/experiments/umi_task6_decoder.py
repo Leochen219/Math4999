@@ -245,7 +245,7 @@ def _decoder_identity(runtime: Any) -> Any:
 
 
 def _encoder_identity(encoder: Any) -> Any:
-    for name in ("identity", "state_identity", "encoder_identity"):
+    for name in ("actual_identity", "identity", "state_identity", "encoder_identity"):
         value = getattr(encoder, name, None)
         if callable(value): return value()
     typ = type(encoder)

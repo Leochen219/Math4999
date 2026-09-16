@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 import shutil
+import tempfile
 from pathlib import Path
 from typing import Any, Mapping
 import numpy as np
@@ -86,21 +87,21 @@ def build_inputs(factory: OfficialRuntimeFactory, runtime: Any, *, asset: Mappin
                        direction_hashes={k: sha256_array(v) for k, v in official.directions.items()})
 
 
-def execute_official(args: argparse.Namespace) -> dict[str, Any]:
+def _execute_official_impl(args: argparse.Namespace) -> dict[str, Any]:
     contract = load_json(args.launch_contract)
     expected_observed = load_json(args.observed_evidence) if args.observed_evidence else None
     # Static contract checks happen before any installed framework import.
     _validate_static_contract(contract)
     assets = verify_pinned_bridge_assets(args.action, args.video)
-    contract["bridge_video_path"] = str(Path(args.video).resolve())
-    contract["framework_root"] = str(Path(args.framework_root).resolve())
     task5 = extract_task5_directions(args.task5_root,
         expected_manifest_sha256=contract["task5"].get("manifest_sha256"),
         expected_plan_sha256=contract["task5"].get("plan_sha256"),
         expected_direction_file_hashes=contract["task5"].get("direction_file_sha256"),
         expected_direction_hashes=contract["task5"].get("direction_sha256"))
     factory = OfficialRuntimeFactory(loader=args.loader, framework_root=args.framework_root, checkpoint=args.checkpoint,
-                                     vae=args.vae, contract=contract, direction_bank=task5["bank"], action=load_json(args.action), prompt=contract["prompt"])
+                                     vae=args.vae, contract=contract, direction_bank=task5["bank"], action=load_json(args.action),
+                                     prompt=contract["prompt"], video=args.video, phase=args.phase, run_dir=args.run_dir,
+                                     resume=bool(args.resume))
     if args.phase == "preflight":
         root = Path(args.run_dir); root.mkdir(parents=True, exist_ok=True)
         samplers = resource_samplers(args.run_dir, gpu_index=args.gpu_index)
@@ -114,14 +115,21 @@ def execute_official(args: argparse.Namespace) -> dict[str, Any]:
             runtime, inputs, _ = factory.build()
             live = observe_live_launch(
                 contract, runtime=runtime, inputs=inputs, assets=assets, task5=task5,
-                checkpoint=args.checkpoint, vae=args.vae)
+                checkpoint=args.checkpoint, vae=args.vae, framework_root=args.framework_root)
             validate_launch_contract(contract, observed=live)
             if expected_observed is not None and expected_observed != live:
                 raise OperationalEvidenceError("observed-evidence JSON differs from independently observed environment")
             bank_path = root / "task5_direction_bank.npy"
             if bank_path.exists():
                 raise OperationalEvidenceError("preflight destination already contains a direction bank")
-            np.save(bank_path, task5["bank"], allow_pickle=False)
+            with tempfile.NamedTemporaryFile(prefix=".task5_direction_bank.", suffix=".npy", dir=root,
+                                             delete=False) as temporary:
+                temporary_path = Path(temporary.name)
+            try:
+                np.save(temporary_path, task5["bank"], allow_pickle=False)
+                os.replace(temporary_path, bank_path)
+            finally:
+                temporary_path.unlink(missing_ok=True)
             identity = inputs.identity()
             binding_config = task6_binding_config(inputs)
             strict_config = {"environment": {"torch": live["torch_version"], "cuda": live["cuda_version"]},
@@ -199,6 +207,34 @@ def execute_official(args: argparse.Namespace) -> dict[str, Any]:
     finally:
         try: runtime.cleanup()
         finally: factory.unload()
+
+
+def execute_official(args: argparse.Namespace) -> dict[str, Any]:
+    """Run one official phase and leave a canonical terminal status on failure."""
+    try:
+        return _execute_official_impl(args)
+    except BaseException as error:
+        root = Path(args.run_dir).resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        existing = root / "run_status.json"
+        try:
+            prior = load_json(existing) if existing.is_file() else {}
+        except Exception:
+            prior = {}
+        # Never replace a completed status with a later setup error.  A failed
+        # preflight/smoke/pilot gets an explicit canonical status instead.
+        preserve = prior.get("status") == "COMPLETE" or (
+            str(getattr(args, "phase", "unknown")) == "preflight" and
+            prior.get("status") == "PREFLIGHT_COMPLETE")
+        if not preserve:
+            text = str(error).lower()
+            status = "RESOURCE_STOP" if any(token in text for token in ("resource", "oom", "cuda out of memory", "monitor")) else "BLOCKED"
+            payload = {"status": status, "phase": str(getattr(args, "phase", "unknown")),
+                       "generation_started": False, "reason_code": type(error).__name__, "reason": str(error)}
+            temporary = root / ".run_status.json.tmp"
+            temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            os.replace(temporary, existing)
+        raise
 
 
 def parse_args(argv=None):
