@@ -21,7 +21,7 @@ try:
         _validate_static_contract)
     from .umi_task6_primitives import STATE_CATALOG, build_generation_plan, evaluate_resources
     from .umi_task6_runtime import Task6Inputs, build_task6_hash_binding, preflight_task6, task6_binding_config
-    from .run_umi_task6_experiment import (_atomic_json, BlockedExecution, ResourceMonitor,
+    from .run_umi_task6_experiment import (_atomic_json, BlockedExecution, ResourceMonitor, ResourceStop,
         accept_resource_smoke, run_pilot, run_resource_smoke)
     from .umi_task6_decoder import _verify_raw_task6, run_task6_decoder_replays
     from .umi_fd_post_vae_bridge import sha256_array
@@ -29,7 +29,7 @@ except ImportError:  # pragma: no cover
     from umi_task6_operational import OfficialRuntimeFactory, OperationalEvidenceError, extract_task5_directions, prepare_bridge_upload_bundle, validate_launch_contract, verify_pinned_bridge_assets, observe_live_launch, _validate_static_contract
     from umi_task6_primitives import STATE_CATALOG, build_generation_plan, evaluate_resources
     from umi_task6_runtime import Task6Inputs, build_task6_hash_binding, preflight_task6, task6_binding_config
-    from run_umi_task6_experiment import (_atomic_json, BlockedExecution, ResourceMonitor,
+    from run_umi_task6_experiment import (_atomic_json, BlockedExecution, ResourceMonitor, ResourceStop,
         accept_resource_smoke, run_pilot, run_resource_smoke)
     from umi_task6_decoder import _verify_raw_task6, run_task6_decoder_replays
     from umi_fd_post_vae_bridge import sha256_array
@@ -214,7 +214,8 @@ def _execute_official_impl(args: argparse.Namespace) -> dict[str, Any]:
                                   lifecycle={"pre_load": lambda: None, "load": load, "cleanup": cleanup, "unload": unload})
     if args.phase != "pilot": raise BlockedExecution("unknown official Task 6 phase")
     samplers = resource_samplers(args.run_dir, gpu_index=args.gpu_index)
-    decoder_root = Path(args.decoder_root) if args.decoder_root else Path(args.run_dir).parent / (Path(args.run_dir).name + "_decoder")
+    decoder_root = (Path(args.decoder_root) if args.decoder_root else
+                    Path(args.run_dir).parent / (Path(args.run_dir).name + "_decoder")).resolve()
     status_path = Path(args.run_dir) / "run_status.json"
     try:
         prior_status = load_json(status_path) if status_path.is_file() else {}
@@ -240,13 +241,17 @@ def _execute_official_impl(args: argparse.Namespace) -> dict[str, Any]:
     if raw_status is not None:
         raw_status.pop("raw_manifest_sha256", None)
         raw_root = Path(args.run_dir).resolve()
-        try:
-            decoder_root.resolve().relative_to(raw_root)
-        except ValueError:
-            pass
-        else:
-            raise OperationalEvidenceError("derived decoder root must be outside the immutable raw run")
-    monitor_root = decoder_root / "load_monitor" if raw_status is not None else Path(args.run_dir)
+        control_root = decoder_root.with_name(decoder_root.name + "_control").resolve()
+        for candidate, label in ((decoder_root, "derived decoder"), (control_root, "derived control")):
+            try:
+                candidate.relative_to(raw_root)
+            except ValueError:
+                pass
+            else:
+                raise OperationalEvidenceError(f"{label} root must be outside the immutable raw run")
+    else:
+        control_root = None
+    monitor_root = (control_root / "load_monitor") if raw_status is not None else Path(args.run_dir)
     monitor = ResourceMonitor(monitor_root, gpu_sampler=samplers["gpu"], ram_sampler=samplers["ram"], disk_sampler=samplers["disk"])
     monitor_started = False
     runtime = None
@@ -280,8 +285,8 @@ def _execute_official_impl(args: argparse.Namespace) -> dict[str, Any]:
                             "resource_stop_reason_code": reason_code, "resource_stop_reason": reason})
             if raw_manifest_sha:
                 payload["raw_manifest_sha256"] = raw_manifest_sha
-            decoder_root.mkdir(parents=True, exist_ok=True)
-            _atomic_json(decoder_root / "load_resource_stop.json", payload)
+            control_root.mkdir(parents=True, exist_ok=True)
+            _atomic_json(control_root / "load_resource_stop.json", payload)
             return payload
         payload = dict(base)
         payload.update({"status": "RESOURCE_STOP", "phase": "PILOT", "generation_started": False,
@@ -299,9 +304,12 @@ def _execute_official_impl(args: argparse.Namespace) -> dict[str, Any]:
         if preload.get("status") == "HARD_STOP":
             payload = resource_stop_payload(preload)
             secondary = close_monitor()
-            if secondary and raw_status is None:
+            if secondary:
                 payload["secondary_errors"] = secondary
-                _atomic_json(status_path, payload)
+                if raw_status is None:
+                    _atomic_json(status_path, payload)
+                else:
+                    _atomic_json(control_root / "load_resource_stop.json", payload)
             factory.unload()
             return payload
         factory_result = factory.build(); runtime, inputs = factory_result[0], factory_result[1]
@@ -319,11 +327,28 @@ def _execute_official_impl(args: argparse.Namespace) -> dict[str, Any]:
                 secondary = close_monitor()
                 if secondary:
                     payload["secondary_errors"] = secondary
-                    _atomic_json(decoder_root / "load_resource_stop.json", payload)
+                    _atomic_json(control_root / "load_resource_stop.json", payload)
                 try: runtime.cleanup()
                 finally: factory.unload()
                 return payload
-    except BaseException:
+    except BaseException as error:
+        if raw_status is not None:
+            # A failed derived load/monitor close is control evidence only.
+            # Never rewrite the completed raw status or place this marker in
+            # the exact-inventory decoder tree.
+            failure_payload = dict(raw_status)
+            failure_payload.update({"resource_stop": True, "resource_stop_phase": "PILOT",
+                                    "resource_stop_reason_code": type(error).__name__,
+                                    "resource_stop_reason": str(error)})
+            if raw_manifest_sha:
+                failure_payload["raw_manifest_sha256"] = raw_manifest_sha
+            try:
+                control_root.mkdir(parents=True, exist_ok=True)
+                _atomic_json(control_root / "load_resource_stop.json", failure_payload)
+            except BaseException:
+                # Preserve the original fail-closed exception if control
+                # evidence itself cannot be persisted.
+                pass
         if monitor_started:
             try: monitor.stop()
             except BaseException: pass

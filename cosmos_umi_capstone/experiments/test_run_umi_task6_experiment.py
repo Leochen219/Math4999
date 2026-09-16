@@ -415,5 +415,39 @@ class Task6RunnerTests(unittest.TestCase):
                                                 for name in telemetry})
             self.assertFalse(resumed_monitor._thread.is_alive())
 
+    def test_raw_complete_resume_abort_failure_is_explicit_and_preserves_raw_evidence(self):
+        with tempfile.TemporaryDirectory() as temp:
+            api, runtime, inputs, counts, _ = self.public_chain(temp)
+            safe = lambda: {"gpu_used_gib": 0, "gpu_free_gib": 100, "gpu_reserved_gib": 0,
+                            "ram_available_gib": 600, "rss_gib": 0, "swap_used_gib": 0, "disk_free_gib": 20}
+            first = api.run_pilot(runtime, inputs, temp,
+                                  monitor=api.ResourceMonitor(temp, gpu_sampler=safe, ram_sampler=safe, disk_sampler=safe))
+            self.assertEqual(first["status"], "AWAITING_REVIEW")
+            root = Path(temp)
+            immutable = (root / "MANIFEST.sha256").read_bytes(), (root / "MANIFEST.sha256").stat().st_mtime_ns
+            status = (root / "run_status.json").read_bytes(), (root / "run_status.json").stat().st_mtime_ns
+            telemetry_names = ("gpu_samples.csv", "ram_samples.csv", "disk_samples.csv",
+                               "sample_resource_snapshots.csv", "sample_resource_snapshots.jsonl")
+            telemetry = {name: ((root / name).read_bytes(), (root / name).stat().st_mtime_ns)
+                         for name in telemetry_names}
+
+            class ExplodingAbort(api.ResourceMonitor):
+                def abort(self):
+                    raise RuntimeError("abort join failed")
+
+            runtime.execute = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("raw complete resume must not decode or generate"))
+            resumed_monitor = ExplodingAbort(temp, gpu_sampler=safe, ram_sampler=safe, disk_sampler=safe)
+            # Simulate a monitor that was started by the caller and whose
+            # abort/close path fails while the raw run is already complete.
+            resumed_monitor._thread = object()
+            with self.assertRaisesRegex(api.ResourceStop, "abort join failed"):
+                api.run_pilot(runtime, inputs, temp, resume=True, monitor=resumed_monitor)
+            self.assertEqual((root / "run_status.json").read_bytes(), status[0])
+            self.assertEqual((root / "run_status.json").stat().st_mtime_ns, status[1])
+            self.assertEqual((root / "MANIFEST.sha256").read_bytes(), immutable[0])
+            self.assertEqual((root / "MANIFEST.sha256").stat().st_mtime_ns, immutable[1])
+            self.assertEqual(telemetry, {name: ((root / name).read_bytes(), (root / name).stat().st_mtime_ns)
+                                         for name in telemetry_names})
+
 
 if __name__ == "__main__": unittest.main()

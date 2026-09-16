@@ -601,6 +601,198 @@ class OperationalTask6Tests(unittest.TestCase):
             self.assertNotEqual(Monitor.instances[0].root.resolve(), root.resolve())
             self.assertEqual(raw_status_before, ((root / "run_status.json").read_bytes(), (root / "run_status.json").stat().st_mtime_ns))
 
+    def test_official_derived_resume_flushes_sibling_load_monitor_before_exact_decoder_resume(self):
+        import run_umi_task6_official as official
+        import umi_task6_decoder as decoder_api
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); decoder_root = root.parent / (root.name + "_decoder")
+            decoder_root.mkdir()
+            (decoder_root / "decoder_config.json").write_text("config\n", encoding="utf-8")
+            (decoder_root / "replay.json").write_text("record\n", encoding="utf-8")
+            decoder_api._decoder_manifest(decoder_root)
+            manifest_before = ((decoder_root / "MANIFEST.sha256").read_bytes(),
+                               (decoder_root / "MANIFEST.sha256").stat().st_mtime_ns)
+            evidence = root / "evidence.json"
+            evidence.write_text('{"task5": {}, "prompt": "Put the pot to the left of the purple item."}', encoding="utf-8")
+            (root / "action").write_text(json.dumps([[0.0] * 10 for _ in range(16)]), encoding="utf-8")
+            (root / "video").write_bytes(b"video")
+            raw_status = {"status": "AWAITING_REVIEW", "phase": "PILOT", "generation_started": False,
+                          "smoke_run_id": "raw-sibling-1", "hashes": {name: name + "-hash" for name in ("code", "model", "config", "direction", "input", "noise")},
+                          "group": {"state": "bridge_0", "seed": 0}, "completed_samples": [], "failed_samples": [], "skipped_samples": []}
+            events = []
+            class Runtime:
+                provenance = {"fixture": "runtime"}
+                def actual_identity(self): return {"fixture": "runtime"}
+                def cleanup(self): events.append("runtime_cleanup")
+            runtime = Runtime()
+            class Factory:
+                def __init__(self, **kwargs): pass
+                def build(self): events.append("factory_build"); return runtime, object(), object()
+                def unload(self): events.append("factory_unload")
+            class Monitor:
+                instances = []
+                def __init__(self, monitor_root, **kwargs):
+                    self.root = Path(monitor_root); self._thread = object(); Monitor.instances.append(self)
+                def start(self): events.append("load_monitor_start"); return self
+                def check(self, **kwargs): return {"status": "OK"}
+                def stop(self):
+                    events.append("load_monitor_stop")
+                    self.root.mkdir(parents=True, exist_ok=True)
+                    (self.root / "gpu_samples.csv").write_bytes(b"flushed load telemetry\n")
+            safe = lambda: {"gpu_used_gib": 0.0, "gpu_free_gib": 100.0, "ram_available_gib": 600.0,
+                            "rss_gib": 0.0, "swap_used_gib": 0.0, "disk_free_gib": 20.0}
+            decoder_calls = []
+            def pilot(*args, **kwargs):
+                # Simulate the generation runner's normal terminal monitor flush.
+                kwargs["monitor"].stop()
+                return dict(raw_status)
+            def decoder_resume(*args, **kwargs):
+                decoder_calls.append(Path(kwargs["decoder_root"]).resolve())
+                decoder_api._verify_decoder_manifest(Path(kwargs["decoder_root"]).resolve())
+                return {"status": "COMPLETE", "decoder_calls": 16}
+            old = {name: getattr(official, name) for name in ("_validate_static_contract", "verify_pinned_bridge_assets",
+                "extract_task5_directions", "OfficialRuntimeFactory", "resource_samplers", "ResourceMonitor", "run_pilot",
+                "run_task6_decoder_replays")}
+            try:
+                official._validate_static_contract = lambda contract: None
+                official.verify_pinned_bridge_assets = lambda *args, **kwargs: {"action_sha256": "a" * 64, "video_sha256": "b" * 64}
+                official.extract_task5_directions = lambda *args, **kwargs: {"bank": np.zeros((3, 1)), "manifest_sha256": "a" * 64,
+                    "plan_sha256": "b" * 64, "direction_file_sha256": {}, "direction_sha256": {}}
+                official.OfficialRuntimeFactory = Factory
+                official.resource_samplers = lambda *args, **kwargs: {key: safe for key in ("gpu", "ram", "disk")}
+                official.ResourceMonitor = Monitor
+                official.run_pilot = pilot
+                official.run_task6_decoder_replays = decoder_resume
+                args = official.parse_args(["--phase", "pilot", "--run-dir", str(root), "--decoder-root", str(decoder_root),
+                    "--analysis-root", str(root / "analysis"), "--launch-contract", str(evidence), "--framework-root", str(root),
+                    "--checkpoint", str(root / "checkpoint"), "--vae", str(root / "vae"), "--action", str(root / "action"),
+                    "--video", str(root / "video"), "--task5-root", str(root), "--resume"])
+                with mock.patch.object(official, "_inspect_raw_complete", return_value=raw_status, create=True), \
+                     mock.patch("analyze_umi_task6.analyze_task6_run", return_value={"status": "COMPLETE"}):
+                    result = official._execute_official_impl(args)
+            finally:
+                for name, value in old.items(): setattr(official, name, value)
+            control_root = decoder_root.parent / (decoder_root.name + "_control")
+            self.assertEqual(result["status"], "COMPLETE")
+            self.assertEqual(decoder_calls, [decoder_root.resolve()])
+            self.assertEqual(Monitor.instances[0].root.resolve(), (control_root / "load_monitor").resolve())
+            self.assertTrue((control_root / "load_monitor" / "gpu_samples.csv").is_file())
+            self.assertEqual(manifest_before, ((decoder_root / "MANIFEST.sha256").read_bytes(),
+                                               (decoder_root / "MANIFEST.sha256").stat().st_mtime_ns))
+            decoder_api._verify_decoder_manifest(decoder_root)
+
+    def test_official_raw_complete_load_stop_marker_is_sibling_control_evidence(self):
+        import run_umi_task6_official as official
+        import umi_task6_decoder as decoder_api
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); decoder_root = root.parent / (root.name + "_decoder")
+            decoder_root.mkdir()
+            (decoder_root / "decoder_config.json").write_text("config\n", encoding="utf-8")
+            (decoder_root / "replay.json").write_text("record\n", encoding="utf-8")
+            decoder_api._decoder_manifest(decoder_root)
+            evidence = root / "evidence.json"
+            evidence.write_text('{"task5": {}, "prompt": "Put the pot to the left of the purple item."}', encoding="utf-8")
+            (root / "action").write_text(json.dumps([[0.0] * 10 for _ in range(16)]), encoding="utf-8")
+            (root / "video").write_bytes(b"video")
+            raw_status = {"status": "AWAITING_REVIEW", "phase": "PILOT", "generation_started": False,
+                          "smoke_run_id": "raw-stop-1", "hashes": {name: name + "-hash" for name in ("code", "model", "config", "direction", "input", "noise")},
+                          "group": {"state": "bridge_0", "seed": 0}, "completed_samples": [], "failed_samples": [], "skipped_samples": []}
+            class Runtime:
+                def cleanup(self): pass
+                def actual_identity(self): return {"fixture": "runtime"}
+            class Factory:
+                def __init__(self, **kwargs): pass
+                def build(self): raise AssertionError("preload stop must block raw model load")
+                def unload(self): pass
+            class Monitor:
+                def __init__(self, monitor_root, **kwargs): self.root = Path(monitor_root); self._thread = object()
+                def start(self): return self
+                def check(self, **kwargs): return {"status": "HARD_STOP", "reason_code": "LOAD_GATE", "reason": "load gate"}
+                def stop(self): pass
+            safe = lambda: {"gpu_used_gib": 0.0, "gpu_free_gib": 100.0, "ram_available_gib": 600.0,
+                            "rss_gib": 0.0, "swap_used_gib": 0.0, "disk_free_gib": 20.0}
+            old = {name: getattr(official, name) for name in ("_validate_static_contract", "verify_pinned_bridge_assets",
+                "extract_task5_directions", "OfficialRuntimeFactory", "resource_samplers", "ResourceMonitor")}
+            try:
+                official._validate_static_contract = lambda contract: None
+                official.verify_pinned_bridge_assets = lambda *args, **kwargs: {"action_sha256": "a" * 64, "video_sha256": "b" * 64}
+                official.extract_task5_directions = lambda *args, **kwargs: {"bank": np.zeros((3, 1)), "manifest_sha256": "a" * 64,
+                    "plan_sha256": "b" * 64, "direction_file_sha256": {}, "direction_sha256": {}}
+                official.OfficialRuntimeFactory = Factory
+                official.resource_samplers = lambda *args, **kwargs: {key: safe for key in ("gpu", "ram", "disk")}
+                official.ResourceMonitor = Monitor
+                args = official.parse_args(["--phase", "pilot", "--run-dir", str(root), "--decoder-root", str(decoder_root),
+                    "--launch-contract", str(evidence), "--framework-root", str(root), "--checkpoint", str(root / "checkpoint"),
+                    "--vae", str(root / "vae"), "--action", str(root / "action"), "--video", str(root / "video"),
+                    "--task5-root", str(root), "--resume"])
+                with mock.patch.object(official, "_inspect_raw_complete", return_value=raw_status, create=True):
+                    result = official._execute_official_impl(args)
+            finally:
+                for name, value in old.items(): setattr(official, name, value)
+            control_root = decoder_root.parent / (decoder_root.name + "_control")
+            self.assertEqual(result["status"], "AWAITING_REVIEW")
+            self.assertTrue((control_root / "load_resource_stop.json").is_file())
+            self.assertFalse((decoder_root / "load_resource_stop.json").exists())
+            decoder_api._verify_decoder_manifest(decoder_root)
+
+    def test_official_raw_complete_monitor_close_failure_blocks_decoder_and_preserves_raw_evidence(self):
+        import run_umi_task6_official as official
+        import run_umi_task6_experiment as runner
+        from test_run_umi_task6_experiment import Task6RunnerTests
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            api, runtime, inputs, counts, _ = Task6RunnerTests().public_chain(temp)
+            safe = lambda: {"gpu_used_gib": 0.0, "gpu_free_gib": 100.0, "gpu_reserved_gib": 0.0,
+                            "ram_available_gib": 600.0, "rss_gib": 0.0, "swap_used_gib": 0.0, "disk_free_gib": 20.0}
+            raw = api.run_pilot(runtime, inputs, temp,
+                                monitor=api.ResourceMonitor(temp, gpu_sampler=safe, ram_sampler=safe, disk_sampler=safe))
+            self.assertEqual(raw["status"], "AWAITING_REVIEW")
+            status_path = root / "run_status.json"
+            telemetry_names = ("gpu_samples.csv", "ram_samples.csv", "disk_samples.csv",
+                               "sample_resource_snapshots.csv", "sample_resource_snapshots.jsonl")
+            status_before = (status_path.read_bytes(), status_path.stat().st_mtime_ns)
+            telemetry_before = {name: ((root / name).read_bytes(), (root / name).stat().st_mtime_ns)
+                                for name in telemetry_names}
+            evidence = root / "official-evidence.json"
+            evidence.write_text('{"task5": {}, "prompt": "Put the pot to the left of the purple item."}', encoding="utf-8")
+            action = root / "official-action.json"; action.write_text(json.dumps(inputs.action.tolist()), encoding="utf-8")
+            video = root / "official-video.mp4"; video.write_bytes(b"video")
+            decoder_root = root.parent / (root.name + "_decoder")
+            decoder_calls = []
+            class Factory:
+                def __init__(self, **kwargs): pass
+                def build(self): return runtime, inputs, object()
+                def unload(self): pass
+            class ExplodingStop(runner.ResourceMonitor):
+                def stop(self):
+                    raise RuntimeError("derived load monitor join failed")
+            old = {name: getattr(official, name) for name in ("_validate_static_contract", "verify_pinned_bridge_assets",
+                "extract_task5_directions", "OfficialRuntimeFactory", "resource_samplers", "ResourceMonitor",
+                "run_task6_decoder_replays")}
+            try:
+                official._validate_static_contract = lambda contract: None
+                official.verify_pinned_bridge_assets = lambda *args, **kwargs: {"action_sha256": "a" * 64, "video_sha256": "b" * 64}
+                official.extract_task5_directions = lambda *args, **kwargs: {"bank": np.zeros((3, 1)), "manifest_sha256": "a" * 64,
+                    "plan_sha256": "b" * 64, "direction_file_sha256": {}, "direction_sha256": {}}
+                official.OfficialRuntimeFactory = Factory
+                official.resource_samplers = lambda *args, **kwargs: {key: safe for key in ("gpu", "ram", "disk")}
+                official.ResourceMonitor = ExplodingStop
+                official.run_task6_decoder_replays = lambda *args, **kwargs: decoder_calls.append(True) or self.fail("decoder must be blocked by monitor close failure")
+                args = official.parse_args(["--phase", "pilot", "--run-dir", str(root), "--decoder-root", str(decoder_root),
+                    "--launch-contract", str(evidence), "--framework-root", str(root), "--checkpoint", str(root / "checkpoint"),
+                    "--vae", str(root / "vae"), "--action", str(action), "--video", str(video), "--task5-root", str(root), "--resume"])
+                with mock.patch.object(official, "_inspect_raw_complete", return_value=raw, create=True):
+                    with self.assertRaisesRegex(runner.ResourceStop, "derived load monitor join failed"):
+                        official._execute_official_impl(args)
+            finally:
+                for name, value in old.items(): setattr(official, name, value)
+            control_root = decoder_root.parent / (decoder_root.name + "_control")
+            self.assertEqual(decoder_calls, [])
+            self.assertTrue((control_root / "load_resource_stop.json").is_file())
+            self.assertEqual((status_path.read_bytes(), status_path.stat().st_mtime_ns), status_before)
+            self.assertEqual(telemetry_before, {name: ((root / name).read_bytes(), (root / name).stat().st_mtime_ns)
+                                                for name in telemetry_names})
+
     def test_official_pilot_stops_preload_monitor_when_model_load_fails(self):
         import run_umi_task6_official as official
         with tempfile.TemporaryDirectory() as temp:

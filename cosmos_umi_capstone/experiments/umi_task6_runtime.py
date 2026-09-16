@@ -704,11 +704,11 @@ def _run_task6_group(runtime: Any, inputs: Task6Inputs, run_dir: str | Path, *, 
                     close = getattr(monitor, "abort", None) if same_root else getattr(monitor, "stop", None)
                     if callable(close) and getattr(monitor, "_thread", None) is not None:
                         try: close()
-                        except BaseException:
-                            # The raw run is already complete; cleanup
-                            # telemetry must not rewrite its status or trigger
-                            # generation on a resume attempt.
-                            pass
+                        except BaseException as error:
+                            # A complete raw run is immutable, but a failed
+                            # monitor join/abort is still a hard stop.  Do
+                            # not turn an unsafe close into a normal resume.
+                            raise ResourceStop(f"completed raw resume monitor close failed: {error}") from error
                 return existing_status
         if monitor is not None and hasattr(monitor, "start") and getattr(monitor, "_thread", None) is None:
             try:
