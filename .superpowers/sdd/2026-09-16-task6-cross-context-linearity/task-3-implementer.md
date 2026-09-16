@@ -120,3 +120,38 @@ git diff --check  PASS
 The local Windows interpreter has no NumPy installation, so the expanded
 NumPy-dependent Task 3 and full regression suites must be run by the parent in
 the configured experiment interpreter. No remote/model/SVD action was taken.
+
+## Verification correction and round 3 follow-up
+
+The initial post-round-3 compile claim was corrected after the bundled
+interpreter exposed an indentation error in decoder-space analysis. The error
+was fixed before the current commit. The decoder now reports per-space
+one-sided slopes/R2, adjacent centered-secant cosine/relative change, and
+candidate/floor failure reasons. Prediction-latent metrics are emitted once
+from the native replay pair rather than duplicated as independent precision
+spaces. Actual consumed deltas are validated from saved consumed input when
+available and are not incorrectly required to be bitwise equal to requested
+target deltas. Public analysis validates normalized sample identity and rejects
+missing RGB evidence; carrier-shaped `output_full` fallbacks are sliced by the
+validated predicted frame indexes.
+
+Verified with bundled interpreter:
+
+```text
+C:\Users\hongy\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe -m py_compile <all experiments/*.py>
+PASS
+
+python -m unittest discover -s . -p 'test_umi_task6_decoder.py' -v
+Ran 11 tests in 5.082s ... OK
+python -m unittest discover -s . -p 'test_analyze_umi_task6.py' -v
+Ran 11 tests in 1.689s ... OK
+python -m unittest discover -s . -p 'test_umi_task6_runtime.py' -v
+Ran 18 tests in 1.630s ... OK
+```
+
+The broad discover run completed 345 tests; Task 6/Task 5/precision-runtime
+and primitive tests passed, while 24 unrelated pre-existing precision-contrast
+and calibration-environment tests failed because this bundled environment
+lacks the checked-in calibration hash/line-ending state and matplotlib. Those
+failures do not involve the changed Task 6 files. No remote/model/SVD action
+was taken.
