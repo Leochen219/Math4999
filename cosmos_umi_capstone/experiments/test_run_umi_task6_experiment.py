@@ -382,10 +382,16 @@ class Task6RunnerTests(unittest.TestCase):
             second = api.run_pilot(runtime, inputs, temp, resume=True,
                                    monitor=api.ResourceMonitor(temp, gpu_sampler=safe, ram_sampler=safe, disk_sampler=safe))
             self.assertEqual(second["status"], "AWAITING_REVIEW"); self.assertEqual(counts["pilot_execute"], 32)
+            self.assertEqual(len(second["skipped_samples"]), 2)
             for name, (hashes, mtime) in first_samples.items():
                 sample = Path(temp, "samples", name)
                 self.assertEqual(mtime, sample.stat().st_mtime_ns)
                 self.assertEqual(hashes, [(str(p.relative_to(sample)), hashlib.sha256(p.read_bytes()).hexdigest(), p.stat().st_mtime_ns) for p in sorted(sample.rglob("*")) if p.is_file()])
+            runtime.execute = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("partial raw-complete resume must skip generation"))
+            third = api.run_pilot(runtime, inputs, temp, resume=True,
+                                  monitor=api.ResourceMonitor(temp, gpu_sampler=safe, ram_sampler=safe, disk_sampler=safe))
+            self.assertEqual(third, second)
+            self.assertEqual(counts["pilot_execute"], 32)
 
     def test_public_resume_of_complete_raw_run_skips_generation_and_keeps_status(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -394,6 +400,10 @@ class Task6RunnerTests(unittest.TestCase):
                             "ram_available_gib": 600, "rss_gib": 0, "swap_used_gib": 0, "disk_free_gib": 20}
             first = api.run_pilot(runtime, inputs, temp, monitor=api.ResourceMonitor(temp, gpu_sampler=safe, ram_sampler=safe, disk_sampler=safe))
             self.assertEqual(first["status"], "AWAITING_REVIEW")
+            telemetry = ("gpu_samples.csv", "ram_samples.csv", "disk_samples.csv",
+                         "sample_resource_snapshots.csv", "sample_resource_snapshots.jsonl")
+            telemetry_before = {name: ((Path(temp) / name).read_bytes(), (Path(temp) / name).stat().st_mtime_ns)
+                                for name in telemetry}
             status_path = Path(temp) / "run_status.json"; before = (status_path.read_bytes(), status_path.stat().st_mtime_ns)
             runtime.execute = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("complete raw resume must skip generation"))
             resumed_monitor = api.ResourceMonitor(temp, gpu_sampler=safe, ram_sampler=safe, disk_sampler=safe)
@@ -401,6 +411,8 @@ class Task6RunnerTests(unittest.TestCase):
             resumed = api.run_pilot(runtime, inputs, temp, resume=True, monitor=resumed_monitor)
             self.assertEqual(resumed, json.loads(before[0].decode()))
             self.assertEqual((status_path.read_bytes(), status_path.stat().st_mtime_ns), before)
+            self.assertEqual(telemetry_before, {name: ((Path(temp) / name).read_bytes(), (Path(temp) / name).stat().st_mtime_ns)
+                                                for name in telemetry})
             self.assertFalse(resumed_monitor._thread.is_alive())
 
 

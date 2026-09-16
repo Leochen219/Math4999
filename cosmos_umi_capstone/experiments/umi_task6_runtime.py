@@ -269,12 +269,20 @@ class Task6RuntimeAdapter:
         actual_delta = np.subtract(consumed, target.z_bar, dtype=np.float32)
         direction = np.zeros_like(target.z_bar, dtype=np.float32)
         expected_delta = np.zeros_like(target.z_bar, dtype=np.float32)
+        realized_target_delta = np.zeros_like(target.z_bar, dtype=np.float32)
         if spec.get("kind") == "perturbation":
             direction = np.array(target.directions[spec["direction_id"]], dtype=np.float32, copy=True)
             expected_delta = np.multiply(np.float32(spec["sign"] * float(spec["alpha"]) * target.s_z), direction, dtype=np.float32)
             expected_delta[~target.geometry.mask] = 0.0
+        # ``target_delta_fp32`` is the delta in the actual FP32 carrier, not
+        # the unrounded scalar formula above.  A large carrier can absorb a
+        # mathematically nonzero perturbation as a different representable
+        # delta (or zero), and that realized value is the protocol boundary.
+        requested_target = target.for_spec({**request, "state": target.state, "seed": target.seed})
+        realized_target_delta = np.subtract(requested_target, target.z_bar, dtype=np.float32)
         fields = {"z_bar": np.array(target.z_bar, dtype=np.float32, copy=True), "mask": np.array(target.geometry.mask, dtype=bool, copy=True),
-                  "direction": direction, "actual_delta_fp32": actual_delta, "target_delta_fp32": expected_delta,
+                  "direction": direction, "actual_delta_fp32": actual_delta, "target_delta_fp32": realized_target_delta,
+                  "theoretical_delta_fp32": expected_delta,
                   "consumed_input_fp32": np.array(consumed, dtype=np.float32, copy=True), "s_z": float(target.s_z), "spec": dict(request), "group": {"state": target.state, "seed": target.seed}, "seed": target.seed, "model_seed": target.seed}
         for name, value in fields.items():
             if name in record:
@@ -671,21 +679,36 @@ def _run_task6_group(runtime: Any, inputs: Task6Inputs, run_dir: str | Path, *, 
         if resume and status_path.is_file():
             existing_status = json.loads(status_path.read_text(encoding="utf-8"))
             expected_ids = {item["sample_id"] for item in plan}
-            completed_ids = set(existing_status.get("completed_samples", []))
-            if (existing_status.get("status") in {"AWAITING_REVIEW", "COMPLETE"} and
-                    len(completed_ids) == 32 and completed_ids == expected_ids and
-                    not existing_status.get("failed_samples") and
-                    not existing_status.get("skipped_samples") and
-                    dict(existing_status.get("hashes", {})) == hashes):
-                if (monitor is not None and getattr(monitor, "_thread", None) is not None and
-                        callable(getattr(monitor, "stop", None))):
-                    try:
-                        monitor.stop()
-                    except BaseException:
-                        # The raw run is already complete; cleanup telemetry
-                        # must not rewrite its immutable status or trigger
-                        # generation on a resume attempt.
-                        pass
+            existing_completed = existing_status.get("completed_samples", [])
+            existing_failed = existing_status.get("failed_samples", [])
+            existing_skipped = existing_status.get("skipped_samples", [])
+            try:
+                completed_ids = set(existing_completed) if isinstance(existing_completed, list) else set()
+                skipped_ids = set(existing_skipped) if isinstance(existing_skipped, list) else set()
+            except TypeError:
+                completed_ids = skipped_ids = set()
+            raw_complete = (existing_status.get("status") in {"AWAITING_REVIEW", "COMPLETE"} and
+                            isinstance(existing_completed, list) and len(existing_completed) == 32 and
+                            len(completed_ids) == 32 and completed_ids == expected_ids and
+                            isinstance(existing_failed, list) and not existing_failed and
+                            isinstance(existing_skipped, list) and len(existing_skipped) == len(skipped_ids) and
+                            skipped_ids.issubset(expected_ids) and
+                            dict(existing_status.get("hashes", {})) == hashes)
+            if raw_complete:
+                # A raw monitor is part of the completed run's evidence.  A
+                # derived monitor may be closed normally, but a monitor rooted
+                # at the raw run must be joined without flushing new files.
+                if monitor is not None:
+                    monitor_root = getattr(monitor, "root", None)
+                    same_root = monitor_root is not None and Path(monitor_root).resolve() == root.resolve()
+                    close = getattr(monitor, "abort", None) if same_root else getattr(monitor, "stop", None)
+                    if callable(close) and getattr(monitor, "_thread", None) is not None:
+                        try: close()
+                        except BaseException:
+                            # The raw run is already complete; cleanup
+                            # telemetry must not rewrite its status or trigger
+                            # generation on a resume attempt.
+                            pass
                 return existing_status
         if monitor is not None and hasattr(monitor, "start") and getattr(monitor, "_thread", None) is None:
             try:

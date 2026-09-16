@@ -187,6 +187,19 @@ class ResourceMonitor:
         _atomic_text(self.root / "sample_resource_snapshots.jsonl", "".join(json.dumps(row, sort_keys=True, allow_nan=False) + "\n" for row in self._sample_rows))
         if self.failure is not None: raise RuntimeError("resource monitor failed") from self.failure
 
+    def abort(self):
+        """Stop a monitor without publishing telemetry to its root.
+
+        A completed raw generation run is immutable evidence when it is opened
+        for a decoder-only resume.  Joining the polling thread is still
+        required, but flushing an empty/derived sample set into the raw root
+        would overwrite the original telemetry files.
+        """
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+            if self._thread.is_alive(): self.failure = RuntimeError("resource monitor did not terminate")
+
     @property
     def last_resources(self) -> dict[str, Any]:
         latest = {}
@@ -537,10 +550,20 @@ def authorize_pilot(run_dir: str | Path, *, expected_hashes: Mapping[str, str] |
     expected_ids = {item["sample_id"] for item in build_generation_plan(
         status.get("group", {}).get("state", "bridge_0"),
         int(status.get("group", {}).get("seed", 0)))}
-    completed_ids = set(status.get("completed_samples", []))
+    completed = status.get("completed_samples", [])
+    failed = status.get("failed_samples", [])
+    skipped = status.get("skipped_samples", [])
+    try:
+        completed_ids = set(completed) if isinstance(completed, list) else set()
+        skipped_ids = set(skipped) if isinstance(skipped, list) else set()
+    except TypeError:
+        completed_ids = skipped_ids = set()
     raw_complete = (status.get("status") in {"AWAITING_REVIEW", "COMPLETE"} and
-                    completed_ids == expected_ids and len(completed_ids) == 32 and
-                    not status.get("failed_samples") and not status.get("skipped_samples"))
+                    isinstance(completed, list) and len(completed) == 32 and
+                    len(completed_ids) == 32 and completed_ids == expected_ids and
+                    isinstance(failed, list) and not failed and
+                    isinstance(skipped, list) and len(skipped) == len(skipped_ids) and
+                    skipped_ids.issubset(expected_ids))
     if status.get("status") not in {"AWAITING_RESOURCE_REVIEW", "RESOURCE_STOP"} and not (resume and raw_complete):
         raise BlockedExecution("pilot status is not resumable")
     if status.get("smoke_run_id") != acceptance.get("smoke_run_id"):

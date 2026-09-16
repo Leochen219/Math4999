@@ -158,7 +158,18 @@ def _derive_plan_detail(records: Mapping[str, Mapping[str, Any]]) -> dict[str, A
         sign = 0 if sample_id.startswith("baseline_") else (1 if sample_id.endswith("plus") else -1)
         expected_delta = np.multiply(np.float32(sign * alpha * s_z), expected_direction, dtype=np.float32); expected_delta[~mask] = 0.0
         target_delta = np.asarray(item["target_delta_fp32"], np.float32); actual_delta = np.asarray(item["actual_delta_fp32"], np.float32)
-        if target_delta.shape != z_bar.shape or not np.array_equal(target_delta, expected_delta): raise ValueError(f"sample {sample_id} target delta mismatch")
+        if target_delta.shape != z_bar.shape: raise ValueError(f"sample {sample_id} target delta shape mismatch")
+        if "theoretical_delta_fp32" in item:
+            realized_target = np.subtract(np.add(z_bar, expected_delta, dtype=np.float32), z_bar, dtype=np.float32)
+            if not np.array_equal(target_delta, realized_target): raise ValueError(f"sample {sample_id} target delta mismatch")
+            theoretical_delta = np.asarray(item["theoretical_delta_fp32"], np.float32)
+            if theoretical_delta.shape != z_bar.shape or not np.array_equal(theoretical_delta, expected_delta):
+                raise ValueError(f"sample {sample_id} theoretical delta mismatch")
+        elif not np.array_equal(target_delta, expected_delta):
+            # Keep historical Task 6 fixtures readable; the explicit
+            # theoretical field above disambiguates new realized-target
+            # evidence from this legacy schema.
+            raise ValueError(f"sample {sample_id} target delta mismatch")
         if actual_delta.shape != z_bar.shape or not np.all(np.isfinite(actual_delta)) or not np.all(actual_delta[~mask] == 0.0): raise ValueError(f"sample {sample_id} consumed delta geometry mismatch")
         consumed = np.asarray(item["consumed_input_fp32"], np.float32)
         if consumed.shape != z_bar.shape or not np.all(np.isfinite(consumed)) or not np.array_equal(np.subtract(consumed, z_bar, dtype=np.float32), actual_delta): raise ValueError(f"sample {sample_id} consumed input does not reproduce actual delta")

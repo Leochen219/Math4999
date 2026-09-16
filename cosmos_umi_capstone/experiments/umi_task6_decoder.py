@@ -287,7 +287,17 @@ def _verify_raw_task6(root: Path) -> tuple[str, Mapping[str, Any]]:
     status = json.loads(status_path.read_text(encoding="utf-8"))
     expected = [item["sample_id"] for item in build_generation_plan(status.get("group", {}).get("state", "bridge_0"), int(status.get("group", {}).get("seed", 0)))]
     completed = status.get("completed_samples", [])
-    if status.get("status") not in {"AWAITING_REVIEW", "COMPLETE"} or len(completed) != 32 or len(set(completed)) != 32 or set(completed) != set(expected):
+    failed = status.get("failed_samples", [])
+    skipped = status.get("skipped_samples", [])
+    try:
+        completed_ids = set(completed) if isinstance(completed, list) else set()
+        skipped_ids = set(skipped) if isinstance(skipped, list) else set()
+    except TypeError:
+        completed_ids = skipped_ids = set()
+    if (status.get("status") not in {"AWAITING_REVIEW", "COMPLETE"} or
+            not isinstance(completed, list) or len(completed) != 32 or len(completed_ids) != 32 or completed_ids != set(expected) or
+            not isinstance(failed, list) or failed or not isinstance(skipped, list) or
+            len(skipped) != len(skipped_ids) or not skipped_ids.issubset(set(expected))):
         raise EvidenceError("decoder requires a completed 32-sample Task 6 raw run")
     manifest = root / "MANIFEST.sha256"
     if not manifest.is_file(): raise EvidenceError("Task 6 raw manifest is missing")

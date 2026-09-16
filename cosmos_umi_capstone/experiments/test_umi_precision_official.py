@@ -255,6 +255,52 @@ class OfficialTests(unittest.TestCase):
         with self.assertRaises(EvidenceError):
             runtime.execute({"sample_id": "actual-mismatch", "group": "B", "alpha": 0., "sign": 0}, runtime.inputs, scope="full")
 
+    def test_task6_adapter_accepts_realized_target_delta_from_official_runtime(self):
+        from umi_fd_post_vae_bridge import construct_delta, sha256_array
+        from umi_precision_primitives import mask_geometry
+        from umi_task6_runtime import Task6RuntimeAdapter
+        runtime_api = self.api
+        ops = Ops()
+        model = Model(ops)
+        shape = (1, 1, 3, 2, 2)
+        mask = np.zeros(shape, dtype=bool); mask[:, :, 0] = True
+        z_bar = np.full(shape, 1.0e8, dtype=np.float32)
+        direction = np.zeros(shape, dtype=np.float32); direction[mask] = 1.0
+        geometry = mask_geometry((0,), mask, shape)
+        class Inputs:
+            state = "bridge_0"; seed = 0; s_z = 1.0e8
+            def __init__(self):
+                self.z0 = z_bar.copy(); self.z_bar = z_bar.copy(); self.direction = direction.copy()
+                self.directions = {"v0": self.direction.copy()}; self.geometry = geometry
+            def identity(self): return {"fixture": "realized-target", "z_bar": sha256_array(self.z_bar)}
+            def for_spec(self, spec):
+                if spec.get("kind") == "baseline": return self.z_bar.copy()
+                return construct_delta(self.z_bar, self.geometry.mask, self.direction,
+                                       alpha=spec["alpha"], sign=spec["sign"]).latent
+            def direction_for_spec(self, spec):
+                return np.zeros_like(self.z_bar) if spec.get("kind") == "baseline" else self.direction.copy()
+        task_inputs = Inputs()
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint = Path(tmp) / "checkpoint.bin"
+            decoder = Path(tmp) / "decoder.bin"
+            checkpoint.write_bytes(b"checkpoint")
+            decoder.write_bytes(b"decoder")
+            official = runtime_api.OfficialPrecisionRuntime(
+                model, {"prompt": "mouse", "action": [1, 2]}, np.expand_dims(direction, 0),
+                provenance={"decode": "fixture-fixed", "seed": 0}, ops=ops, scheduler_class=Scheduler,
+                generation_settings={"num_steps": 2, "guidance": 1., "shift": 10.},
+                artifact_paths={"checkpoint": checkpoint, "decoder": decoder},
+                model_seed=0, inputs_factory=lambda carrier, indexes, packed_mask, bank: task_inputs)
+            adapter = Task6RuntimeAdapter(official, task_inputs)
+            spec = {"sample_id": "v0_alpha_00_plus", "kind": "perturbation", "direction_id": "v0",
+                    "alpha": 1.0e-7, "sign": 1, "state": "bridge_0", "seed": 0}
+            record = adapter.execute(spec)
+            realized = np.subtract(task_inputs.for_spec(spec), task_inputs.z_bar, dtype=np.float32)
+            self.assertFalse(np.array_equal(realized, np.multiply(np.float32(10.0), direction, dtype=np.float32)))
+            np.testing.assert_array_equal(record["target_delta_fp32"], realized)
+            np.testing.assert_array_equal(record["actual_delta_fp32"], realized)
+            np.testing.assert_array_equal(record["theoretical_delta_fp32"], np.multiply(np.float32(10.0), direction, dtype=np.float32))
+
     def test_step_zero_module_stops_before_scheduler_update_and_decode(self):
         runtime, model = self.fixture()
         spec = {"sample_id": "module", "group": "B", "alpha": 0., "sign": 0}

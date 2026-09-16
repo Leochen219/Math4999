@@ -421,6 +421,186 @@ class OperationalTask6Tests(unittest.TestCase):
             self.assertLess(events.index("monitor_start"), events.index("factory_build") if "factory_build" in events else len(events), events)
             self.assertIn("factory_unload", events)
 
+    def test_official_preload_stop_preserves_accepted_smoke_binding(self):
+        import run_umi_task6_official as official
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            evidence = root / "evidence.json"
+            evidence.write_text('{"task5": {}, "prompt": "Put the pot to the left of the purple item."}', encoding="utf-8")
+            (root / "action").write_text(json.dumps([[0.0] * 10 for _ in range(16)]), encoding="utf-8")
+            (root / "video").write_bytes(b"video")
+            six = {name: name + "-hash" for name in ("code", "model", "config", "direction", "input", "noise")}
+            prior = {"status": "AWAITING_RESOURCE_REVIEW", "phase": "PILOT", "generation_started": False,
+                     "smoke_run_id": "smoke-accepted-1", "hashes": six, "group": {"state": "bridge_0", "seed": 0},
+                     "completed_samples": [], "failed_samples": [], "skipped_samples": [], "smoke_decision": {"status": "AWAITING_RESOURCE_REVIEW"}}
+            (root / "run_status.json").write_text(json.dumps(prior), encoding="utf-8")
+            (root / "smoke_acceptance.json").write_text(json.dumps({"status": "AWAITING_RESOURCE_REVIEW", "smoke_decision_accepted": True,
+                "smoke_run_id": prior["smoke_run_id"], "hashes": six}), encoding="utf-8")
+            class Factory:
+                def __init__(self, **kwargs): pass
+                def build(self): self.fail("preload hard-stop must not load the model")
+                def unload(self): pass
+            class Monitor:
+                last_resources = {"gpu_used_gib": 0.0, "gpu_free_gib": 100.0, "ram_available_gib": 600.0,
+                                  "rss_gib": 0.0, "swap_used_gib": 0.0, "disk_free_gib": 20.0}
+                def __init__(self, *args, **kwargs): pass
+                def start(self): return self
+                def check(self, **kwargs): return {"status": "HARD_STOP", "reason_code": "GPU_START_USED_HIGH", "reason": "unsafe"}
+                def stop(self): pass
+            safe = lambda: dict(Monitor.last_resources)
+            old = {name: getattr(official, name) for name in ("_validate_static_contract", "verify_pinned_bridge_assets",
+                "extract_task5_directions", "OfficialRuntimeFactory", "resource_samplers", "ResourceMonitor")}
+            try:
+                official._validate_static_contract = lambda contract: None
+                official.verify_pinned_bridge_assets = lambda *args, **kwargs: {"action_sha256": "a" * 64, "video_sha256": "b" * 64}
+                official.extract_task5_directions = lambda *args, **kwargs: {"bank": np.zeros((3, 1)), "manifest_sha256": "a" * 64,
+                    "plan_sha256": "b" * 64, "direction_file_sha256": {}, "direction_sha256": {}}
+                official.OfficialRuntimeFactory = Factory
+                official.resource_samplers = lambda *args, **kwargs: {key: safe for key in ("gpu", "ram", "disk")}
+                official.ResourceMonitor = Monitor
+                args = official.parse_args(["--phase", "pilot", "--run-dir", str(root), "--launch-contract", str(evidence),
+                    "--framework-root", str(root), "--checkpoint", str(root / "checkpoint"), "--vae", str(root / "vae"),
+                    "--action", str(root / "action"), "--video", str(root / "video"), "--task5-root", str(root)])
+                result = official._execute_official_impl(args)
+            finally:
+                for name, value in old.items(): setattr(official, name, value)
+            self.assertEqual(result["status"], "RESOURCE_STOP")
+            self.assertEqual(result["smoke_run_id"], prior["smoke_run_id"])
+            self.assertEqual(result["hashes"], six)
+            self.assertEqual(result["group"], prior["group"])
+            self.assertEqual(json.loads((root / "run_status.json").read_text())["smoke_run_id"], prior["smoke_run_id"])
+
+    def test_official_raw_complete_preload_stop_preserves_complete_binding(self):
+        import run_umi_task6_official as official
+        from umi_task6_primitives import build_generation_plan
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            evidence = root / "evidence.json"
+            evidence.write_text('{"task5": {}, "prompt": "Put the pot to the left of the purple item."}', encoding="utf-8")
+            (root / "action").write_text(json.dumps([[0.0] * 10 for _ in range(16)]), encoding="utf-8")
+            (root / "video").write_bytes(b"video")
+            six = {name: name + "-hash" for name in ("code", "model", "config", "direction", "input", "noise")}
+            expected = [item["sample_id"] for item in build_generation_plan("bridge_0", 0)]
+            samples = root / "samples"
+            samples.mkdir()
+            for sample_id in expected:
+                sample = samples / sample_id
+                sample.mkdir()
+                (sample / "status.json").write_text(json.dumps({"status": "success", "artifact_sha256": {}}), encoding="utf-8")
+            prior = {"status": "AWAITING_REVIEW", "phase": "PILOT", "generation_started": False,
+                     "smoke_run_id": "smoke-accepted-complete", "hashes": six, "group": {"state": "bridge_0", "seed": 0},
+                     "completed_samples": expected, "failed_samples": [], "skipped_samples": [], "smoke_decision": {"status": "AWAITING_REVIEW"}}
+            (root / "run_status.json").write_text(json.dumps(prior), encoding="utf-8")
+            (root / "smoke_acceptance.json").write_text(json.dumps({"status": "AWAITING_RESOURCE_REVIEW", "smoke_decision_accepted": True,
+                "smoke_run_id": prior["smoke_run_id"], "hashes": six}), encoding="utf-8")
+            manifest_entries = []
+            for path in sorted(root.rglob("*")):
+                if path.is_file() and path.name != "MANIFEST.sha256":
+                    manifest_entries.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.relative_to(root).as_posix()}")
+            (root / "MANIFEST.sha256").write_text("\n".join(manifest_entries) + "\n", encoding="ascii")
+            class Factory:
+                def __init__(self, **kwargs): pass
+                def build(self): self.fail("preload hard-stop must not load the model")
+                def unload(self): pass
+            class Monitor:
+                last_resources = {"gpu_used_gib": 0.0, "gpu_free_gib": 100.0, "ram_available_gib": 600.0,
+                                  "rss_gib": 0.0, "swap_used_gib": 0.0, "disk_free_gib": 20.0}
+                def __init__(self, *args, **kwargs): pass
+                def start(self): return self
+                def check(self, **kwargs): return {"status": "HARD_STOP", "reason_code": "GPU_START_USED_HIGH", "reason": "unsafe"}
+                def stop(self): pass
+            safe = lambda: dict(Monitor.last_resources)
+            old = {name: getattr(official, name) for name in ("_validate_static_contract", "verify_pinned_bridge_assets",
+                "extract_task5_directions", "OfficialRuntimeFactory", "resource_samplers", "ResourceMonitor")}
+            try:
+                official._validate_static_contract = lambda contract: None
+                official.verify_pinned_bridge_assets = lambda *args, **kwargs: {"action_sha256": "a" * 64, "video_sha256": "b" * 64}
+                official.extract_task5_directions = lambda *args, **kwargs: {"bank": np.zeros((3, 1)), "manifest_sha256": "a" * 64,
+                    "plan_sha256": "b" * 64, "direction_file_sha256": {}, "direction_sha256": {}}
+                official.OfficialRuntimeFactory = Factory
+                official.resource_samplers = lambda *args, **kwargs: {key: safe for key in ("gpu", "ram", "disk")}
+                official.ResourceMonitor = Monitor
+                args = official.parse_args(["--phase", "pilot", "--run-dir", str(root), "--launch-contract", str(evidence),
+                    "--framework-root", str(root), "--checkpoint", str(root / "checkpoint"), "--vae", str(root / "vae"),
+                    "--action", str(root / "action"), "--video", str(root / "video"), "--task5-root", str(root), "--resume"])
+                result = official._execute_official_impl(args)
+            finally:
+                for name, value in old.items(): setattr(official, name, value)
+            self.assertEqual(result["status"], "AWAITING_REVIEW")
+            self.assertEqual(result["smoke_run_id"], prior["smoke_run_id"])
+            self.assertEqual(result["hashes"], six)
+            self.assertEqual(result["completed_samples"], expected)
+            self.assertEqual(json.loads((root / "run_status.json").read_text())["status"], "AWAITING_REVIEW")
+
+    def test_official_derived_resume_consumes_latched_loader_stop_before_decoder(self):
+        import run_umi_task6_official as official
+        from umi_task6_primitives import build_generation_plan
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            evidence = root / "evidence.json"
+            evidence.write_text('{"task5": {}, "prompt": "Put the pot to the left of the purple item."}', encoding="utf-8")
+            (root / "action").write_text(json.dumps([[0.0] * 10 for _ in range(16)]), encoding="utf-8")
+            (root / "video").write_bytes(b"video")
+            six = {name: name + "-hash" for name in ("code", "model", "config", "direction", "input", "noise")}
+            expected = [item["sample_id"] for item in build_generation_plan("bridge_0", 0)]
+            raw_status = {"status": "AWAITING_REVIEW", "phase": "PILOT", "generation_started": False,
+                          "smoke_run_id": "smoke-derived", "hashes": six, "group": {"state": "bridge_0", "seed": 0},
+                          "completed_samples": expected, "failed_samples": [], "skipped_samples": []}
+            (root / "run_status.json").write_text(json.dumps(raw_status), encoding="utf-8")
+            raw_status_before = ((root / "run_status.json").read_bytes(), (root / "run_status.json").stat().st_mtime_ns)
+            class Runtime:
+                provenance = {"fixture": "runtime"}
+                def cleanup(self): pass
+                def actual_identity(self): return {"fixture": "runtime"}
+            runtime = Runtime()
+            inputs = object()
+            events = []
+            class Factory:
+                def __init__(self, **kwargs): pass
+                def build(self):
+                    events.append("loader_recovered")
+                    Monitor.instances[0].latched = {"status": "HARD_STOP", "reason_code": "GPU_TRANSIENT", "reason": "latched during load"}
+                    return runtime, inputs, object()
+                def unload(self): events.append("factory_unload")
+            class Monitor:
+                instances = []
+                def __init__(self, root, **kwargs):
+                    self.root = Path(root); self._thread = object(); self.latched = None; self.check_calls = 0
+                    Monitor.instances.append(self)
+                def start(self): events.append(("monitor_start", self.root.name)); return self
+                def check(self, **kwargs):
+                    self.check_calls += 1
+                    if self.latched is not None: return dict(self.latched)
+                    return {"status": "OK"}
+                def stop(self): events.append(("monitor_stop", self.root.name))
+            safe = lambda: {"gpu_used_gib": 0.0, "gpu_free_gib": 100.0, "ram_available_gib": 600.0,
+                            "rss_gib": 0.0, "swap_used_gib": 0.0, "disk_free_gib": 20.0}
+            old = {name: getattr(official, name) for name in ("_validate_static_contract", "verify_pinned_bridge_assets",
+                "extract_task5_directions", "OfficialRuntimeFactory", "resource_samplers", "ResourceMonitor", "run_pilot",
+                "run_task6_decoder_replays")}
+            try:
+                official._validate_static_contract = lambda contract: None
+                official.verify_pinned_bridge_assets = lambda *args, **kwargs: {"action_sha256": "a" * 64, "video_sha256": "b" * 64}
+                official.extract_task5_directions = lambda *args, **kwargs: {"bank": np.zeros((3, 1)), "manifest_sha256": "a" * 64,
+                    "plan_sha256": "b" * 64, "direction_file_sha256": {}, "direction_sha256": {}}
+                official.OfficialRuntimeFactory = Factory
+                official.resource_samplers = lambda *args, **kwargs: {key: safe for key in ("gpu", "ram", "disk")}
+                official.ResourceMonitor = Monitor
+                official.run_pilot = lambda *args, **kwargs: dict(raw_status)
+                official.run_task6_decoder_replays = lambda *args, **kwargs: self.fail("latched loader stop must block decoder")
+                args = official.parse_args(["--phase", "pilot", "--run-dir", str(root), "--launch-contract", str(evidence),
+                    "--framework-root", str(root), "--checkpoint", str(root / "checkpoint"), "--vae", str(root / "vae"),
+                    "--action", str(root / "action"), "--video", str(root / "video"), "--task5-root", str(root), "--resume"])
+                with mock.patch.object(official, "_inspect_raw_complete", return_value=raw_status, create=True):
+                    result = official._execute_official_impl(args)
+            finally:
+                for name, value in old.items(): setattr(official, name, value)
+            self.assertEqual(result["status"], "AWAITING_REVIEW")
+            self.assertIn("loader_recovered", events)
+            self.assertEqual(Monitor.instances[0].check_calls, 2)
+            self.assertNotEqual(Monitor.instances[0].root.resolve(), root.resolve())
+            self.assertEqual(raw_status_before, ((root / "run_status.json").read_bytes(), (root / "run_status.json").stat().st_mtime_ns))
+
     def test_official_pilot_stops_preload_monitor_when_model_load_fails(self):
         import run_umi_task6_official as official
         with tempfile.TemporaryDirectory() as temp:

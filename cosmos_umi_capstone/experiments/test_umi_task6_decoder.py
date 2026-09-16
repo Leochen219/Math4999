@@ -206,7 +206,14 @@ class DecoderTests(unittest.TestCase):
             def identity(self): return {"encoder_state": "encoder-v1", "code": "fixture"}
             def __call__(self, frame): return np.asarray(frame, np.float32).mean(keepdims=True)
         with tempfile.TemporaryDirectory() as temporary:
-            raw = Path(temporary) / "raw"; self._raw(raw); decoder = Path(temporary) / "decoder"
+            raw = Path(temporary) / "raw"; self._raw(raw)
+            status_path = raw / "run_status.json"
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            status["failed_samples"] = []
+            status["skipped_samples"] = [status["completed_samples"][0], status["completed_samples"][1]]
+            status_path.write_text(json.dumps(status), encoding="utf-8")
+            self.assertEqual(len(api._verify_raw_task6(raw)[1]["skipped_samples"]), 2)
+            decoder = Path(temporary) / "decoder"
             first = Runtime(3); stopped = api.run_task6_decoder_replays(first, raw, encoder=Encoder(), decoder_root=decoder)
             self.assertEqual(stopped["status"], "BLOCKED"); self.assertEqual(first.calls, 4)
             completed_dirs = [p for p in decoder.iterdir() if p.is_dir() and p.name.endswith(("__native_bf16", "__temporary_fp32"))]

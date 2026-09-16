@@ -208,10 +208,22 @@ def validate_capture(record, spec, inputs, scope, *, paired_noise=None):
     elif "decoded_final" in record:
         raise EvidenceError("module fallback must never decode")
     direction = inputs.direction_for_spec(spec) if hasattr(inputs, "direction_for_spec") else inputs.direction
-    target_delta = expected - inputs.z_bar
+    target_delta = np.subtract(np.asarray(expected, dtype=np.float32), np.asarray(inputs.z_bar, dtype=np.float32), dtype=np.float32)
+    if float(spec.get("alpha", 0.0)) == 0.0:
+        theoretical_delta = np.zeros_like(target_delta, dtype=np.float32)
+    else:
+        s_z = float(getattr(inputs, "s_z", np.sqrt(np.mean(
+            np.asarray(inputs.z_bar, dtype=np.float32)[mask].astype(np.float64) ** 2,
+            dtype=np.float64))))
+        theoretical_delta = np.multiply(
+            np.float32(int(spec["sign"]) * float(spec["alpha"]) * s_z),
+            np.asarray(direction, dtype=np.float32), dtype=np.float32)
+        theoretical_delta[~mask] = 0.0
+    actual_delta = np.subtract(np.asarray(actual, dtype=np.float32), np.asarray(inputs.z_bar, dtype=np.float32), dtype=np.float32)
     record.update({"initial_noise_hash": noise_hash, "predicted_latent": selected,
-                   "latent_slicing": slicing, "actual_delta_fp32": actual - inputs.z_bar,
+                   "latent_slicing": slicing, "actual_delta_fp32": actual_delta,
                    "target_delta_fp32": target_delta,
+                   "theoretical_delta_fp32": theoretical_delta,
                    "mask": mask.copy(), "direction": direction.copy(), "z_bar": inputs.z_bar.copy(),
                    "primary_quantity": "predicted_predecode_latent" if scope == "full" else "step_0_predicted_denoiser_output"})
     return noise_hash

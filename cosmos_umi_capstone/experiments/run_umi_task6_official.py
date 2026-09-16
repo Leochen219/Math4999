@@ -19,19 +19,19 @@ try:
     from .umi_task6_operational import (OfficialRuntimeFactory, OperationalEvidenceError, extract_task5_directions,
         prepare_bridge_upload_bundle, validate_launch_contract, verify_pinned_bridge_assets, observe_live_launch,
         _validate_static_contract)
-    from .umi_task6_primitives import STATE_CATALOG, evaluate_resources
+    from .umi_task6_primitives import STATE_CATALOG, build_generation_plan, evaluate_resources
     from .umi_task6_runtime import Task6Inputs, build_task6_hash_binding, preflight_task6, task6_binding_config
     from .run_umi_task6_experiment import (_atomic_json, BlockedExecution, ResourceMonitor,
         accept_resource_smoke, run_pilot, run_resource_smoke)
-    from .umi_task6_decoder import run_task6_decoder_replays
+    from .umi_task6_decoder import _verify_raw_task6, run_task6_decoder_replays
     from .umi_fd_post_vae_bridge import sha256_array
 except ImportError:  # pragma: no cover
     from umi_task6_operational import OfficialRuntimeFactory, OperationalEvidenceError, extract_task5_directions, prepare_bridge_upload_bundle, validate_launch_contract, verify_pinned_bridge_assets, observe_live_launch, _validate_static_contract
-    from umi_task6_primitives import STATE_CATALOG, evaluate_resources
+    from umi_task6_primitives import STATE_CATALOG, build_generation_plan, evaluate_resources
     from umi_task6_runtime import Task6Inputs, build_task6_hash_binding, preflight_task6, task6_binding_config
     from run_umi_task6_experiment import (_atomic_json, BlockedExecution, ResourceMonitor,
         accept_resource_smoke, run_pilot, run_resource_smoke)
-    from umi_task6_decoder import run_task6_decoder_replays
+    from umi_task6_decoder import _verify_raw_task6, run_task6_decoder_replays
     from umi_fd_post_vae_bridge import sha256_array
 
 
@@ -87,6 +87,46 @@ def build_inputs(factory: OfficialRuntimeFactory, runtime: Any, *, asset: Mappin
     return Task6Inputs(official.z0, list(geometry.condition_indexes), geometry.mask, direction["bank"],
                        z_bar=official.z_bar, action=action, prompt=factory.prompt, state="bridge_0", seed=0,
                        direction_hashes={k: sha256_array(v) for k, v in official.directions.items()})
+
+
+_TASK6_HASH_KEYS = frozenset(("code", "model", "config", "direction", "input", "noise"))
+
+
+def _status_claims_raw_complete(status: Mapping[str, Any], expected_ids: set[str]) -> bool:
+    """Validate the mutable status portion of a completed raw run."""
+    if not isinstance(status, Mapping) or status.get("status") not in {"AWAITING_REVIEW", "COMPLETE"}:
+        return False
+    completed = status.get("completed_samples", [])
+    failed = status.get("failed_samples", [])
+    skipped = status.get("skipped_samples", [])
+    try:
+        completed_ids = set(completed) if isinstance(completed, list) else set()
+        skipped_ids = set(skipped) if isinstance(skipped, list) else set()
+    except TypeError:
+        return False
+    return (isinstance(completed, list) and len(completed) == 32 and len(completed_ids) == 32 and
+            completed_ids == expected_ids and isinstance(failed, list) and not failed and
+            isinstance(skipped, list) and len(skipped) == len(skipped_ids) and
+            skipped_ids.issubset(expected_ids))
+
+
+def _inspect_raw_complete(run_dir: str | os.PathLike[str]) -> dict[str, Any] | None:
+    """Return a hash/manifest-bound raw status for decoder-only resumes."""
+    root = Path(run_dir)
+    try:
+        manifest_sha, status = _verify_raw_task6(root)
+        expected = {item["sample_id"] for item in build_generation_plan(
+            status.get("group", {}).get("state", "bridge_0"), int(status.get("group", {}).get("seed", 0)))}
+    except Exception:
+        return None
+    hashes = status.get("hashes")
+    if not _status_claims_raw_complete(status, expected) or not isinstance(hashes, Mapping) or set(hashes) != _TASK6_HASH_KEYS:
+        return None
+    if any(not isinstance(value, str) or not value for value in hashes.values()):
+        return None
+    result = dict(status)
+    result["raw_manifest_sha256"] = manifest_sha
+    return result
 
 
 def _execute_official_impl(args: argparse.Namespace) -> dict[str, Any]:
@@ -174,9 +214,81 @@ def _execute_official_impl(args: argparse.Namespace) -> dict[str, Any]:
                                   lifecycle={"pre_load": lambda: None, "load": load, "cleanup": cleanup, "unload": unload})
     if args.phase != "pilot": raise BlockedExecution("unknown official Task 6 phase")
     samplers = resource_samplers(args.run_dir, gpu_index=args.gpu_index)
-    monitor = ResourceMonitor(args.run_dir, gpu_sampler=samplers["gpu"], ram_sampler=samplers["ram"], disk_sampler=samplers["disk"])
+    decoder_root = Path(args.decoder_root) if args.decoder_root else Path(args.run_dir).parent / (Path(args.run_dir).name + "_decoder")
+    status_path = Path(args.run_dir) / "run_status.json"
+    try:
+        prior_status = load_json(status_path) if status_path.is_file() else {}
+    except OperationalEvidenceError:
+        prior_status = {}
+    acceptance_path = Path(args.run_dir) / "smoke_acceptance.json"
+    if acceptance_path.is_file():
+        try:
+            prior_acceptance = load_json(acceptance_path)
+        except OperationalEvidenceError:
+            prior_acceptance = {}
+        if isinstance(prior_acceptance, Mapping):
+            # The status is authoritative for sample progress, while an
+            # accepted-smoke sidecar is authoritative for its identity if a
+            # previous interrupted writer did not copy those fields over.
+            prior_status = dict(prior_status)
+            for key in ("smoke_run_id", "hashes"):
+                if key not in prior_status and key in prior_acceptance:
+                    prior_status[key] = prior_acceptance[key]
+    raw_binding = _inspect_raw_complete(args.run_dir) if bool(args.resume) else None
+    raw_status = dict(raw_binding) if raw_binding is not None else None
+    raw_manifest_sha = None if raw_binding is None else raw_binding.get("raw_manifest_sha256")
+    if raw_status is not None:
+        raw_status.pop("raw_manifest_sha256", None)
+        raw_root = Path(args.run_dir).resolve()
+        try:
+            decoder_root.resolve().relative_to(raw_root)
+        except ValueError:
+            pass
+        else:
+            raise OperationalEvidenceError("derived decoder root must be outside the immutable raw run")
+    monitor_root = decoder_root / "load_monitor" if raw_status is not None else Path(args.run_dir)
+    monitor = ResourceMonitor(monitor_root, gpu_sampler=samplers["gpu"], ram_sampler=samplers["ram"], disk_sampler=samplers["disk"])
     monitor_started = False
     runtime = None
+
+    def monitor_needs_close() -> bool:
+        event = getattr(monitor, "_stop", None)
+        if event is not None and callable(getattr(event, "is_set", None)) and event.is_set():
+            return False
+        return getattr(monitor, "_thread", None) is not None
+
+    def close_monitor() -> list[dict[str, str]]:
+        nonlocal monitor_started
+        errors: list[dict[str, str]] = []
+        if monitor_started or monitor_needs_close():
+            try:
+                monitor.stop()
+            except BaseException as error:
+                errors.append({"type": type(error).__name__, "message": str(error)})
+        monitor_started = False
+        return errors
+
+    def resource_stop_payload(decision: Mapping[str, Any]) -> dict[str, Any]:
+        base = dict(raw_status or prior_status or {})
+        reason_code = decision.get("reason_code") or "RESOURCE_STOP"
+        reason = decision.get("reason") or "preload resource gate stopped"
+        if raw_status is not None:
+            # A complete raw run is immutable.  Persist a derived control
+            # record, while returning the original completion/status binding.
+            payload = dict(base)
+            payload.update({"resource_stop": True, "resource_stop_phase": "PILOT",
+                            "resource_stop_reason_code": reason_code, "resource_stop_reason": reason})
+            if raw_manifest_sha:
+                payload["raw_manifest_sha256"] = raw_manifest_sha
+            decoder_root.mkdir(parents=True, exist_ok=True)
+            _atomic_json(decoder_root / "load_resource_stop.json", payload)
+            return payload
+        payload = dict(base)
+        payload.update({"status": "RESOURCE_STOP", "phase": "PILOT", "generation_started": False,
+                        "reason_code": reason_code, "reason": reason})
+        _atomic_json(status_path, payload)
+        return payload
+
     try:
         # Start telemetry and enforce the current preload limits before the
         # loader can import or construct any model object. The monitor stays
@@ -185,21 +297,32 @@ def _execute_official_impl(args: argparse.Namespace) -> dict[str, Any]:
         preload = monitor.check(phase="preload", starting_new_sample=True,
                                 remaining_samples=32, run_dir=Path(args.run_dir))
         if preload.get("status") == "HARD_STOP":
-            payload = {"status": "RESOURCE_STOP", "phase": "PILOT", "generation_started": False,
-                       "reason_code": preload.get("reason_code") or "RESOURCE_STOP",
-                       "reason": preload.get("reason") or "preload resource gate stopped"}
-            _atomic_json(Path(args.run_dir) / "run_status.json", payload)
-            try:
-                monitor.stop()
-            finally:
-                monitor_started = False
-                factory.unload()
+            payload = resource_stop_payload(preload)
+            secondary = close_monitor()
+            if secondary and raw_status is None:
+                payload["secondary_errors"] = secondary
+                _atomic_json(status_path, payload)
+            factory.unload()
             return payload
         factory_result = factory.build(); runtime, inputs = factory_result[0], factory_result[1]
         encoder = factory_result[2] if len(factory_result) > 2 else getattr(runtime, "encoder", None)
         generation = run_pilot(runtime, inputs, args.run_dir, resume=bool(args.resume), monitor=monitor)
-        # run_pilot owns the monitor through its terminal status write.
+        # run_pilot normally owns the monitor through its terminal status
+        # write.  A derived raw resume still needs one final latched check
+        # after model load and before any decoder call.
         monitor_started = False
+        if raw_status is not None:
+            post_load = monitor.check(phase="pilot", starting_new_sample=False,
+                                      remaining_samples=0, run_dir=Path(args.run_dir))
+            if post_load.get("status") == "HARD_STOP":
+                payload = resource_stop_payload(post_load)
+                secondary = close_monitor()
+                if secondary:
+                    payload["secondary_errors"] = secondary
+                    _atomic_json(decoder_root / "load_resource_stop.json", payload)
+                try: runtime.cleanup()
+                finally: factory.unload()
+                return payload
     except BaseException:
         if monitor_started:
             try: monitor.stop()
@@ -217,7 +340,6 @@ def _execute_official_impl(args: argparse.Namespace) -> dict[str, Any]:
         try: runtime.cleanup()
         finally: factory.unload()
         raise OperationalEvidenceError("official loader must expose a condition encoder for decoder replay")
-    decoder_root = Path(args.decoder_root) if args.decoder_root else Path(args.run_dir).parent / (Path(args.run_dir).name + "_decoder")
     # Decoder telemetry is derived evidence and must not mutate the raw
     # generation monitor files or its immutable manifest.
     decoder_monitor = ResourceMonitor(decoder_root, gpu_sampler=samplers["gpu"], ram_sampler=samplers["ram"], disk_sampler=samplers["disk"])
@@ -254,8 +376,13 @@ def execute_official(args: argparse.Namespace) -> dict[str, Any]:
             prior = {}
         # Never replace a completed status with a later setup error.  A failed
         # preflight/smoke/pilot gets an explicit canonical status instead.
+        completed = prior.get("completed_samples", [])
+        try:
+            completed_ids = set(completed) if isinstance(completed, list) else set()
+        except TypeError:
+            completed_ids = set()
         raw_complete = (prior.get("status") in {"AWAITING_REVIEW", "COMPLETE"} and
-                        len(set(prior.get("completed_samples", []))) == 32)
+                        isinstance(completed, list) and len(completed) == 32 and len(completed_ids) == 32)
         preserve = raw_complete or (
             str(getattr(args, "phase", "unknown")) == "preflight" and
             prior.get("status") == "PREFLIGHT_COMPLETE")
