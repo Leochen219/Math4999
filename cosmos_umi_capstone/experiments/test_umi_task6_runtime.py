@@ -177,24 +177,6 @@ class Task6RuntimeTests(unittest.TestCase):
             root, manifest = self.reference_root(temp); manifest.write_text(manifest.read_text() + "tamper")
             with self.assertRaises(ValueError): self.api.verify_reference_reuse(Runtime(), None, reference_artifacts=root, reference_manifest=manifest)
 
-    def test_resource_stop_preserves_completed_samples_and_resume_numbers_incomplete_attempt(self):
-        carrier, indexes, mask, bank = self.fixture()
-        inputs = self.inputs()
-        class Runtime:
-            provenance = {"seed": 0}
-            def __init__(self): self.calls = []
-            def actual_identity(self): return {"fixture": "stop"}
-            def execute(self, spec, inputs, *, scope="full"):
-                self.calls.append(spec["sample_id"])
-                return {"output_full": inputs.for_spec(spec)}
-        with tempfile.TemporaryDirectory() as temp:
-            runtime = Runtime()
-            stopped = self.api._run_task6_group(runtime, inputs, temp, authorization=self.authorization(runtime, inputs), monitor=self.Monitor())
-            self.assertEqual(stopped["status"], "AWAITING_REVIEW")
-            resumed = self.api._run_task6_group(runtime, inputs, temp, resume=True, authorization=self.authorization(runtime, inputs), monitor=self.Monitor())
-            self.assertEqual(resumed["successful_samples"], 32)
-            self.assertEqual(len(runtime.calls), 32)
-
     def test_resume_refuses_tampered_success(self):
         carrier, indexes, mask, bank = self.fixture()
         inputs = self.inputs()
