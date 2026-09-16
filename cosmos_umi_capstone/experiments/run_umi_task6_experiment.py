@@ -49,6 +49,15 @@ def _atomic_text(path: Path, value: str) -> None:
     os.replace(stage, path)
 
 
+def _smoke_identity(hashes: Mapping[str, str], stages: Mapping[str, Any], sample_dir: Path) -> str:
+    files = {}
+    if sample_dir.is_dir():
+        files = {str(path.relative_to(sample_dir)).replace("\\", "/"): _sha_file(path)
+                 for path in sorted(sample_dir.rglob("*")) if path.is_file()}
+    payload = json.dumps({"hashes": dict(hashes), "stages": stages, "files": files}, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 class AtomicSampleStore:
     """Independent temp directory publication with immutable successful samples."""
     def __init__(self, root: str | Path):
@@ -255,6 +264,8 @@ def run_resource_smoke(run_dir: str | Path, *, lifecycle: Mapping[str, Callable[
         raise BlockedExecution("resource smoke requires lifecycle factory and GPU/RAM/disk samplers")
     if not all(callable(samplers[key]) for key in samplers): raise BlockedExecution("resource smoke samplers must be callable")
     root = Path(run_dir); root.mkdir(parents=True, exist_ok=True)
+    acceptance_path = root / "smoke_acceptance.json"
+    if acceptance_path.exists(): acceptance_path.unlink()
     prior_path = root / "run_status.json"
     if not prior_path.is_file(): raise BlockedExecution("resource smoke requires prior PREFLIGHT_COMPLETE status")
     prior = json.loads(prior_path.read_text(encoding="utf-8"))
@@ -263,7 +274,10 @@ def run_resource_smoke(run_dir: str | Path, *, lifecycle: Mapping[str, Callable[
     if not isinstance(prior_hashes, Mapping) or set(prior_hashes) != {"code", "model", "config", "direction", "input", "noise"}:
         raise BlockedExecution("preflight status has incomplete hash binding")
     background = ResourceMonitor(root, gpu_sampler=samplers["gpu"], ram_sampler=samplers["ram"], disk_sampler=samplers["disk"])
-    background.start()
+    try:
+        background.start()
+    except BaseException as error:
+        background.failure = error
     rows: list[dict[str, Any]] = []
     stages = ("pre-load", "loaded", "call", "post-call", "post-cleanup", "unloaded")
     by_stage: dict[str, dict[str, Any]] = {}
@@ -277,6 +291,8 @@ def run_resource_smoke(run_dir: str | Path, *, lifecycle: Mapping[str, Callable[
         by_stage[stage] = row; rows.append(row); return row
     runtime = inputs = None; baseline: Mapping[str, Any] = {}; loaded_ok = False; load_attempted = False; baseline_calls = 0; hashes = prior_hashes; stopped = False
     try:
+        if background.failure is not None:
+            raise ResourceStop("resource monitor failed to start")
         lifecycle["pre_load"](); pre = sample("pre-load", "preload")
         pre_decision = evaluate_resources(pre, phase="preload")
         if pre_decision["status"] == "HARD_STOP":
@@ -323,8 +339,9 @@ def run_resource_smoke(run_dir: str | Path, *, lifecycle: Mapping[str, Callable[
     sample_dir = root / "smoke_samples" / "baseline_smoke"
     sample_bytes = sum(path.stat().st_size for path in sample_dir.rglob("*") if path.is_file()) if sample_dir.is_dir() else 0
     forecast = sample_bytes * 31 * 1.3
-    disk_free = by_stage.get("unloaded", {}).get("disk_free_gib")
     peak_rows = list(getattr(background, "_gpu", [])) + rows
+    disk_values = [float(row["disk_free_gib"]) for row in peak_rows if row.get("disk_free_gib") is not None]
+    disk_free = min(disk_values) if disk_values else None
     peak_alloc = max((float(row.get("gpu_peak_allocated_gib", row.get("gpu_allocated_gib", 0))) for row in peak_rows), default=0.0)
     peak_reserved = max((float(row.get("gpu_peak_reserved_gib", row.get("gpu_reserved_gib", 0))) for row in peak_rows), default=0.0)
     peak_nvml = max((float(row.get("gpu_peak_nvml_used_gib", row.get("gpu_used_gib", row.get("nvml_used_gib", 0)))) for row in peak_rows), default=0.0)
@@ -336,7 +353,8 @@ def run_resource_smoke(run_dir: str | Path, *, lifecycle: Mapping[str, Callable[
         for key in ("gpu_free_gib", "ram_available_gib", "rss_gib", "swap_used_gib", "disk_free_gib"):
             vals = [float(row[key]) for row in actual_rows if row.get(key) is not None]
             if vals: worst[key] = min(vals)
-    worst.update({"gpu_used_gib": peak_nvml, "gpu_peak_allocated_gib": peak_alloc, "gpu_peak_nvml_used_gib": peak_nvml})
+    worst.update({"gpu_used_gib": peak_nvml, "gpu_reserved_gib": peak_reserved,
+                  "gpu_peak_allocated_gib": peak_alloc, "gpu_peak_nvml_used_gib": peak_nvml})
     if disk_free is not None: worst["disk_free_gib"] = float(disk_free)
     worst["mean_success_sample_bytes"] = sample_bytes; worst["remaining_samples"] = 31
     gate = evaluate_resources(worst, phase="resource-smoke")
@@ -345,11 +363,13 @@ def run_resource_smoke(run_dir: str | Path, *, lifecycle: Mapping[str, Callable[
     status = "AWAITING_RESOURCE_REVIEW" if not errors else "RESOURCE_STOP"
     reason_code = "SMOKE_REVIEW_REQUIRED" if not errors else errors[0]["type"]
     reason = "baseline smoke complete; explicit review required" if not errors else errors[0]["message"]
+    smoke_id = _smoke_identity(hashes, by_stage, sample_dir)
     payload = build_run_status(status, reason_code=reason_code, reason=reason, completed=[], failed=[], skipped=[],
         resource_snapshots={"by_stage": by_stage, "background_gpu": background._gpu, "background_ram": background._ram, "background_disk": background._disk, "last": background.last_resources},
         hashes=dict(hashes), smoke_decision={"status": status, "reason_code": reason_code}, baseline_calls=baseline_calls,
         disk_size_forecast={"mean_success_sample_bytes": sample_bytes, "remaining_samples": 31, "forecast_bytes": forecast,
-                            "forecast_free_gib": None if disk_free is None else float(disk_free) - forecast / 2**30}, errors=errors)
+                            "forecast_free_gib": None if disk_free is None else float(disk_free) - forecast / 2**30}, errors=errors,
+        smoke_run_id=smoke_id)
     _atomic_json(root / "smoke_stage_snapshots.json", {"stages": list(stages), "by_stage": by_stage})
     _atomic_json(root / "run_status.json", payload)
     return payload
@@ -373,6 +393,10 @@ def execute_task6(args: argparse.Namespace, *, runtime: Any | None = None, input
                   samplers: Mapping[str, Callable[[], Mapping[str, Any]]] | None = None) -> dict[str, Any]:
     """Execute only the explicitly requested phase; pilot needs injected runtime inputs."""
     if args.phase == "preflight":
+        if args.run_dir:
+            acceptance = Path(args.run_dir) / "smoke_acceptance.json"
+            if acceptance.exists():
+                acceptance.unlink()
         if runtime is None or inputs is None: raise BlockedExecution("preflight requires injected runtime and validated inputs")
         config = {}
         if args.preflight_json:
@@ -409,6 +433,8 @@ def run_pilot(runtime: Any, inputs: Task6Inputs, run_dir: str | Path, *, resume:
     authorization = authorize_pilot(run_dir, expected_hashes=build_task6_hash_binding(runtime, inputs, binding_config))
     if not isinstance(monitor, ResourceMonitor):
         raise BlockedExecution("pilot requires a ResourceMonitor instance")
+    if not callable(getattr(runtime, "cleanup", None)) and not callable(getattr(runtime, "reset_cache", None)):
+        raise BlockedExecution("pilot runtime must expose the cleanup seam")
     return _run_task6_group(runtime, inputs, run_dir, resume=resume, authorization=authorization, monitor=monitor)
 
 
@@ -428,6 +454,8 @@ def authorize_pilot(run_dir: str | Path, *, expected_hashes: Mapping[str, str] |
         raise BlockedExecution("pilot hashes do not match accepted resource smoke")
     if status.get("status") not in {"AWAITING_RESOURCE_REVIEW", "RESOURCE_STOP"}:
         raise BlockedExecution("pilot status is not resumable")
+    if status.get("smoke_run_id") != acceptance.get("smoke_run_id"):
+        raise BlockedExecution("pilot stop is not bound to the accepted smoke run")
     return {**status, **acceptance, "status": "AWAITING_RESOURCE_REVIEW"}
 
 
@@ -443,7 +471,8 @@ def accept_resource_smoke(run_dir: str | Path, *, hashes: Mapping[str, str] | No
     status["smoke_accepted_at_unix"] = time.time()
     acceptance_path = path.with_name("smoke_acceptance.json")
     _atomic_json(acceptance_path, {"status": "AWAITING_RESOURCE_REVIEW", "smoke_decision_accepted": True,
-                                   "smoke_accepted_at_unix": status["smoke_accepted_at_unix"], "hashes": dict(hashes)})
+                                   "smoke_accepted_at_unix": status["smoke_accepted_at_unix"], "hashes": dict(hashes),
+                                   "smoke_run_id": status.get("smoke_run_id")})
     stage = path.with_name("." + path.name + ".accept")
     stage.write_text(json.dumps(status, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(stage, path)

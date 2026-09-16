@@ -156,5 +156,42 @@ class Task6RunnerTests(unittest.TestCase):
             result = api.run_resource_smoke(temp, lifecycle={"pre_load": lambda: None, "load": lambda: (runtime, inputs), "cleanup": lambda: None, "unload": lambda: None}, samplers={"gpu": bad, "ram": good, "disk": good})
             self.assertEqual(result["status"], "RESOURCE_STOP")
 
+    def test_stale_smoke_acceptance_is_invalidated_by_new_preflight(self):
+        import run_umi_task6_experiment as api
+        with tempfile.TemporaryDirectory() as temp:
+            api, runtime, inputs, samplers, lifecycle, _ = self.smoke_fixture(temp)
+            result = api.run_resource_smoke(temp, samplers=samplers, lifecycle=lifecycle)
+            api.accept_resource_smoke(temp, hashes=result["hashes"])
+            self.assertTrue(Path(temp, "smoke_acceptance.json").is_file())
+            # A new preflight attempt invalidates prior acceptance before
+            # validating its new evidence.
+            with self.assertRaises(api.BlockedExecution):
+                api.execute_task6(api.parse_args(["--phase", "preflight", "--run-dir", temp, "--preflight-json", str(Path(temp, "missing.json"))]), runtime=runtime, inputs=inputs)
+            self.assertFalse(Path(temp, "smoke_acceptance.json").exists())
+
+    def test_smoke_peak_reserved_and_worst_disk_gate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            api, _, _, _, lifecycle, _ = self.smoke_fixture(temp)
+            state = {"n": 0}
+            def sampler():
+                state["n"] += 1
+                return {"gpu_used_gib": 0, "gpu_free_gib": 100, "gpu_reserved_gib": 70,
+                        "ram_available_gib": 600, "rss_gib": 0, "swap_used_gib": 0,
+                        "disk_free_gib": 12 if state["n"] % 2 else 20}
+            result = api.run_resource_smoke(temp, samplers={key: sampler for key in ("gpu", "ram", "disk")}, lifecycle=lifecycle)
+            self.assertEqual(result["status"], "RESOURCE_STOP")
+
+    def test_monitor_start_failure_writes_canonical_smoke_status(self):
+        import run_umi_task6_experiment as api
+        with tempfile.TemporaryDirectory() as temp:
+            api, _, _, samplers, lifecycle, _ = self.smoke_fixture(temp)
+            original = api.ResourceMonitor.start
+            api.ResourceMonitor.start = lambda self: (_ for _ in ()).throw(RuntimeError("start"))
+            try:
+                result = api.run_resource_smoke(temp, samplers=samplers, lifecycle=lifecycle)
+            finally:
+                api.ResourceMonitor.start = original
+            self.assertEqual(result["status"], "RESOURCE_STOP")
+
 
 if __name__ == "__main__": unittest.main()

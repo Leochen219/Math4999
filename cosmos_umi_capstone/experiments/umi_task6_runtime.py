@@ -517,10 +517,19 @@ def _run_task6_group(runtime: Any, inputs: Task6Inputs, run_dir: str | Path, *, 
         last_resources = {}
         if monitor is not None:
             last_resources = getattr(monitor, "last_resources", {}) or {}
+        smoke_run_id = None
+        if status_path.is_file():
+            try: smoke_run_id = json.loads(status_path.read_text(encoding="utf-8")).get("smoke_run_id")
+            except (OSError, ValueError, json.JSONDecodeError): smoke_run_id = None
+        if smoke_run_id is None:
+            acceptance_path = root / "smoke_acceptance.json"
+            if acceptance_path.is_file():
+                try: smoke_run_id = json.loads(acceptance_path.read_text(encoding="utf-8")).get("smoke_run_id")
+                except (OSError, ValueError, json.JSONDecodeError): smoke_run_id = None
         payload = build_run_status(status, reason_code=reason_code, reason=reason, completed=completed,
                                    failed=failed, skipped=skipped, hashes=hashes,
                                    group={"state": inputs.state, "seed": inputs.seed}, successful_samples=len(completed),
-                                   last_resource_snapshots=last_resources)
+                                   last_resource_snapshots=last_resources, smoke_run_id=smoke_run_id)
         _atomic_text(status_path, canonical_json(payload) + "\n"); return payload
     with ProcessLock(root / ".runner.lock"):
         if resume and (root / "task6_plan.json").is_file() and not (root / "MANIFEST.sha256").is_file():
@@ -580,6 +589,7 @@ def _run_task6_group(runtime: Any, inputs: Task6Inputs, run_dir: str | Path, *, 
                     stream.write(canonical_json({"sample_id": spec["sample_id"], "identity": identity, "started_at_unix": time.time()}) + "\n")
             except Exception as error:
                 payload = write_status("FAILED", type(error).__name__, str(error)); _write_manifest(root); return payload
+            cleanup_attempted = False
             try:
                 record = dict(runtime.execute(spec, inputs, scope="full"))
                 if "output_full" not in record: raise ValueError("runtime did not return output_full")
@@ -588,7 +598,8 @@ def _run_task6_group(runtime: Any, inputs: Task6Inputs, run_dir: str | Path, *, 
                 samples.write_success(spec["sample_id"], {key: value for key, value in record.items() if not isinstance(value, np.ndarray)}, artifacts=arrays)
                 completed.append(spec["sample_id"])
                 cleanup = getattr(runtime, "cleanup", None) or getattr(runtime, "reset_cache", None)
-                if callable(cleanup): cleanup()
+                if callable(cleanup):
+                    cleanup_attempted = True; cleanup()
                 if monitor is not None and hasattr(monitor, "capture_sample"):
                     try: capture_decision = monitor.capture_sample(spec["sample_id"], "post_cleanup", 32 - len(completed), root)
                     except Exception as error:
@@ -604,8 +615,26 @@ def _run_task6_group(runtime: Any, inputs: Task6Inputs, run_dir: str | Path, *, 
                     if decision.get("status") == "HARD_STOP":
                         payload = write_status("RESOURCE_STOP", decision.get("reason_code"), decision.get("reason")); _write_manifest(root); return payload
             except KeyboardInterrupt:
+                if not cleanup_attempted:
+                    cleanup = getattr(runtime, "cleanup", None) or getattr(runtime, "reset_cache", None)
+                    if callable(cleanup):
+                        cleanup_attempted = True
+                        try: cleanup()
+                        except Exception as cleanup_error: failed.append(spec["sample_id"]); error = cleanup_error
+                    if cleanup_attempted and monitor is not None and hasattr(monitor, "capture_sample"):
+                        try: monitor.capture_sample(spec["sample_id"], "post_cleanup", 32 - len(completed), root)
+                        except Exception: pass
                 payload = write_status("INTERRUPTED", "SIGNAL_INTERRUPTED", "interrupt received"); _write_manifest(root); return payload
             except Exception as error:
+                if not cleanup_attempted:
+                    cleanup = getattr(runtime, "cleanup", None) or getattr(runtime, "reset_cache", None)
+                    if callable(cleanup):
+                        cleanup_attempted = True
+                        try: cleanup()
+                        except Exception as cleanup_error: error = cleanup_error
+                    if cleanup_attempted and monitor is not None and hasattr(monitor, "capture_sample"):
+                        try: monitor.capture_sample(spec["sample_id"], "post_cleanup", 32 - len(completed), root)
+                        except Exception as capture_error: error = capture_error
                 failed.append(spec["sample_id"])
                 try:
                     samples.write_failure(spec["sample_id"], {"status": "fail", "identity": identity,
