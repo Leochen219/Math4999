@@ -1,6 +1,7 @@
 import hashlib
 import errno
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -383,6 +384,83 @@ class OperationalTask6Tests(unittest.TestCase):
         self.assertEqual(loader.resolve_bridge_fps(type("Sample", (), {"fps": 5})()), 5)
         with self.assertRaises(ValueError):
             loader.resolve_bridge_fps(type("Sample", (), {"fps": 20})())
+
+    def test_task6_bridge_loader_uses_first_frame_square_padding_and_domain_seven(self):
+        import umi_task6_cosmos_loader as loader
+
+        class Mode:
+            FORWARD_DYNAMICS = object()
+
+        class Overrides:
+            def __init__(self, payload): self.payload = payload
+            @classmethod
+            def model_validate(cls, payload): return cls(payload)
+            def download(self, _output): pass
+            def build_sample(self, model_config):
+                return type("Sample", (), {"fps": self.payload["fps"], "guidance": 1.0, "shift": 10.0})()
+
+        seen = {}
+        source_frames = np.arange(3 * 4 * 480 * 640, dtype=np.uint8).reshape(3, 4, 480, 640)
+        def read_media_frames(_path, max_frames):
+            seen["max_frames"] = max_frames
+            return source_frames, 5.0
+        def reflection_pad(data, _keys, *, keep_aspect_ratio, target_w, target_h):
+            self.assertTrue(keep_aspect_ratio)
+            self.assertEqual((target_w, target_h), (256, 256))
+            np.testing.assert_array_equal(data["video"], source_frames[:, :1])
+            data["video"] = np.zeros((3, 1, target_h, target_w), dtype=np.uint8)
+            data["image_size"] = np.array([256, 256, 192, 256], dtype=np.float32)
+        def load_actions(path, mode, chunk, max_dim, raw_dim):
+            self.assertEqual((mode, chunk, max_dim, raw_dim), (Mode.FORWARD_DYNAMICS, 16, 10, 10))
+            return np.zeros((16, 10), dtype=np.float32), 10
+        def build_action_batch(**kwargs):
+            seen["batch"] = kwargs
+            return {"domain_id": [7], "image_size": np.array([[256, 256, 256, 256]], dtype=np.float32), "video": [[kwargs["video"]]]}
+
+        action_mod = type(sys)("cosmos_framework.inference.action")
+        action_mod._load_actions = load_actions; action_mod.build_action_batch = build_action_batch
+        args_mod = type(sys)("cosmos_framework.inference.args")
+        args_mod.ModelMode = Mode; args_mod.OmniSampleOverrides = Overrides
+        vision_mod = type(sys)("cosmos_framework.inference.vision"); vision_mod.read_media_frames = read_media_frames
+        domain_mod = type(sys)("cosmos_framework.data.generator.action.utils.domain_utils")
+        domain_mod.get_domain_id = lambda name: 7 if name == "bridge_orig_lerobot" else 1
+        transforms_mod = type(sys)("cosmos_framework.data.generator.action.utils.transforms")
+        transforms_mod.reflection_pad_to_target = reflection_pad
+        with tempfile.TemporaryDirectory() as temp, mock.patch.dict(sys.modules, {
+            "cosmos_framework.inference.action": action_mod,
+            "cosmos_framework.inference.args": args_mod,
+            "cosmos_framework.inference.vision": vision_mod,
+            "cosmos_framework.data.generator.action.utils.domain_utils": domain_mod,
+            "cosmos_framework.data.generator.action.utils.transforms": transforms_mod,
+        }):
+            root = Path(temp); video = root / "video.mp4"; video.write_bytes(b"video")
+            action = root / "action.json"; action.write_text("[]", encoding="utf-8")
+            adapter = type("Adapter", (), {
+                "pipeline": type("Pipeline", (), {"model_config": object()})(),
+                "model": type("Model", (), {"config": type("Config", (), {"max_action_dim": 10})(), "input_video_key": "video"})(),
+            })()
+            args = type("Args", (), {"input_path": str(video), "action_path": str(action), "prompt": "p", "fps": 5})()
+            batch, sample, evidence = loader._load_task6_bridge_data_batch(adapter, args, root)
+            self.assertEqual(seen["max_frames"], 17)
+            self.assertEqual(tuple(seen["batch"]["video"].shape), (3, 1, 256, 256))
+            self.assertEqual(str(seen["batch"]["video"].dtype), "uint8")
+            self.assertEqual(seen["batch"]["domain_name"], "bridge_orig_lerobot")
+            self.assertEqual(evidence["domain_id"], 7)
+            self.assertEqual(evidence["data_batch_domain_id"], 7)
+            self.assertEqual(evidence["input_frame_shape"], [3, 1, 480, 640])
+            self.assertEqual(evidence["processed_frame_shape"], [3, 1, 256, 256])
+            self.assertEqual(evidence["source_hw"], [480, 640])
+            self.assertEqual(evidence["resized_content_hw"], [192, 256])
+            self.assertEqual(evidence["official_final_image_size"], [256, 256, 256, 256])
+            self.assertEqual(sample.fps, 5)
+
+            vision_mod.read_media_frames = lambda _path, max_frames: (source_frames[:, :, :, :-1], 5.0)
+            with self.assertRaisesRegex(ValueError, "first frame"):
+                loader._load_task6_bridge_data_batch(adapter, args, root)
+            vision_mod.read_media_frames = read_media_frames
+            domain_mod.get_domain_id = lambda _name: 8
+            with self.assertRaisesRegex(ValueError, "domain mapping"):
+                loader._load_task6_bridge_data_batch(adapter, args, root)
 
     def test_loader_action_json_is_finite_exact_16_by_10_list_for_numpy_action(self):
         import umi_task6_cosmos_loader as loader

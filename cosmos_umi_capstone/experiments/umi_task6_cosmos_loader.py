@@ -6,6 +6,7 @@ it is intentionally not a second implementation of model construction.
 from __future__ import annotations
 
 import gc
+import hashlib
 import json
 import os
 import subprocess
@@ -216,6 +217,117 @@ def resolve_bridge_fps(sample_args: Any) -> int:
     return value
 
 
+def _scalar_int(value: Any) -> int:
+    """Read the scalar domain id stored in the official batch list."""
+    if isinstance(value, (list, tuple)):
+        if len(value) != 1:
+            raise ValueError("official domain_id must contain exactly one value")
+        return _scalar_int(value[0])
+    item = getattr(value, "item", None)
+    if callable(item):
+        value = item()
+    return int(value)
+
+
+def _sha256_bytes(value: Any) -> str:
+    raw = value.detach().cpu().contiguous().numpy() if hasattr(value, "detach") else np.asarray(value)
+    return hashlib.sha256(np.ascontiguousarray(raw).tobytes()).hexdigest()
+
+
+def _int_list(value: Any) -> list[int]:
+    """Convert an official tensor/list metadata field to JSON-safe integers."""
+    if hasattr(value, "detach"):
+        value = value.detach().cpu().numpy()
+    values = np.asarray(value).reshape(-1).tolist()
+    if not values:
+        raise ValueError("official image_size metadata is empty")
+    return [int(item) for item in values]
+
+
+def _load_task6_bridge_data_batch(adapter: Any, args: Any, run_dir: Path) -> tuple[Any, Any, dict[str, Any]]:
+    """Build Task 6's Bridge batch without changing the shared Task 4/5 seam.
+
+    The official generic loader reads the raw media and selects a rectangular
+    target bucket.  Task 6's Bridge contract instead uses frame zero only,
+    preserves uint8 values, and applies the official reflection padding to a
+    fixed square before calling the official action batch builder.
+    """
+    from cosmos_framework.inference.action import _load_actions, build_action_batch
+    from cosmos_framework.inference.args import ModelMode, OmniSampleOverrides
+    from cosmos_framework.inference.vision import read_media_frames
+    from cosmos_framework.data.generator.action.utils.domain_utils import get_domain_id
+    from cosmos_framework.data.generator.action.utils.transforms import reflection_pad_to_target
+
+    if not args.input_path or not args.action_path:
+        raise ValueError("--input-path and --action-path are required for official execution")
+    sample = {
+        "name": "umi_task6_bridge", "model_mode": "forward_dynamics", "domain_name": "bridge_orig_lerobot",
+        "view_point": "ego_view", "fps": int(getattr(args, "fps", 5)), "image_size": 256, "action_chunk_size": 16,
+        "prompt": args.prompt, "vision_path": str(Path(args.input_path).resolve()),
+        "action_path": str(Path(args.action_path).resolve()), "seed": 0, "guidance": 1.0, "shift": 10.0,
+    }
+    overrides = OmniSampleOverrides.model_validate(sample)
+    overrides.output_dir = run_dir / "inputs"
+    overrides.download(run_dir / "inputs")
+    sample_args = overrides.build_sample(model_config=adapter.pipeline.model_config)
+    adapter.sample_args = sample_args
+    adapter.sample_settings = {
+        "guidance": float(getattr(sample_args, "guidance", 1.0)), "shift": float(getattr(sample_args, "shift", 10.0)),
+        "guidance_interval": getattr(sample_args, "guidance_interval", None), "has_negative_prompt": bool(getattr(sample_args, "has_negative_prompt", False)),
+        "skip_text_tokens_for_cfg": bool(getattr(sample_args, "skip_text_tokens_for_cfg", False)),
+        "normalize_cfg": bool(getattr(sample_args, "normalize_cfg", False)),
+        "use_batched_cfg": bool(getattr(sample_args, "use_batched_cfg", False)), "sampler": getattr(adapter.model, "fixed_step_sampler", None),
+    }
+    if adapter.sample_settings["guidance"] != 1.0 or adapter.sample_settings["shift"] != 10.0:
+        raise ValueError("resolved official sample settings must be guidance=1.0 and shift=10.0")
+
+    frames, _ = read_media_frames(Path(args.input_path), max_frames=17)
+    first_frame = frames[:, :1]
+    if tuple(first_frame.shape) != (3, 1, 480, 640):
+        raise ValueError(f"official Bridge first frame must be (3, 1, 480, 640), got {tuple(first_frame.shape)}")
+    if getattr(first_frame, "dtype", None) is not None and str(first_frame.dtype) not in {"torch.uint8", "uint8"}:
+        raise ValueError("official Bridge input frame must remain uint8")
+    pad_dict = {"video": first_frame}
+    reflection_pad_to_target(pad_dict, ["video"], keep_aspect_ratio=True, target_w=256, target_h=256)
+    processed = pad_dict["video"]
+    if tuple(processed.shape) != (3, 1, 256, 256):
+        raise ValueError(f"official Bridge processed frame must be (3, 1, 256, 256), got {tuple(processed.shape)}")
+    if str(processed.dtype) not in {"torch.uint8", "uint8"}:
+        raise ValueError("official Bridge processed frame must remain uint8")
+    action, raw_action_dim = _load_actions(Path(args.action_path), ModelMode.FORWARD_DYNAMICS, 16,
+                                            int(adapter.model.config.max_action_dim), 10)
+    if int(raw_action_dim) != 10:
+        raise ValueError(f"official Bridge raw action dim must be 10, got {raw_action_dim}")
+    data_batch = build_action_batch(
+        video=processed, action=action, raw_action_dim=raw_action_dim, prompt=args.prompt,
+        view_point="ego_view", domain_name="bridge_orig_lerobot", model_mode=ModelMode.FORWARD_DYNAMICS,
+        action_chunk_size=16, fps=int(getattr(args, "fps", 5)), resolution="256",
+        input_video_key=adapter.model.input_video_key, batch_size=1, device="cuda",
+    )
+    expected_domain_id = int(get_domain_id("bridge_orig_lerobot"))
+    if expected_domain_id != 7:
+        raise ValueError(f"official Bridge domain mapping must resolve to 7, got {expected_domain_id}")
+    actual_domain_id = _scalar_int(data_batch.get("domain_id"))
+    if actual_domain_id != expected_domain_id:
+        raise ValueError(f"official Bridge data batch domain_id must be {expected_domain_id}, got {actual_domain_id}")
+    final_image_size = _int_list(data_batch.get("image_size"))
+    if final_image_size != [256, 256, 256, 256]:
+        raise ValueError(f"official Bridge final image_size must be [256, 256, 256, 256], got {final_image_size}")
+    pad_image_size = _int_list(pad_dict.get("image_size"))
+    if pad_image_size != [256, 256, 192, 256]:
+        raise ValueError(f"official Bridge preprocessed image_size must be [256, 256, 192, 256], got {pad_image_size}")
+    evidence = {
+        "input_frame_sha256": _sha256_bytes(first_frame), "processed_frame_sha256": _sha256_bytes(processed),
+        "input_frame_shape": list(first_frame.shape), "processed_frame_shape": list(processed.shape),
+        "source_hw": [int(first_frame.shape[-2]), int(first_frame.shape[-1])],
+        "resized_content_hw": pad_image_size[2:], "preprocessed_image_size": pad_image_size,
+        "official_final_image_size": final_image_size,
+        "domain_name": "bridge_orig_lerobot", "domain_id": expected_domain_id,
+        "data_batch_domain_id": actual_domain_id, "raw_action_dim": int(raw_action_dim),
+    }
+    return data_batch, sample_args, evidence
+
+
 def load_task6_cosmos_runtime(*, framework_root: str, checkpoint: str, vae: str, device: str,
                               model_seed: int, prompt: str, action: Any, video: str | None = None,
                               contract: dict[str, Any] | None = None, run_dir: str | Path | None = None,
@@ -230,10 +342,10 @@ def load_task6_cosmos_runtime(*, framework_root: str, checkpoint: str, vae: str,
         sys.path.insert(0, str(framework))
     # These imports are the exact Task 4/5 verified setup and data seams.
     try:
-        from .umi_fd_post_vae_scan import _clone_runtime, load_official_data_batch, load_official_runtime
+        from .umi_fd_post_vae_scan import load_official_runtime
         from .umi_precision_official import OfficialPrecisionRuntime, TorchOps
     except ImportError:  # pragma: no cover
-        from umi_fd_post_vae_scan import _clone_runtime, load_official_data_batch, load_official_runtime
+        from umi_fd_post_vae_scan import load_official_runtime
         from umi_precision_official import OfficialPrecisionRuntime, TorchOps
     setup_dir = _make_setup_dir(run_dir, phase, resume=resume)
     args = build_loader_args(framework_root=framework, checkpoint=checkpoint, vae=vae, video=video,
@@ -250,14 +362,14 @@ def load_task6_cosmos_runtime(*, framework_root: str, checkpoint: str, vae: str,
         os.replace(temporary, action_path)
     args.action_path = str(action_path)
     post_adapter = load_official_runtime(args, setup_dir)
-    data_batch, sample_args = load_official_data_batch(post_adapter, args, setup_dir)
+    data_batch, sample_args, input_evidence = _load_task6_bridge_data_batch(post_adapter, args, setup_dir)
     resolved_fps = resolve_bridge_fps(sample_args)
     ops = TorchOps()
     provenance = {"framework_root": str(framework), "framework_commit": _framework_commit(framework), "checkpoint_path": str(Path(checkpoint).resolve()),
         "vae_path": str(Path(vae).resolve()), "sampler": "unipc", "precision": "bfloat16",
         "asset_source_commit": "2b17a2413bd86b2cf9b03823637108851e4ddf2d",
         "diffusion_cache_requested": False, "diffusion_cache_installed": False, "seed": 0, "prompt": prompt,
-        "fps": resolved_fps}
+        "fps": resolved_fps, **input_evidence}
     runtime_model = post_adapter.model
     # The verified UMI VAE path owns both encode/decode on tokenizer_vision_gen;
     # bind that object first so round-trip conditions use the same artifact as

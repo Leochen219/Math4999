@@ -367,6 +367,20 @@ def observe_live_launch(contract: Mapping[str, Any], *, runtime: Any, inputs: An
                      "predicted_indexes": list(geometry.predicted_indexes), "mask_shape": list(inputs.geometry.mask.shape)},
         "runtime_identity": actual,
     }
+    # The official Task 6 loader binds these hashes/domain checks before the
+    # runtime wrapper is constructed. Carry that immutable evidence into the
+    # live snapshot so launch review sees the actual loader boundary too.
+    loader_provenance = getattr(runtime, "provenance", {})
+    loader_evidence = dict(loader_provenance) if isinstance(loader_provenance, Mapping) else {}
+    bridge_keys = ("input_frame_sha256", "processed_frame_sha256", "input_frame_shape",
+                   "processed_frame_shape", "source_hw", "resized_content_hw",
+                   "preprocessed_image_size", "official_final_image_size", "domain_name",
+                   "domain_id", "data_batch_domain_id", "raw_action_dim")
+    bridge_input = {key: loader_evidence[key] for key in bridge_keys if key in loader_evidence}
+    if bridge_input:
+        if bridge_input.get("domain_id") != 7 or bridge_input.get("data_batch_domain_id") != 7:
+            raise OperationalEvidenceError("live loader evidence does not prove Bridge domain_id=7")
+        observation["bridge_input"] = bridge_input
     return observation
 
 
