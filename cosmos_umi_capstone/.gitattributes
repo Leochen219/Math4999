@@ -1,0 +1,6 @@
+/experiments/artifacts/umi_precision_calibration/calibration_report.md text eol=lf
+/experiments/artifacts/umi_precision_calibration/config.json text eol=lf
+/experiments/artifacts/umi_precision_calibration/error_plot.svg text eol=lf
+/experiments/artifacts/umi_precision_calibration/hashes.json text eol=lf
+/experiments/artifacts/umi_precision_calibration/metrics.csv text eol=lf
+/experiments/artifacts/umi_precision_calibration/metrics.json text eol=lf
