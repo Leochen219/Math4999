@@ -163,14 +163,14 @@ def _verify_tree_manifest(root: Path, *, manifest_name: str = "MANIFEST.sha256",
         if len(parts) != 2 or len(parts[0]) != 64 or any(c not in "0123456789abcdef" for c in parts[0]):
             raise OperationalEvidenceError("malformed Task 5 manifest")
         relative = Path(parts[1])
-        if relative.is_absolute() or ".." in relative.parts or relative.as_posix() in {manifest_name, lock_name} or parts[1] in seen:
+        if relative.is_absolute() or ".." in relative.parts or relative.as_posix() == manifest_name or parts[1] in seen:
             raise OperationalEvidenceError("unsafe or duplicate Task 5 manifest path")
         target = root / relative
         if not target.is_file() or sha256_file(target) != parts[0]:
             raise OperationalEvidenceError(f"Task 5 manifest mismatch: {parts[1]}")
         seen.add(parts[1])
     actual = {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file() and p.relative_to(root).as_posix() not in {manifest_name, lock_name}}
-    if actual != seen:
+    if actual != seen - {lock_name}:
         raise OperationalEvidenceError("Task 5 manifest inventory mismatch")
     return sha256_file(manifest)
 

@@ -200,7 +200,7 @@ class OperationalTask6Tests(unittest.TestCase):
         contract = self.contract(); observed = dict(contract); observed["cuda_version"] = "wrong"
         with self.assertRaises(self.op.OperationalEvidenceError): self.op.validate_launch_contract(contract, observed=observed)
 
-    def test_task5_direction_extraction_requires_manifest_and_status(self):
+    def test_task5_direction_extraction_accepts_root_lock_in_manifest(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp); (root / "samples").mkdir()
             for direction in ("v0", "v1", "v2"):
@@ -214,12 +214,51 @@ class OperationalTask6Tests(unittest.TestCase):
                 (sample / "status.json").write_text(json.dumps({"status": "success", "artifact_sha256": hashes}))
             plan = {"status": "complete", "plan": [{"sample_id": f"s{i}"} for i in range(32)]}; (root / "task5_plan.json").write_text(json.dumps(plan))
             (root / "status.json").write_text(json.dumps({"status": "complete", "formal_successful": 32}))
+            (root / ".runner.lock").write_bytes(b"historical task5 lock")
             entries = []
             for path in sorted(root.rglob("*")):
                 if path.is_file(): entries.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.relative_to(root).as_posix()}")
             (root / "MANIFEST.sha256").write_text("\n".join(entries) + "\n")
             result = self.op.extract_task5_directions(root)
             self.assertEqual(result["bank"].shape, (3, 1, 48, 5, 16, 16)); self.assertEqual(set(result["direction_sha256"]), {"v0", "v1", "v2", "u01", "u12"})
+
+    def test_task5_manifest_rejects_duplicate_root_lock(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); lock = root / ".runner.lock"; lock.write_bytes(b"lock")
+            digest = hashlib.sha256(lock.read_bytes()).hexdigest()
+            (root / "MANIFEST.sha256").write_text(f"{digest}  .runner.lock\n{digest}  .runner.lock\n")
+            with self.assertRaisesRegex(self.op.OperationalEvidenceError, "unsafe or duplicate"):
+                self.op._verify_tree_manifest(root)
+
+    def test_task5_manifest_rejects_root_lock_hash_mismatch(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); (root / ".runner.lock").write_bytes(b"lock")
+            (root / "MANIFEST.sha256").write_text(f"{'0' * 64}  .runner.lock\n")
+            with self.assertRaisesRegex(self.op.OperationalEvidenceError, "manifest mismatch"):
+                self.op._verify_tree_manifest(root)
+
+    def test_task5_manifest_rejects_absolute_parent_and_manifest_paths(self):
+        for invalid_kind in ("absolute", "parent", "manifest"):
+            with self.subTest(invalid_kind=invalid_kind), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                invalid_path = {"absolute": str((root / "absolute").resolve()),
+                                "parent": "../outside", "manifest": "MANIFEST.sha256"}[invalid_kind]
+                (root / "MANIFEST.sha256").write_text(f"{'0' * 64}  {invalid_path}\n")
+                with self.assertRaisesRegex(self.op.OperationalEvidenceError, "unsafe or duplicate"):
+                    self.op._verify_tree_manifest(root)
+
+    def test_task5_manifest_rejects_unlisted_extra_hidden_file(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); lock = root / ".runner.lock"; lock.write_bytes(b"lock")
+            payload = root / "payload.txt"; payload.write_bytes(b"payload")
+            (root / ".hidden").write_bytes(b"unlisted")
+            entries = [
+                f"{hashlib.sha256(lock.read_bytes()).hexdigest()}  .runner.lock",
+                f"{hashlib.sha256(payload.read_bytes()).hexdigest()}  payload.txt",
+            ]
+            (root / "MANIFEST.sha256").write_text("\n".join(entries) + "\n")
+            with self.assertRaisesRegex(self.op.OperationalEvidenceError, "inventory mismatch"):
+                self.op._verify_tree_manifest(root)
 
     def test_task5_manifest_rejects_nested_manifest_and_extra_file(self):
         with tempfile.TemporaryDirectory() as temp:
