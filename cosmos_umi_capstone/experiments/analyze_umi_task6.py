@@ -473,16 +473,22 @@ def _close_memmaps(value: Any) -> None:
         mmap = getattr(value, "_mmap", None)
         if mmap is not None:
             mmap.close()
-        try:
-            _OPEN_MEMMAPS.remove(value)
-        except ValueError:
-            pass
+        for index, item in enumerate(_OPEN_MEMMAPS):
+            if item is value:
+                del _OPEN_MEMMAPS[index]
+                break
     elif isinstance(value, dict):
         for item in value.values():
             _close_memmaps(item)
     elif isinstance(value, (list, tuple)):
         for item in value:
             _close_memmaps(item)
+
+
+def _close_new_memmaps(marker: int) -> None:
+    """Close only mappings registered after *marker*, by object identity."""
+    for value in list(_OPEN_MEMMAPS[marker:]):
+        _close_memmaps(value)
 
 
 def _analyze_decoder_replays(run_root: str | Path, decoder_root: str | Path | None = None, *, expected_raw_manifest_sha: str | None = None, expected_group: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -657,8 +663,7 @@ def analyze_decoder_replays(run_root: str | Path, decoder_root: str | Path | Non
                                         expected_raw_manifest_sha=expected_raw_manifest_sha,
                                         expected_group=expected_group)
     finally:
-        for value in list(_OPEN_MEMMAPS[marker:]):
-            _close_memmaps(value)
+        _close_new_memmaps(marker)
 
 
 def _verify_decoder_manifest_for_analysis(root: Path) -> str:
@@ -876,8 +881,10 @@ def analyze_task6_run(run_dir: str | Path, output_dir: str | Path | None = None,
     if status.get("status") not in {"AWAITING_REVIEW", "COMPLETE"} or len(status.get("completed_samples", [])) != 32:
         raise ValueError("public Task 6 analysis rejects stopped or partial raw runs")
     raw_manifest = verify_raw_manifest(root)
-    records = _load_records(root)
+    marker = len(_OPEN_MEMMAPS)
+    records: dict[str, dict[str, Any]] = {}
     try:
+        records = _load_records(root)
         result = analyze_task6_records(records, group=status.get("group"), plan_detail=status.get("plan_detail"))
         decoder = analyze_decoder_replays(root, decoder_root=decoder_root,
                                           expected_raw_manifest_sha=raw_manifest["sha256"], expected_group=status.get("group"))
@@ -890,7 +897,7 @@ def analyze_task6_run(run_dir: str | Path, output_dir: str | Path | None = None,
         if verify_raw_manifest(root)["sha256"] != raw_manifest["sha256"]: raise ValueError("raw evidence changed during analysis")
         return {"status": result.get("status"), "decoder_status": decoder.get("status"), **published}
     finally:
-        _close_memmaps(records)
+        _close_new_memmaps(marker)
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -108,6 +108,32 @@ class AnalysisTests(unittest.TestCase):
             api._close_memmaps(records)
             del loaded
 
+    def test_close_memmaps_uses_identity_for_different_shapes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); first_path = root / "first.npy"; second_path = root / "second.npy"
+            np.save(first_path, np.arange(6, dtype=np.float32), allow_pickle=False)
+            np.save(second_path, np.arange(12, dtype=np.float32).reshape(3, 4), allow_pickle=False)
+            first = api._load_mmap(first_path); second = api._load_mmap(second_path)
+            api._close_memmaps(second)
+            self.assertEqual(first.tolist(), list(range(6)))
+            self.assertIn(first, api._OPEN_MEMMAPS)
+            api._close_memmaps(first)
+
+    def test_close_new_memmaps_releases_only_mappings_registered_after_marker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); first_path = root / "first.npy"; second_path = root / "second.npy"
+            np.save(first_path, np.arange(4, dtype=np.float32), allow_pickle=False)
+            np.save(second_path, np.arange(5, dtype=np.float32), allow_pickle=False)
+            first = api._load_mmap(first_path); marker = len(api._OPEN_MEMMAPS)
+            try:
+                api._load_mmap(second_path)
+                raise RuntimeError("synthetic analysis failure")
+            except RuntimeError:
+                api._close_new_memmaps(marker)
+            self.assertEqual(first.tolist(), list(range(4)))
+            self.assertIn(first, api._OPEN_MEMMAPS)
+            api._close_memmaps(first)
+
     def test_decoder_manifest_rejects_unsafe_path_and_nonhex_digest(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); (root / "MANIFEST.sha256").write_text("not-a-digest  ../escape\n", encoding="ascii")

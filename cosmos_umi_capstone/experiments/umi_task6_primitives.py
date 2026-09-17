@@ -1,14 +1,17 @@
 """Pure, deterministic contracts for the Task 6 cross-context experiment.
 
-This module deliberately has no framework, OpenCV, CUDA, or filesystem imports.
-Asset loading and model execution belong to the later runtime; these helpers only
-validate and describe values that cross those boundaries.
+This module deliberately has no framework, OpenCV, or CUDA imports. Asset
+loading and model execution belong to the later runtime; these helpers only
+validate and describe values that cross those boundaries. The cgroup sampler is
+the sole read-only operating-system probe used by resource policy evaluation.
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import numbers
+import os
+from pathlib import Path
 from dataclasses import asdict, dataclass
 from types import MappingProxyType
 from typing import Any, Mapping
@@ -268,6 +271,33 @@ class ResourceSnapshot:
         return asdict(self)
 
 
+def sample_cgroup_memory(root: str | os.PathLike[str] = "/sys/fs/cgroup") -> dict[str, Any]:
+    """Read cgroup v2 memory limit/usage, returning explicit failures."""
+    directory = Path(root)
+    limit_path, current_path = directory / "memory.max", directory / "memory.current"
+    if not limit_path.exists() and not current_path.exists():
+        return {}
+    try:
+        limit_text = limit_path.read_text(encoding="ascii").strip()
+        current_bytes = int(current_path.read_text(encoding="ascii").strip(), 10)
+        if current_bytes < 0:
+            raise ValueError("memory.current must be nonnegative")
+        if limit_text == "max":
+            return {"cgroup_memory_limited": False,
+                    "cgroup_memory_limit_gib": None,
+                    "cgroup_memory_current_gib": current_bytes / 2**30,
+                    "cgroup_memory_free_gib": None}
+        limit_bytes = int(limit_text, 10)
+        if limit_bytes < 0 or current_bytes > limit_bytes:
+            raise ValueError("cgroup memory values are out of range")
+        return {"cgroup_memory_limited": True,
+                "cgroup_memory_limit_gib": limit_bytes / 2**30,
+                "cgroup_memory_current_gib": current_bytes / 2**30,
+                "cgroup_memory_free_gib": (limit_bytes - current_bytes) / 2**30}
+    except (OSError, TypeError, ValueError) as error:
+        return {"monitor_failure": f"cgroup v2 memory sampler failed: {error}"}
+
+
 def _number(snapshot: Mapping[str, Any], *names: str, default: float = 0.0) -> float:
     for name in names:
         if name in snapshot and snapshot[name] is not None:
@@ -308,6 +338,20 @@ def evaluate_resources(snapshot: Mapping[str, Any] | ResourceSnapshot, *, phase:
     ram_consecutive = int(ram_consecutive_raw) if np.isfinite(ram_consecutive_raw) and ram_consecutive_raw.is_integer() and ram_consecutive_raw >= 0 else float("nan")
     gpu_growth = _number(snapshot, "gpu_cleanup_growth_gib", "gpu_cleanup_baseline_growth_gib")
     ram_growth = _number(snapshot, "ram_cleanup_growth_gib", "ram_cleanup_baseline_growth_gib")
+    cgroup_limited = snapshot.get("cgroup_memory_limited", False)
+    if not isinstance(cgroup_limited, bool):
+        cgroup_limited = None
+    cgroup_limit = _number(snapshot, "cgroup_memory_limit_gib", default=1e300)
+    cgroup_current = _number(snapshot, "cgroup_memory_current_gib", default=0.0)
+    cgroup_free = _number(snapshot, "cgroup_memory_free_gib", default=1e300)
+    cgroup_invalid = False
+    if cgroup_limited is True:
+        cgroup_invalid = any(name not in snapshot for name in (
+            "cgroup_memory_limit_gib", "cgroup_memory_current_gib", "cgroup_memory_free_gib"))
+        cgroup_invalid = cgroup_invalid or any(
+            not np.isfinite(value) or value < 0 for value in (cgroup_limit, cgroup_current, cgroup_free))
+        cgroup_invalid = cgroup_invalid or cgroup_current > cgroup_limit
+        cgroup_invalid = cgroup_invalid or not np.isclose(cgroup_free, cgroup_limit - cgroup_current, rtol=0, atol=1e-6)
 
     numeric_values = (gpu_used, gpu_free, gpu_reserved, ram_available, rss, swap, disk, forecast,
                       gpu_growth, ram_growth)
@@ -317,6 +361,8 @@ def evaluate_resources(snapshot: Mapping[str, Any] | ResourceSnapshot, *, phase:
         hard.append(("CUDA_OOM", "CUDA reported an out-of-memory failure"))
     if snapshot.get("monitor_failure") or snapshot.get("monitor_error"):
         hard.append(("MONITOR_FAILURE", "resource monitor reported a failure"))
+    if cgroup_limited is None or cgroup_invalid:
+        hard.append(("RESOURCE_SNAPSHOT_NONFINITE", "cgroup memory snapshot is malformed"))
     mean_bytes = _number(snapshot, "mean_success_sample_bytes", default=0.0)
     remaining_samples = _number(snapshot, "remaining_samples", default=0.0)
     raw_mean = snapshot.get("mean_success_sample_bytes")
@@ -347,6 +393,8 @@ def evaluate_resources(snapshot: Mapping[str, Any] | ResourceSnapshot, *, phase:
     if phase in ("start", "startup", "preload") and ram_available < 500:
         hard.append(("RAM_START_AVAILABLE_LOW", "RAM start availability is below 500 GiB"))
     if ram_available < 300: hard.append(("RAM_AVAILABLE_LOW", "available RAM is below 300 GiB"))
+    if cgroup_limited is True and cgroup_free < 10:
+        hard.append(("CGROUP_MEMORY_HEADROOM_CRITICAL", "cgroup memory headroom is below 10 GiB"))
     if rss > 160: hard.append(("RAM_RSS_HIGH", "process RSS exceeds 160 GiB"))
     if swap > 0: hard.append(("SWAP_IN_USE", "swap is in use"))
     if phase in ("start", "startup", "preload") and disk < 10:
@@ -358,6 +406,8 @@ def evaluate_resources(snapshot: Mapping[str, Any] | ResourceSnapshot, *, phase:
     if gpu_used > 60: warnings.append(("GPU_USED_WARNING", "GPU used memory exceeds 60 GiB"))
     if gpu_free < 35: warnings.append(("GPU_FREE_WARNING", "GPU free memory is below 35 GiB"))
     if ram_available < 400: warnings.append(("RAM_AVAILABLE_WARNING", "available RAM is below 400 GiB"))
+    if cgroup_limited is True and cgroup_free < 20:
+        warnings.append(("CGROUP_MEMORY_HEADROOM_LOW", "cgroup memory headroom is below 20 GiB"))
     if rss > 100: warnings.append(("RAM_RSS_WARNING", "process RSS exceeds 100 GiB"))
     if disk < 8: warnings.append(("DISK_FREE_WARNING", "disk free space is below 8 GiB"))
     if forecast < 6: warnings.append(("DISK_FORECAST_WARNING", "forecast completion free space is below 6 GiB"))
@@ -408,4 +458,5 @@ __all__ = ["ALPHAS", "DIRECTION_IDS", "GROUPS", "SEEDS", "SOURCE_COMMIT", "STATE
            "build_generation_plan", "build_run_status", "build_task6_call_plan", "evaluate_resources",
            "evaluate_resource_policy", "hash_action", "hash_array", "parse_action", "pilot_groups",
            "preprocess_frame", "preprocess_frame0", "preprocess_frame_zero", "select_pilot_groups",
-           "stable_hash", "validate_action", "canonical_run_status", "TERMINAL_STATUSES"]
+           "stable_hash", "validate_action", "canonical_run_status", "TERMINAL_STATUSES",
+           "sample_cgroup_memory"]

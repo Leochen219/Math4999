@@ -19,7 +19,7 @@ try:
     from .umi_task6_operational import (OfficialRuntimeFactory, OperationalEvidenceError, extract_task5_directions,
         prepare_bridge_upload_bundle, validate_launch_contract, verify_pinned_bridge_assets, observe_live_launch,
         _validate_static_contract)
-    from .umi_task6_primitives import STATE_CATALOG, build_generation_plan, evaluate_resources
+    from .umi_task6_primitives import STATE_CATALOG, build_generation_plan, evaluate_resources, sample_cgroup_memory
     from .umi_task6_runtime import Task6Inputs, build_task6_hash_binding, preflight_task6, task6_binding_config
     from .run_umi_task6_experiment import (_atomic_json, BlockedExecution, ResourceMonitor, ResourceStop,
         accept_resource_smoke, run_pilot, run_resource_smoke)
@@ -27,7 +27,7 @@ try:
     from .umi_fd_post_vae_bridge import sha256_array
 except ImportError:  # pragma: no cover
     from umi_task6_operational import OfficialRuntimeFactory, OperationalEvidenceError, extract_task5_directions, prepare_bridge_upload_bundle, validate_launch_contract, verify_pinned_bridge_assets, observe_live_launch, _validate_static_contract
-    from umi_task6_primitives import STATE_CATALOG, build_generation_plan, evaluate_resources
+    from umi_task6_primitives import STATE_CATALOG, build_generation_plan, evaluate_resources, sample_cgroup_memory
     from umi_task6_runtime import Task6Inputs, build_task6_hash_binding, preflight_task6, task6_binding_config
     from run_umi_task6_experiment import (_atomic_json, BlockedExecution, ResourceMonitor, ResourceStop,
         accept_resource_smoke, run_pilot, run_resource_smoke)
@@ -42,7 +42,8 @@ def load_json(path: str | os.PathLike[str]) -> Any:
         raise OperationalEvidenceError(f"invalid JSON evidence: {path}") from error
 
 
-def resource_samplers(run_dir: str | os.PathLike[str], *, gpu_index: int = 0):
+def resource_samplers(run_dir: str | os.PathLike[str], *, gpu_index: int = 0,
+                      cgroup_root: str | os.PathLike[str] = "/sys/fs/cgroup"):
     """Create fail-closed NVML, psutil and disk samplers for one process."""
     root = Path(run_dir)
     def gpu():
@@ -65,8 +66,10 @@ def resource_samplers(run_dir: str | os.PathLike[str], *, gpu_index: int = 0):
         try:
             import psutil
             memory, swap = psutil.virtual_memory(), psutil.swap_memory()
-            return {"ram_available_gib": memory.available / 2**30, "rss_gib": psutil.Process(os.getpid()).memory_info().rss / 2**30,
-                    "swap_used_gib": swap.used / 2**30}
+            sample = {"ram_available_gib": memory.available / 2**30, "rss_gib": psutil.Process(os.getpid()).memory_info().rss / 2**30,
+                      "swap_used_gib": swap.used / 2**30}
+            sample.update(sample_cgroup_memory(cgroup_root))
+            return sample
         except Exception as error:
             return {"monitor_failure": f"RAM sampler failed: {error}"}
     def disk():

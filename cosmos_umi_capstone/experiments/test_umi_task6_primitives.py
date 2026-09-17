@@ -1,4 +1,5 @@
 import json
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -18,6 +19,7 @@ from umi_task6_primitives import (
     preprocess_frame,
     stable_hash,
     evaluate_resources,
+    sample_cgroup_memory,
 )
 
 
@@ -100,6 +102,63 @@ class PreprocessTests(unittest.TestCase):
 
 
 class InputAndResourceTests(unittest.TestCase):
+    def test_cgroup_v2_sampler_reads_finite_limit_current_and_free(self):
+        with tempfile.TemporaryDirectory() as root:
+            from pathlib import Path
+            root = Path(root)
+            (root / "memory.max").write_text(str(110 * 1024**3), encoding="ascii")
+            (root / "memory.current").write_text(str(16 * 1024**3), encoding="ascii")
+            sample = sample_cgroup_memory(root)
+        self.assertEqual(sample["cgroup_memory_limit_gib"], 110.0)
+        self.assertEqual(sample["cgroup_memory_current_gib"], 16.0)
+        self.assertEqual(sample["cgroup_memory_free_gib"], 94.0)
+        self.assertTrue(sample["cgroup_memory_limited"])
+
+    def test_cgroup_v2_sampler_preserves_unlimited_max(self):
+        with tempfile.TemporaryDirectory() as root:
+            from pathlib import Path
+            root = Path(root)
+            (root / "memory.max").write_text("max\n", encoding="ascii")
+            (root / "memory.current").write_text(str(16 * 1024**3), encoding="ascii")
+            sample = sample_cgroup_memory(root)
+        self.assertIsNone(sample["cgroup_memory_limit_gib"])
+        self.assertEqual(sample["cgroup_memory_current_gib"], 16.0)
+        self.assertIsNone(sample["cgroup_memory_free_gib"])
+        self.assertFalse(sample["cgroup_memory_limited"])
+
+    def test_cgroup_v2_sampler_reports_corrupt_files_as_monitor_failure(self):
+        with tempfile.TemporaryDirectory() as root:
+            from pathlib import Path
+            root = Path(root)
+            (root / "memory.max").write_text("not-a-limit", encoding="ascii")
+            (root / "memory.current").write_text("1", encoding="ascii")
+            sample = sample_cgroup_memory(root)
+        self.assertIn("monitor_failure", sample)
+
+    def test_cgroup_headroom_warning_and_hard_stop_are_independent_of_host_ram(self):
+        base = {"gpu_used_gib": 0, "gpu_free_gib": 100, "gpu_reserved_gib": 0,
+                "ram_available_gib": 900, "rss_gib": 1, "swap_used_gib": 0,
+                "disk_free_gib": 20, "forecast_free_gib": 20,
+                "cgroup_memory_limited": True, "cgroup_memory_limit_gib": 110.0}
+        warning = evaluate_resources({**base, "cgroup_memory_current_gib": 91.0,
+                                      "cgroup_memory_free_gib": 19.0})
+        self.assertEqual(warning["status"], "WARNING")
+        self.assertEqual(warning["reason_code"], "CGROUP_MEMORY_HEADROOM_LOW")
+        hard = evaluate_resources({**base, "cgroup_memory_current_gib": 101.0,
+                                   "cgroup_memory_free_gib": 9.0})
+        self.assertEqual(hard["status"], "HARD_STOP")
+        self.assertEqual(hard["reason_code"], "CGROUP_MEMORY_HEADROOM_CRITICAL")
+
+    def test_cgroup_limited_snapshot_requires_consistent_headroom_fields(self):
+        base = {"gpu_used_gib": 0, "gpu_free_gib": 100, "gpu_reserved_gib": 0,
+                "ram_available_gib": 900, "rss_gib": 1, "swap_used_gib": 0,
+                "disk_free_gib": 20, "forecast_free_gib": 20,
+                "cgroup_memory_limited": True, "cgroup_memory_limit_gib": 110.0,
+                "cgroup_memory_current_gib": 16.0}
+        result = evaluate_resources(base)
+        self.assertEqual(result["status"], "HARD_STOP")
+        self.assertEqual(result["reason_code"], "RESOURCE_SNAPSHOT_NONFINITE")
+
     def test_action_requires_exact_shape_finite_numeric_and_hash_is_stable(self):
         action = parse_action([[float(i + j) for j in range(10)] for i in range(16)])
         self.assertEqual(action.shape, (16, 10))
