@@ -435,6 +435,17 @@ def verify_raw_manifest(root: str | Path) -> dict[str, Any]:
     return {"sha256": sha256_file(path), "entries": entries}
 
 
+_OPEN_MEMMAPS: list[np.memmap] = []
+
+
+def _load_mmap(path: Path) -> np.memmap:
+    value = np.load(path, allow_pickle=False, mmap_mode="r")
+    if not isinstance(value, np.memmap):
+        raise ValueError(f"expected mmap-backed array: {path}")
+    _OPEN_MEMMAPS.append(value)
+    return value
+
+
 def _load_records(root: Path) -> dict[str, dict[str, Any]]:
     if not (root / "samples").is_dir(): raise ValueError("Task 6 samples directory is missing")
     records: dict[str, dict[str, Any]] = {}
@@ -451,12 +462,30 @@ def _load_records(root: Path) -> dict[str, dict[str, Any]]:
         if not meta_path.is_file(): raise ValueError(f"sample metadata missing: {sample.name}")
         record = json.loads(meta_path.read_text(encoding="utf-8"))
         for array_path in sample.glob("*.npy"):
-            record[array_path.stem] = np.load(array_path, allow_pickle=False, mmap_mode="r")
+            record[array_path.stem] = _load_mmap(array_path)
         records[sample.name] = record
     return records
 
 
-def analyze_decoder_replays(run_root: str | Path, decoder_root: str | Path | None = None, *, expected_raw_manifest_sha: str | None = None, expected_group: Mapping[str, Any] | None = None) -> dict[str, Any]:
+def _close_memmaps(value: Any) -> None:
+    """Close mmap-backed arrays recursively without copying their payloads."""
+    if isinstance(value, np.memmap):
+        mmap = getattr(value, "_mmap", None)
+        if mmap is not None:
+            mmap.close()
+        try:
+            _OPEN_MEMMAPS.remove(value)
+        except ValueError:
+            pass
+    elif isinstance(value, dict):
+        for item in value.values():
+            _close_memmaps(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _close_memmaps(item)
+
+
+def _analyze_decoder_replays(run_root: str | Path, decoder_root: str | Path | None = None, *, expected_raw_manifest_sha: str | None = None, expected_group: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Read decoder replay records without touching the model."""
     raw = Path(run_root).resolve()
     root = Path(decoder_root).resolve() if decoder_root is not None else raw.parent / (raw.name + "_decoder")
@@ -507,7 +536,7 @@ def analyze_decoder_replays(run_root: str | Path, decoder_root: str | Path | Non
     for path in sorted(root.iterdir()):
         if not path.is_dir() or not (path / "record.json").is_file(): continue
         record = json.loads((path / "record.json").read_text(encoding="utf-8"))
-        for array_path in path.glob("*.npy"): record[array_path.stem] = np.load(array_path, allow_pickle=False, mmap_mode="r")
+        for array_path in path.glob("*.npy"): record[array_path.stem] = _load_mmap(array_path)
         records[path.name] = record
     if len(records) != 16: return {"status": "INCOMPLETE", "metrics": [], "reason": f"expected 16 decoder records, found {len(records)}"}
     expected_replays = {item["replay_id"]: item for item in expected_plan}
@@ -548,7 +577,7 @@ def analyze_decoder_replays(run_root: str | Path, decoder_root: str | Path | Non
         if not path.is_dir() or not (path / "record.json").is_file(): continue
         meta = json.loads((path / "record.json").read_text(encoding="utf-8")); spec = meta.get("spec", {})
         logical = str(spec.get("sample_id", path.name)).split("__")[-1]
-        source_records[str(spec.get("decode_precision"))][logical] = {**meta, **{p.stem: np.load(p, allow_pickle=False, mmap_mode="r") for p in path.glob("*.npy")}}
+        source_records[str(spec.get("decode_precision"))][logical] = {**meta, **{p.stem: _load_mmap(p) for p in path.glob("*.npy")}}
     spaces = {"native_bf16": "native_rgb", "temporary_fp32": "fp32_rgb"}
     for precision, rgb_space in spaces.items():
         values = {rgb_space: "decoded_final_float32", "direct_float_condition_latent": "direct_condition_latent_float32", "uint8_sim_condition_latent": "uint8_condition_latent_float32"}
@@ -612,9 +641,24 @@ def analyze_decoder_replays(run_root: str | Path, decoder_root: str | Path | Non
         for precision, item in (("native_bf16", n), ("temporary_fp32", f)):
             if "direct_condition_latent_float32" in item and "uint8_condition_latent_float32" in item:
                 metric = difference_metrics(item["direct_condition_latent_float32"], item["uint8_condition_latent_float32"]); space_rows.append({"space": "direct_vs_uint8_condition_latent", "sample_id": logical, "precision": precision, **metric})
+    _close_memmaps(raw_records)
+    _close_memmaps(records)
+    _close_memmaps(source_records)
     return {"status": "COMPLETE", "metrics": rows, "space_metrics": space_rows, "tensors": decoder_tensors, "metrics_spaces": ["prediction_latent", "native_rgb", "fp32_rgb", "direct_float_condition_latent", "uint8_sim_condition_latent"], "decoder_calls": 16, "decoder_manifest_sha256": decoder_manifest_sha,
             "decoder_config_sha256": sha256_file(config_path),
             "reason": "8 selected latents decoded serially at native BF16 and temporary FP32"}
+
+
+def analyze_decoder_replays(run_root: str | Path, decoder_root: str | Path | None = None, *, expected_raw_manifest_sha: str | None = None, expected_group: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Analyze decoder records and close all mmap handles on every exit path."""
+    marker = len(_OPEN_MEMMAPS)
+    try:
+        return _analyze_decoder_replays(run_root, decoder_root=decoder_root,
+                                        expected_raw_manifest_sha=expected_raw_manifest_sha,
+                                        expected_group=expected_group)
+    finally:
+        for value in list(_OPEN_MEMMAPS[marker:]):
+            _close_memmaps(value)
 
 
 def _verify_decoder_manifest_for_analysis(root: Path) -> str:
@@ -833,17 +877,20 @@ def analyze_task6_run(run_dir: str | Path, output_dir: str | Path | None = None,
         raise ValueError("public Task 6 analysis rejects stopped or partial raw runs")
     raw_manifest = verify_raw_manifest(root)
     records = _load_records(root)
-    result = analyze_task6_records(records, group=status.get("group"), plan_detail=status.get("plan_detail"))
-    decoder = analyze_decoder_replays(root, decoder_root=decoder_root,
-                                      expected_raw_manifest_sha=raw_manifest["sha256"], expected_group=status.get("group"))
-    if result.get("status") != "COMPLETE" or len(result.get("fits", [])) != 5 or len(result.get("additivity", [])) != 6 or len(result.get("predictions", [])) != 24:
-        raise ValueError("public Task 6 analysis requires exact 5 direction, 6 additivity, and 24 holdout results")
-    if decoder.get("status") != "COMPLETE" or int(decoder.get("decoder_calls", 0)) != 16:
-        raise ValueError("public Task 6 analysis requires a complete bound decoder replay")
-    destination = Path(output_dir) if output_dir is not None else root.parent / (root.name + "_analysis")
-    published = write_task6_artifacts(result, destination, raw_root=root, decoder=decoder, source_dir=Path(__file__).parent)
-    if verify_raw_manifest(root)["sha256"] != raw_manifest["sha256"]: raise ValueError("raw evidence changed during analysis")
-    return {"status": result.get("status"), "decoder_status": decoder.get("status"), **published}
+    try:
+        result = analyze_task6_records(records, group=status.get("group"), plan_detail=status.get("plan_detail"))
+        decoder = analyze_decoder_replays(root, decoder_root=decoder_root,
+                                          expected_raw_manifest_sha=raw_manifest["sha256"], expected_group=status.get("group"))
+        if result.get("status") != "COMPLETE" or len(result.get("fits", [])) != 5 or len(result.get("additivity", [])) != 6 or len(result.get("predictions", [])) != 24:
+            raise ValueError("public Task 6 analysis requires exact 5 direction, 6 additivity, and 24 holdout results")
+        if decoder.get("status") != "COMPLETE" or int(decoder.get("decoder_calls", 0)) != 16:
+            raise ValueError("public Task 6 analysis requires a complete bound decoder replay")
+        destination = Path(output_dir) if output_dir is not None else root.parent / (root.name + "_analysis")
+        published = write_task6_artifacts(result, destination, raw_root=root, decoder=decoder, source_dir=Path(__file__).parent)
+        if verify_raw_manifest(root)["sha256"] != raw_manifest["sha256"]: raise ValueError("raw evidence changed during analysis")
+        return {"status": result.get("status"), "decoder_status": decoder.get("status"), **published}
+    finally:
+        _close_memmaps(records)
 
 
 def main(argv: list[str] | None = None) -> int:

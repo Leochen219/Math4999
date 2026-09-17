@@ -99,12 +99,13 @@ class AnalysisTests(unittest.TestCase):
             (sample / "sample.json").write_text(json.dumps({"sample_id": "sample-0"}), encoding="utf-8")
             digest = hashlib.sha256(array_path.read_bytes()).hexdigest()
             (sample / "status.json").write_text(json.dumps({"status": "success", "artifact_sha256": {"probe.npy": digest}}), encoding="utf-8")
-            loaded = api._load_records(root)["sample-0"]["probe"]
+            records = api._load_records(root); loaded = records["sample-0"]["probe"]
             self.assertIsInstance(loaded, np.memmap)
             self.assertFalse(loaded.flags.writeable)
             np.testing.assert_array_equal(loaded, expected)
             with self.assertRaises((ValueError, RuntimeError)):
                 loaded[0, 0] = 99
+            api._close_memmaps(records)
             del loaded
 
     def test_decoder_manifest_rejects_unsafe_path_and_nonhex_digest(self):
@@ -197,8 +198,11 @@ class AnalysisTests(unittest.TestCase):
             status = runner.run_pilot(adapter, inputs, run_dir, monitor=monitor)
             self.assertEqual(status["status"], "AWAITING_REVIEW")
             reloaded = api._load_records(run_dir)
-            result = api.analyze_task6_records(reloaded, strict=True)
-            self.assertEqual(len(reloaded), 32); self.assertEqual(len(result["fits"]), 5); self.assertNotEqual(result["derivation"]["combination_coefficients"]["c01"], 1.0)
+            try:
+                result = api.analyze_task6_records(reloaded, strict=True)
+                self.assertEqual(len(reloaded), 32); self.assertEqual(len(result["fits"]), 5); self.assertNotEqual(result["derivation"]["combination_coefficients"]["c01"], 1.0)
+            finally:
+                api._close_memmaps(reloaded)
             import umi_task6_decoder as decoder_api
             class Encoder:
                 def identity(self): return {"encoder_state": "public-vae-v1", "code": "fixture"}
