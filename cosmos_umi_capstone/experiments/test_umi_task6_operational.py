@@ -230,6 +230,14 @@ class OperationalTask6Tests(unittest.TestCase):
             with self.assertRaisesRegex(self.op.OperationalEvidenceError, "unsafe or duplicate"):
                 self.op._verify_tree_manifest(root)
 
+    def test_task5_manifest_rejects_noncanonical_root_lock_path(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); lock = root / ".runner.lock"; lock.write_bytes(b"lock")
+            digest = hashlib.sha256(lock.read_bytes()).hexdigest()
+            (root / "MANIFEST.sha256").write_text(f"{digest}  ./.runner.lock\n")
+            with self.assertRaisesRegex(self.op.OperationalEvidenceError, "inventory mismatch"):
+                self.op._verify_tree_manifest(root)
+
     def test_task5_manifest_rejects_root_lock_hash_mismatch(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp); (root / ".runner.lock").write_bytes(b"lock")
@@ -258,6 +266,88 @@ class OperationalTask6Tests(unittest.TestCase):
             ]
             (root / "MANIFEST.sha256").write_text("\n".join(entries) + "\n")
             with self.assertRaisesRegex(self.op.OperationalEvidenceError, "inventory mismatch"):
+                self.op._verify_tree_manifest(root)
+
+    def test_task5_manifest_accepts_valid_unlisted_nested_self_manifest(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); child = root / "samples"; child.mkdir()
+            lock = root / ".runner.lock"; lock.write_bytes(b"lock")
+            payload = child / "payload.bin"; payload.write_bytes(b"payload")
+            child_manifest = child / "MANIFEST.sha256"
+            child_manifest.write_text(f"{hashlib.sha256(payload.read_bytes()).hexdigest()}  payload.bin\n")
+            entries = [
+                f"{hashlib.sha256(lock.read_bytes()).hexdigest()}  .runner.lock",
+                f"{hashlib.sha256(payload.read_bytes()).hexdigest()}  samples/payload.bin",
+            ]
+            (root / "MANIFEST.sha256").write_text("\n".join(entries) + "\n")
+            self.op._verify_tree_manifest(root)
+
+    def test_task5_manifest_rejects_malformed_unlisted_nested_self_manifest(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); child = root / "nested"; child.mkdir(); lock = root / ".runner.lock"; lock.write_bytes(b"lock")
+            payload = child / "payload.bin"; payload.write_bytes(b"payload")
+            (child / "MANIFEST.sha256").write_text("not a manifest\n")
+            entries = [f"{hashlib.sha256(lock.read_bytes()).hexdigest()}  .runner.lock",
+                       f"{hashlib.sha256(payload.read_bytes()).hexdigest()}  nested/payload.bin"]
+            (root / "MANIFEST.sha256").write_text("\n".join(entries) + "\n")
+            with self.assertRaisesRegex(self.op.OperationalEvidenceError, "malformed"):
+                self.op._verify_tree_manifest(root)
+
+    def test_task5_manifest_rejects_nested_self_manifest_hash_mismatch(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); child = root / "nested"; child.mkdir(); lock = root / ".runner.lock"; lock.write_bytes(b"lock")
+            payload = child / "payload.bin"; payload.write_bytes(b"payload")
+            (child / "MANIFEST.sha256").write_text(f"{'0' * 64}  payload.bin\n")
+            entries = [f"{hashlib.sha256(lock.read_bytes()).hexdigest()}  .runner.lock",
+                       f"{hashlib.sha256(payload.read_bytes()).hexdigest()}  nested/payload.bin"]
+            (root / "MANIFEST.sha256").write_text("\n".join(entries) + "\n")
+            with self.assertRaisesRegex(self.op.OperationalEvidenceError, "manifest mismatch"):
+                self.op._verify_tree_manifest(root)
+
+    def test_task5_manifest_rejects_nested_self_manifest_omission(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); child = root / "nested"; child.mkdir(); lock = root / ".runner.lock"; lock.write_bytes(b"lock")
+            payload = child / "payload.bin"; payload.write_bytes(b"payload")
+            (child / "MANIFEST.sha256").write_text("")
+            entries = [f"{hashlib.sha256(lock.read_bytes()).hexdigest()}  .runner.lock",
+                       f"{hashlib.sha256(payload.read_bytes()).hexdigest()}  nested/payload.bin"]
+            (root / "MANIFEST.sha256").write_text("\n".join(entries) + "\n")
+            with self.assertRaisesRegex(self.op.OperationalEvidenceError, "inventory mismatch"):
+                self.op._verify_tree_manifest(root)
+
+    def test_task5_manifest_rejects_nested_self_manifest_extra_file(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); child = root / "nested"; child.mkdir(); lock = root / ".runner.lock"; lock.write_bytes(b"lock")
+            payload = child / "payload.bin"; payload.write_bytes(b"payload")
+            extra = child / "extra.bin"; extra.write_bytes(b"extra")
+            (child / "MANIFEST.sha256").write_text(f"{hashlib.sha256(payload.read_bytes()).hexdigest()}  payload.bin\n")
+            entries = [f"{hashlib.sha256(lock.read_bytes()).hexdigest()}  .runner.lock",
+                       f"{hashlib.sha256(payload.read_bytes()).hexdigest()}  nested/payload.bin",
+                       f"{hashlib.sha256(extra.read_bytes()).hexdigest()}  nested/extra.bin"]
+            (root / "MANIFEST.sha256").write_text("\n".join(entries) + "\n")
+            with self.assertRaisesRegex(self.op.OperationalEvidenceError, "inventory mismatch"):
+                self.op._verify_tree_manifest(root)
+
+    def test_task5_manifest_rejects_nested_self_manifest_path_escape(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); child = root / "nested"; child.mkdir(); lock = root / ".runner.lock"; lock.write_bytes(b"lock")
+            payload = child / "payload.bin"; payload.write_bytes(b"payload")
+            (child / "MANIFEST.sha256").write_text(f"{hashlib.sha256(payload.read_bytes()).hexdigest()}  ../payload.bin\n")
+            entries = [f"{hashlib.sha256(lock.read_bytes()).hexdigest()}  .runner.lock",
+                       f"{hashlib.sha256(payload.read_bytes()).hexdigest()}  nested/payload.bin"]
+            (root / "MANIFEST.sha256").write_text("\n".join(entries) + "\n")
+            with self.assertRaisesRegex(self.op.OperationalEvidenceError, "unsafe or duplicate"):
+                self.op._verify_tree_manifest(root)
+
+    def test_task5_manifest_rejects_nested_self_manifest_self_reference(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); child = root / "nested"; child.mkdir(); lock = root / ".runner.lock"; lock.write_bytes(b"lock")
+            payload = child / "payload.bin"; payload.write_bytes(b"payload")
+            (child / "MANIFEST.sha256").write_text(f"{'0' * 64}  MANIFEST.sha256\n")
+            entries = [f"{hashlib.sha256(lock.read_bytes()).hexdigest()}  .runner.lock",
+                       f"{hashlib.sha256(payload.read_bytes()).hexdigest()}  nested/payload.bin"]
+            (root / "MANIFEST.sha256").write_text("\n".join(entries) + "\n")
+            with self.assertRaisesRegex(self.op.OperationalEvidenceError, "unsafe or duplicate"):
                 self.op._verify_tree_manifest(root)
 
     def test_task5_manifest_rejects_nested_manifest_and_extra_file(self):

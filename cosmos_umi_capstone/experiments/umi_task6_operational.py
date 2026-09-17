@@ -154,25 +154,38 @@ def prepare_bridge_upload_bundle(action_path: str | os.PathLike[str], video_path
 
 
 def _verify_tree_manifest(root: Path, *, manifest_name: str = "MANIFEST.sha256", lock_name: str = ".runner.lock") -> str:
-    manifest = root / manifest_name
-    if not manifest.is_file():
-        raise OperationalEvidenceError(f"missing manifest: {manifest}")
-    seen: set[str] = set()
-    for line in manifest.read_text(encoding="ascii").splitlines():
-        parts = line.split("  ", 1)
-        if len(parts) != 2 or len(parts[0]) != 64 or any(c not in "0123456789abcdef" for c in parts[0]):
-            raise OperationalEvidenceError("malformed Task 5 manifest")
-        relative = Path(parts[1])
-        if relative.is_absolute() or ".." in relative.parts or relative.as_posix() == manifest_name or parts[1] in seen:
-            raise OperationalEvidenceError("unsafe or duplicate Task 5 manifest path")
-        target = root / relative
-        if not target.is_file() or sha256_file(target) != parts[0]:
-            raise OperationalEvidenceError(f"Task 5 manifest mismatch: {parts[1]}")
-        seen.add(parts[1])
-    actual = {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file() and p.relative_to(root).as_posix() not in {manifest_name, lock_name}}
-    if actual != seen - {lock_name}:
+    def read_manifest_entries(base: Path) -> tuple[set[str], set[str]]:
+        manifest = base / manifest_name
+        if not manifest.is_file():
+            raise OperationalEvidenceError(f"missing manifest: {manifest}")
+        seen: set[str] = set()
+        for line in manifest.read_text(encoding="ascii").splitlines():
+            parts = line.split("  ", 1)
+            if len(parts) != 2 or len(parts[0]) != 64 or any(c not in "0123456789abcdef" for c in parts[0]):
+                raise OperationalEvidenceError("malformed Task 5 manifest")
+            relative = Path(parts[1])
+            if relative.is_absolute() or ".." in relative.parts or relative.as_posix() == manifest_name or parts[1] in seen:
+                raise OperationalEvidenceError("unsafe or duplicate Task 5 manifest path")
+            target = base / relative
+            if not target.is_file() or sha256_file(target) != parts[0]:
+                raise OperationalEvidenceError(f"Task 5 manifest mismatch: {parts[1]}")
+            seen.add(parts[1])
+        actual = {p.relative_to(base).as_posix() for p in base.rglob("*") if p.is_file() and p.relative_to(base).as_posix() not in {manifest_name, lock_name}}
+        return seen, actual
+
+    seen, actual = read_manifest_entries(root)
+    listed = seen - {lock_name}
+    if listed - actual:
         raise OperationalEvidenceError("Task 5 manifest inventory mismatch")
-    return sha256_file(manifest)
+    unlisted = actual - listed
+    for candidate in sorted(unlisted):
+        relative = Path(candidate)
+        if relative.name != Path(manifest_name).name or relative.parent == Path("."):
+            raise OperationalEvidenceError("Task 5 manifest inventory mismatch")
+        auxiliary_seen, auxiliary_actual = read_manifest_entries(root / relative.parent)
+        if auxiliary_actual != auxiliary_seen - {lock_name}:
+            raise OperationalEvidenceError("Task 5 manifest inventory mismatch")
+    return sha256_file(root / manifest_name)
 
 
 def extract_task5_directions(task5_root: str | os.PathLike[str], *, expected_manifest_sha256: str | None = None,
