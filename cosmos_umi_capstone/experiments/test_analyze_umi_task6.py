@@ -6,6 +6,7 @@ import shutil
 import tempfile
 import unittest
 import csv
+from unittest import mock
 from pathlib import Path
 
 import numpy as np
@@ -214,6 +215,30 @@ class AnalysisTests(unittest.TestCase):
             self.assertEqual({(row["space"], row["precision"]) for row in rows}, {
                 ("direct_float_condition_latent", "native_bf16"), ("direct_float_condition_latent", "temporary_fp32"),
                 ("uint8_sim_condition_latent", "native_bf16"), ("uint8_sim_condition_latent", "temporary_fp32")})
+
+    def test_public_run_closes_raw_memmaps_before_decoder_analysis(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "raw"; root.mkdir()
+            (root / "MANIFEST.sha256").write_text("placeholder", encoding="ascii")
+            (root / "run_status.json").write_text(json.dumps({"status": "AWAITING_REVIEW", "completed_samples": list(range(32)), "group": {"state": "bridge_0", "seed": 0}}), encoding="utf-8")
+            marker = len(api._OPEN_MEMMAPS)
+            def load_records(_root):
+                path = Path(temporary) / "raw.npy"
+                np.save(path, np.zeros((2,), np.float32), allow_pickle=False)
+                mapped = np.load(path, allow_pickle=False, mmap_mode="r"); api._OPEN_MEMMAPS.append(mapped)
+                return {"fixture": {"output_full": mapped}}
+            analysis_result = {"status": "COMPLETE", "fits": [{}] * 5, "additivity": [{}] * 6, "predictions": [{}] * 24, "group": {"state": "bridge_0", "seed": 0}, "tensors": {}}
+            decoder_result = {"status": "COMPLETE", "decoder_calls": 16}
+            try:
+                with mock.patch.object(api, "verify_raw_manifest", return_value={"sha256": "r" * 64}), \
+                     mock.patch.object(api, "_load_records", side_effect=load_records), \
+                     mock.patch.object(api, "analyze_task6_records", return_value=analysis_result), \
+                     mock.patch.object(api, "analyze_decoder_replays", side_effect=lambda *args, **kwargs: (self.assertEqual(len(api._OPEN_MEMMAPS), marker), decoder_result)[1]), \
+                     mock.patch.object(api, "write_task6_artifacts", return_value={"output_dir": "out"}):
+                    result = api.analyze_task6_run(root, output_root=Path(temporary) / "analysis")
+                self.assertEqual(result["decoder_status"], "COMPLETE")
+            finally:
+                api._close_new_memmaps(marker)
 
     def test_fresh_review_bundles_are_byte_deterministic(self):
         records, frozen = _linear_records(); result = api.analyze_task6_records(records, strict=True)

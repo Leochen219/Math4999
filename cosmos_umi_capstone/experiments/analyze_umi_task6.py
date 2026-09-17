@@ -901,6 +901,12 @@ def analyze_task6_run(run_dir: str | Path, output_dir: str | Path | None = None,
     try:
         records = _load_records(root)
         result = analyze_task6_records(records, group=status.get("group"), plan_detail=status.get("plan_detail"))
+        # The raw analysis result contains derived tensors/scalars, not raw
+        # memmap views. Release all raw sample mappings before decoder analysis
+        # reopens the same evidence; otherwise large runs can exhaust the file
+        # descriptor limit even though the outer finally eventually closes them.
+        _close_memmaps(records)
+        records = {}
         decoder = analyze_decoder_replays(root, decoder_root=decoder_root,
                                           expected_raw_manifest_sha=raw_manifest["sha256"], expected_group=status.get("group"))
         if result.get("status") != "COMPLETE" or len(result.get("fits", [])) != 5 or len(result.get("additivity", [])) != 6 or len(result.get("predictions", [])) != 24:
