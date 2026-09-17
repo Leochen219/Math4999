@@ -5,6 +5,7 @@ import hashlib
 import shutil
 import tempfile
 import unittest
+import csv
 from pathlib import Path
 
 import numpy as np
@@ -185,6 +186,34 @@ class AnalysisTests(unittest.TestCase):
             output = Path(temporary) / "analysis"; published = api.write_task6_artifacts(result, output, raw_root=raw)
             self.assertTrue((output / "review_bundle.zip").is_file()); self.assertEqual(api.verify_analysis_manifest(output)["sha256"], Path(published["manifest"]).read_bytes() and api.verify_analysis_manifest(output)["sha256"])
             self.assertTrue(api.write_task6_artifacts(result, output, raw_root=raw)["idempotent"])
+
+    def test_artifact_export_binds_real_decoder_summary_and_roundtrip_spaces(self):
+        records, frozen = _linear_records()
+        result = api.analyze_task6_records(records, plan_detail={"combination_coefficients": {"c01": frozen["c01"], "c12": frozen["c12"]}}, strict=True)
+        decoder = {"status": "COMPLETE", "decoder_calls": 16, "decoder_manifest_sha256": "d" * 64,
+                   "metrics": [], "space_metrics": [
+                       {"space": "direct_float_condition_latent", "rms": 1.0, "precision": "native_bf16"},
+                       {"space": "direct_float_condition_latent", "rms": 1.5, "precision": "temporary_fp32"},
+                       {"space": "uint8_sim_condition_latent", "rms": 2.0, "precision": "native_bf16"},
+                       {"space": "uint8_sim_condition_latent", "rms": 2.5, "precision": "temporary_fp32"}],
+                   "tensors": {"large_tensor": np.ones((2, 2), np.float32)}}
+        result["decoder"] = {"status": "NOT_RUN"}
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "analysis"
+            api.write_task6_artifacts(result, output, decoder=decoder)
+            summary = json.loads((output / "task6_summary.json").read_text())
+            decoder_summary = json.loads((output / "decoder_summary.json").read_text())
+            self.assertEqual(summary["decoder"]["status"], "COMPLETE")
+            self.assertEqual(summary["decoder"]["decoder_calls"], 16)
+            self.assertNotIn("tensors", decoder_summary)
+            self.assertEqual(decoder_summary["decoder_manifest_sha256"], "d" * 64)
+            np.testing.assert_array_equal(np.load(output / "analysis_tensors" / "large_tensor.npy", allow_pickle=False), np.ones((2, 2), np.float32))
+            with (output / "roundtrip_metrics.csv").open(newline="") as stream:
+                rows = list(csv.DictReader(stream))
+            self.assertEqual({row["space"] for row in rows}, {"direct_float_condition_latent", "uint8_sim_condition_latent"})
+            self.assertEqual({(row["space"], row["precision"]) for row in rows}, {
+                ("direct_float_condition_latent", "native_bf16"), ("direct_float_condition_latent", "temporary_fp32"),
+                ("uint8_sim_condition_latent", "native_bf16"), ("uint8_sim_condition_latent", "temporary_fp32")})
 
     def test_fresh_review_bundles_are_byte_deterministic(self):
         records, frozen = _linear_records(); result = api.analyze_task6_records(records, strict=True)

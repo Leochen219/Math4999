@@ -783,6 +783,18 @@ def verify_analysis_manifest(root: str | Path) -> dict[str, Any]:
     return {"sha256": sha256_file(manifest), "entries": entries}
 
 
+def _decoder_export_metadata(decoder: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Keep decoder status/provenance JSON small; arrays remain .npy artifacts."""
+    if not isinstance(decoder, Mapping):
+        return {"status": "NOT_RUN"}
+    metadata: dict[str, Any] = {}
+    for key, value in decoder.items():
+        if key == "tensors" or isinstance(value, np.ndarray):
+            continue
+        metadata[key] = value
+    return metadata
+
+
 def write_task6_artifacts(result: Mapping[str, Any], output_dir: str | Path, *, raw_root: str | Path | None = None,
                           decoder: Mapping[str, Any] | None = None, source_dir: str | Path | None = None) -> dict[str, Any]:
     output = Path(output_dir)
@@ -809,8 +821,11 @@ def write_task6_artifacts(result: Mapping[str, Any], output_dir: str | Path, *, 
             response = row.get("predicted_latent_response_rms", row.get("response_rms")); floor = floors.get("predicted_latent", 0.0) or 0.0
             bad = response is None or (response <= 10.0 * floor if floor else response == 0.0)
             failures.append({"direction_id": row.get("direction_id"), "alpha": row.get("alpha"), "sign": row.get("sign"), "status": "FAIL" if bad else "PASS", "response_rms": response, "baseline_floor_rms": floor, "failure_reason": "response_floor" if bad else ""})
-        _rows_csv(stage / "point_metrics.csv", point_rows); _rows_csv(stage / "difference_metrics.csv", result.get("derivatives", [])); _rows_csv(stage / "fit_metrics.csv", result.get("fits", [])); _rows_csv(stage / "window_decisions.csv", result.get("fits", []) + result.get("image_fits", [])); _rows_csv(stage / "additivity_metrics.csv", result.get("additivity", [])); _rows_csv(stage / "prediction_metrics.csv", result.get("predictions", [])); _rows_csv(stage / "failure_amplitudes.csv", failures); _rows_csv(stage / "decoder_metrics.csv", (decoder or {}).get("metrics", [])); _rows_csv(stage / "decoder_roundtrip_metrics.csv", (decoder or {}).get("metrics", [])); _rows_csv(stage / "decoder_space_metrics.csv", (decoder or {}).get("space_metrics", [])); _rows_csv(stage / "roundtrip_metrics.csv", [row for row in (decoder or {}).get("space_metrics", []) if "roundtrip" in str(row.get("space", ""))]); _rows_csv(stage / "pairwise_precision_metrics.csv", [row for row in (decoder or {}).get("space_metrics", []) if "vs_" in str(row.get("space", ""))]); _rows_csv(stage / "cross_group_status.csv", result.get("cross_group_status", summarize_cross_groups({})))
-        _json(stage / "task6_summary.json", {key: value for key, value in result.items() if key != "tensors"}); _json(stage / "decoder_summary.json", decoder or {"status": "NOT_RUN"})
+        _rows_csv(stage / "point_metrics.csv", point_rows); _rows_csv(stage / "difference_metrics.csv", result.get("derivatives", [])); _rows_csv(stage / "fit_metrics.csv", result.get("fits", [])); _rows_csv(stage / "window_decisions.csv", result.get("fits", []) + result.get("image_fits", [])); _rows_csv(stage / "additivity_metrics.csv", result.get("additivity", [])); _rows_csv(stage / "prediction_metrics.csv", result.get("predictions", [])); _rows_csv(stage / "failure_amplitudes.csv", failures); _rows_csv(stage / "decoder_metrics.csv", (decoder or {}).get("metrics", [])); _rows_csv(stage / "decoder_roundtrip_metrics.csv", (decoder or {}).get("metrics", [])); _rows_csv(stage / "decoder_space_metrics.csv", (decoder or {}).get("space_metrics", [])); _rows_csv(stage / "roundtrip_metrics.csv", [row for row in (decoder or {}).get("space_metrics", []) if str(row.get("space", "")) in {"direct_float_condition_latent", "uint8_sim_condition_latent"}]); _rows_csv(stage / "pairwise_precision_metrics.csv", [row for row in (decoder or {}).get("space_metrics", []) if "vs_" in str(row.get("space", ""))]); _rows_csv(stage / "cross_group_status.csv", result.get("cross_group_status", summarize_cross_groups({})))
+        decoder_metadata = _decoder_export_metadata(decoder)
+        task6_summary = {key: value for key, value in result.items() if key not in {"tensors", "decoder"}}
+        task6_summary["decoder"] = decoder_metadata
+        _json(stage / "task6_summary.json", task6_summary); _json(stage / "decoder_summary.json", decoder_metadata)
         source_hash = _analysis_source_sha(); config_value = {"alphas": list(ALPHAS), "directions": list(DIRECTION_IDS), "spaces": ["prediction_latent", "native_rgb", "fp32_rgb", "float_roundtrip_condition_latent", "uint8_simulated_roundtrip_condition_latent"]}; config_sha = hashlib.sha256(json.dumps(config_value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         decoder_config_sha = (decoder or {}).get("decoder_config_sha256") if decoder else None
         analysis_identity = hashlib.sha256(json.dumps({"raw_manifest_sha256": raw_snapshot["sha256"], "decoder_manifest_sha256": decoder_manifest_sha, "decoder_config_sha256": decoder_config_sha, "analysis_code_sha256": source_hash, "config_sha256": config_sha, "group": result.get("group", {})}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
