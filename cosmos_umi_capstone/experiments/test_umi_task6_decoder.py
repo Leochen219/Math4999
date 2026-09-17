@@ -251,6 +251,66 @@ class DecoderTests(unittest.TestCase):
             raw = Path(temporary) / "raw"; self._raw(raw); result = api.run_task6_decoder_replays(adapter, raw, encoder=Encoder(), decoder_root=Path(temporary)/"decoder")
             self.assertEqual(result["status"], "COMPLETE"); self.assertEqual(resident.decoder_state, "bf16")
 
+    def test_post_cleanup_sample_is_taken_after_runtime_cleanup(self):
+        events = []
+        class Runtime:
+            decoder_state = "bf16"
+            def actual_identity(self): return {"model_state": "runtime-v1", "decoder_state": "bf16"}
+            def decode_prediction_latent(self, latent, *, precision):
+                events.append("decode")
+                return np.zeros((3, 2, 2, 2), np.float32)
+            def restore_decoder_state(self): events.append("restore_decoder_state")
+            def cleanup(self): events.append("runtime_cleanup")
+        class Encoder:
+            def identity(self): return {"encoder_state": "encoder-v1", "code": "fixture"}
+            def __call__(self, frame): events.append("encode"); return np.asarray(frame, np.float32).mean(keepdims=True)
+        class Monitor:
+            def start(self): pass
+            def stop(self): pass
+            def check(self, **kwargs): return {"status": "OK"}
+            def capture_sample(self, replay_id, stage, remaining, root):
+                events.append(stage)
+                if stage == "post_cleanup":
+                    self.assert_cleanup(events)
+                return {"decision_status": "OK"}
+            @staticmethod
+            def assert_cleanup(events):
+                if events[-2:-1] != ["runtime_cleanup"] or events[-4:-2] != ["encode", "encode"]:
+                    raise AssertionError("post_cleanup sampled without the two re-encodes and immediate runtime.cleanup")
+        with tempfile.TemporaryDirectory() as temporary:
+            raw = Path(temporary) / "raw"; self._raw(raw)
+            result = api.run_task6_decoder_replays(Runtime(), raw, encoder=Encoder(),
+                decoder_root=Path(temporary) / "decoder", monitor=Monitor())
+            self.assertEqual(result["status"], "COMPLETE")
+            self.assertEqual(events.count("runtime_cleanup"), 16)
+
+    def test_runtime_cleanup_failure_stops_decoder_before_post_cleanup_sample(self):
+        events = []
+        class Runtime:
+            decoder_state = "bf16"
+            def actual_identity(self): return {"model_state": "runtime-v1", "decoder_state": "bf16"}
+            def decode_prediction_latent(self, latent, *, precision): return np.zeros((3, 2, 2, 2), np.float32)
+            def restore_decoder_state(self): pass
+            def cleanup(self): events.append("runtime_cleanup"); raise RuntimeError("cleanup failed")
+        class Encoder:
+            def identity(self): return {"encoder_state": "encoder-v1", "code": "fixture"}
+            def __call__(self, frame): return np.asarray(frame, np.float32).mean(keepdims=True)
+        class Monitor:
+            def start(self): pass
+            def stop(self): pass
+            def check(self, **kwargs): return {"status": "OK"}
+            def capture_sample(self, replay_id, stage, remaining, root):
+                events.append(stage)
+                if stage == "post_cleanup": raise AssertionError("post_cleanup must not be sampled after cleanup failure")
+                return {"decision_status": "OK"}
+        with tempfile.TemporaryDirectory() as temporary:
+            raw = Path(temporary) / "raw"; self._raw(raw)
+            result = api.run_task6_decoder_replays(Runtime(), raw, encoder=Encoder(),
+                decoder_root=Path(temporary) / "decoder", monitor=Monitor())
+            self.assertEqual(result["status"], "RESOURCE_STOP")
+            self.assertEqual(result["reason_code"], "RUNTIME_CLEANUP_FAILURE")
+            self.assertEqual(events, ["pre_sample", "runtime_cleanup"])
+
     def test_adapter_falls_back_to_validated_task5_replay_for_model_ops_runtime(self):
         import umi_task6_runtime as runtime_api
         carrier = np.ones((1, 48, 5, 16, 16), np.float32); mask = np.zeros_like(carrier, bool); mask[:, :, 0] = True

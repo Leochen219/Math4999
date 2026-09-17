@@ -484,6 +484,17 @@ def run_task6_decoder_replays(runtime: Any, run_root: str | Path, *, state: str 
                 record = replay_one(runtime, latent, precision=spec["decode_precision"])
                 direct = reencode_frame(record["decoded_final_float32"], encoder, quantize=False)
                 quant = reencode_frame(record["decoded_final_float32"], encoder, quantize=True)
+                # Re-encoding can leave VAE/request allocations resident even
+                # though replay_one restored decoder dtype/cache state.  Run
+                # the validated runtime cleanup seam before taking the
+                # post-cleanup resource sample; otherwise the monitor measures
+                # a pre-cleanup plateau and can stop a healthy replay series.
+                cleanup = getattr(runtime, "cleanup", None) or getattr(runtime, "reset_cache", None)
+                if callable(cleanup):
+                    try:
+                        cleanup()
+                    except BaseException as error:
+                        return canonical_resource_stop("RUNTIME_CLEANUP_FAILURE", f"decoder runtime cleanup failed: {error}")
                 arrays = {"decoder_input_full_latent.npy": latent, "predicted_latent.npy": predicted_latent, "decoded_full_float32.npy": record["decoded_full_float32"],
                           "decoded_final_float32.npy": record["decoded_final_float32"], "direct_float_input.npy": direct["input_float32"],
                           "uint8_simulated_input.npy": quant["input_after_uint8_simulation"], "direct_condition_latent_float32.npy": direct["condition_latent_float32"],
