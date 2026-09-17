@@ -91,6 +91,22 @@ class AnalysisTests(unittest.TestCase):
             (root / "MANIFEST.sha256").write_text(f"{'0'*64}  x.txt\n", encoding="ascii")
             with self.assertRaises(ValueError): api.verify_raw_manifest(root)
 
+    def test_load_records_uses_read_only_memmap_arrays(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); sample = root / "samples" / "sample-0"; sample.mkdir(parents=True)
+            array_path = sample / "probe.npy"; expected = np.arange(12, dtype=np.float32).reshape(3, 4)
+            np.save(array_path, expected, allow_pickle=False)
+            (sample / "sample.json").write_text(json.dumps({"sample_id": "sample-0"}), encoding="utf-8")
+            digest = hashlib.sha256(array_path.read_bytes()).hexdigest()
+            (sample / "status.json").write_text(json.dumps({"status": "success", "artifact_sha256": {"probe.npy": digest}}), encoding="utf-8")
+            loaded = api._load_records(root)["sample-0"]["probe"]
+            self.assertIsInstance(loaded, np.memmap)
+            self.assertFalse(loaded.flags.writeable)
+            np.testing.assert_array_equal(loaded, expected)
+            with self.assertRaises((ValueError, RuntimeError)):
+                loaded[0, 0] = 99
+            del loaded
+
     def test_decoder_manifest_rejects_unsafe_path_and_nonhex_digest(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); (root / "MANIFEST.sha256").write_text("not-a-digest  ../escape\n", encoding="ascii")

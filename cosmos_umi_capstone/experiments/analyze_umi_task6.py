@@ -451,7 +451,7 @@ def _load_records(root: Path) -> dict[str, dict[str, Any]]:
         if not meta_path.is_file(): raise ValueError(f"sample metadata missing: {sample.name}")
         record = json.loads(meta_path.read_text(encoding="utf-8"))
         for array_path in sample.glob("*.npy"):
-            record[array_path.stem] = np.load(array_path, allow_pickle=False)
+            record[array_path.stem] = np.load(array_path, allow_pickle=False, mmap_mode="r")
         records[sample.name] = record
     return records
 
@@ -507,7 +507,7 @@ def analyze_decoder_replays(run_root: str | Path, decoder_root: str | Path | Non
     for path in sorted(root.iterdir()):
         if not path.is_dir() or not (path / "record.json").is_file(): continue
         record = json.loads((path / "record.json").read_text(encoding="utf-8"))
-        for array_path in path.glob("*.npy"): record[array_path.stem] = np.load(array_path, allow_pickle=False)
+        for array_path in path.glob("*.npy"): record[array_path.stem] = np.load(array_path, allow_pickle=False, mmap_mode="r")
         records[path.name] = record
     if len(records) != 16: return {"status": "INCOMPLETE", "metrics": [], "reason": f"expected 16 decoder records, found {len(records)}"}
     expected_replays = {item["replay_id"]: item for item in expected_plan}
@@ -548,7 +548,7 @@ def analyze_decoder_replays(run_root: str | Path, decoder_root: str | Path | Non
         if not path.is_dir() or not (path / "record.json").is_file(): continue
         meta = json.loads((path / "record.json").read_text(encoding="utf-8")); spec = meta.get("spec", {})
         logical = str(spec.get("sample_id", path.name)).split("__")[-1]
-        source_records[str(spec.get("decode_precision"))][logical] = {**meta, **{p.stem: np.load(p, allow_pickle=False) for p in path.glob("*.npy")}}
+        source_records[str(spec.get("decode_precision"))][logical] = {**meta, **{p.stem: np.load(p, allow_pickle=False, mmap_mode="r") for p in path.glob("*.npy")}}
     spaces = {"native_bf16": "native_rgb", "temporary_fp32": "fp32_rgb"}
     for precision, rgb_space in spaces.items():
         values = {rgb_space: "decoded_final_float32", "direct_float_condition_latent": "direct_condition_latent_float32", "uint8_sim_condition_latent": "uint8_condition_latent_float32"}
