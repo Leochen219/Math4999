@@ -1383,7 +1383,8 @@ def _c_stage_analysis(stage_data: Mapping[str, Any], source: Mapping[str, Any], 
         source_name = ("v0_alpha_00_plus", "v0_alpha_00_minus", "v0_alpha_01_plus",
                        "v0_alpha_01_minus", "v0_alpha_02_plus", "v0_alpha_02_minus")[index]
         direction_record = b_records.get(f"B_{source_name}_step_0") if "b_records" in locals() else None
-        if direction_record is None or z1 is None or z2 is None:
+        direction_step1 = b_records.get(f"B_{source_name}_step_1") if "b_records" in locals() else None
+        if direction_record is None or direction_step1 is None or z1 is None or z2 is None:
             reasons.append(f"C direction source is missing: {direction_name}")
             continue
         try:
@@ -1427,7 +1428,10 @@ def _c_stage_analysis(stage_data: Mapping[str, Any], source: Mapping[str, Any], 
             beta1_plus = beta_records.get((0.1, 1)); beta1_minus = beta_records.get((0.1, -1))
             if beta1_plus is None or beta1_minus is None:
                 continue
-            actual_plus = fp32_difference(_array_from_record(beta1_plus, "encoded_condition"), z2)
+            # C beta=.1 is the prediction input, not the held-out truth.  The
+            # actual second-step response must come from the matching B
+            # trajectory's step-1 output relative to B baseline step 1.
+            actual_plus = fp32_difference(_array_from_record(direction_step1, "encoded_condition"), b_z2)
             prediction = fixed_beta_prediction(
                 actual_delta1=ray,
                 beta_plus_input=fp32_difference(_array_from_record(beta1_plus, "condition_input_fp32"), z1),

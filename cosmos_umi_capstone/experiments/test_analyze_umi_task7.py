@@ -560,5 +560,75 @@ class Task7SavedEvidenceBTests(unittest.TestCase):
         )
 
 
+class Task7SavedEvidenceCTests(unittest.TestCase):
+    """Synthetic C fixtures prove that held-out delta2 comes from B."""
+
+    _NAMES = ("v0_alpha_00_plus", "v0_alpha_00_minus", "v0_alpha_01_plus",
+              "v0_alpha_01_minus", "v0_alpha_02_plus", "v0_alpha_02_minus")
+
+    @staticmethod
+    def _record(condition, encoded, noise_hash="seed1"):
+        condition = np.asarray(condition, dtype=np.float32)
+        encoded = np.asarray(encoded, dtype=np.float32)
+        actual = {key: condition.copy() for key in (
+            "prepared_condition", "initial_condition", "reference_condition",
+            "first_condition", "last_condition")}
+        actual["condition_steps"] = np.stack([condition])
+        return {
+            "condition_input_fp32": condition,
+            "encoded_condition": encoded,
+            "next_condition_fp32": encoded.copy(),
+            "actual": actual,
+            "evidence": {"operation_counts": {"G": 1, "D": 1, "E": 1},
+                         "prediction_noise_hash": noise_hash},
+        }
+
+    @classmethod
+    def _fixture(cls):
+        z1 = np.array([0.0, 0.0], dtype=np.float32)
+        z2 = np.array([1.0, 1.0], dtype=np.float32)
+        ray = np.array([1.0, 0.0], dtype=np.float32)
+        b_delta2 = np.array([1.0, 0.0], dtype=np.float32)
+        mask = np.ones(2, dtype=bool)
+        b_records = {
+            "B_baseline_pre_step_0": {"encoded_condition": z1.copy()},
+            "B_baseline_pre_step_1": {"encoded_condition": z2.copy()},
+        }
+        c_records = {
+            "C_baseline_pre": cls._record(z1, z2),
+            "C_baseline_post": cls._record(z1, z2),
+        }
+        for name in cls._NAMES:
+            b_records[f"B_{name}_step_0"] = {"encoded_condition": ray.copy()}
+            b_records[f"B_{name}_step_1"] = {
+                "encoded_condition": (z2 + b_delta2).astype(np.float32)}
+            for beta in api.TASK7_BETAS:
+                for sign, label in ((1, "plus"), (-1, "minus")):
+                    signed_input = z1 + np.float32(sign * beta) * ray
+                    # C's beta=.1 response is ten times the held-out B delta2.
+                    signed_output = z2 + np.float32(sign * beta * 100.0) * ray
+                    sample_id = f"C_delta1_{cls._NAMES.index(name):02d}_beta_{beta:g}_{label}"
+                    c_records[sample_id] = cls._record(signed_input, signed_output)
+        binding = {"source": "fixture-source", "task7_code_sha256": "fixture-code",
+                   "config": {"stage": "C"}, "model": "fixture", "vae": "fixture",
+                   "framework": "fixture", "mask": "fixture-mask", "z0": "fixture-z0",
+                   "v0": "fixture-v0", "noise_policy": "fixed-seed-paired"}
+        stage = {"run_dir": Path("fixture-run"), "records": c_records,
+                 "config": {"binding": binding}, "status": {"binding": binding}}
+        source = {"rows": {"baseline_pre": {"mask": mask}}, "condition_mask": mask,
+                  "source_tree_sha256": "fixture-source", "mask_sha256": "fixture-mask",
+                  "z0_sha256": "fixture-z0", "v0_sha256": "fixture-v0"}
+        return stage, source, b_records, b_delta2
+
+    def test_c_held_out_delta2_uses_corresponding_b_step_one_not_c_beta_one(self):
+        stage, source, b_records, b_delta2 = self._fixture()
+        tensors = {}
+        with mock.patch.object(api, "load_task7_stage", return_value={"records": b_records}):
+            result = api._c_stage_analysis(stage, source, {}, tensors=tensors)
+        self.assertEqual(len(result["rows"]), 6)
+        np.testing.assert_array_equal(tensors["c_delta1_00_actual_delta2"], b_delta2)
+        np.testing.assert_array_equal(tensors["c_delta1_00_actual_delta2"], np.array([1.0, 0.0], np.float32))
+
+
 if __name__ == "__main__":
     unittest.main()
