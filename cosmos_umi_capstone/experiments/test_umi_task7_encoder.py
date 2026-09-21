@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -21,24 +22,29 @@ if torch is not None:
   @unittest.skipUnless(torch is not None, "real Torch CPU tests require the optional torch dependency")
   class Task7EncoderTests(unittest.TestCase):
     class Inner(torch.nn.Module):
-        def __init__(self, *, force_bf16=False, fail=False):
+        def __init__(self, *, force_bf16=False, fail=False, fail_value=False):
             super().__init__()
             self.weight = torch.nn.Parameter(torch.tensor(2.0, dtype=torch.bfloat16))
             self.register_buffer("floating_buffer", torch.tensor(3.0, dtype=torch.bfloat16))
             self.register_buffer("integer_buffer", torch.tensor(7, dtype=torch.int64))
             self.force_bf16 = force_bf16
             self.fail = fail
+            self.fail_value = fail_value
+            self.calls = 0
 
         def encode(self, value, scale):
+            self.calls += 1
             if self.fail:
                 self.cache = {"active": 1}
                 raise RuntimeError("encoder exploded")
+            if self.fail_value:
+                raise ValueError("encoder value failure")
             if self.force_bf16:
                 value = value.to(torch.bfloat16)
             self.seen_scale_dtype = scale[0].dtype
             return value * self.weight * self.floating_buffer * scale[1]
 
-    class VAE(torch.nn.Module):
+    class VAE:
         def __init__(self, inner):
             super().__init__()
             self.model = inner
@@ -47,10 +53,23 @@ if torch is not None:
             self.std = torch.tensor(2.0, dtype=torch.bfloat16)
             self.scale = (self.mean, torch.tensor(0.5, dtype=torch.bfloat16))
             self.integer_constant = torch.tensor(9, dtype=torch.int64)
-            self.cache = {"stale": 1}
+            self.cache = ["stale", None, None]
+            self.restore_failure = False
 
-        def reset_cache(self):
-            self.cache.clear()
+        @property
+        def training(self):
+            return self.model.training
+
+        def eval(self):
+            self.model.eval()
+            return self
+
+        def train(self, mode=True):
+            self.model.train(mode)
+            return self
+
+        def clear_decoder_cache(self):
+            self.cache[:] = [None, None, None]
             if hasattr(self.model, "cache"):
                 self.model.cache.clear()
 
@@ -69,13 +88,13 @@ if torch is not None:
 
         def reset_cache(self):
             self.cache.clear()
-            self.model.reset_cache()
+            self.model.clear_decoder_cache()
 
         def encode(self, value):
             return self.model.encode(value)
 
         def actual_identity(self):
-            return {"weights": [float(self.model.model.weight.float())]}
+            return {"weights": [self.model.model.weight.detach().float().item()]}
 
         def eval(self):
             self.model.eval()
@@ -93,6 +112,81 @@ if torch is not None:
 
     def _encoder(self, **kwargs):
         return self.Tokenizer(self.Inner(**kwargs))
+
+    def test_actual_style_cache_clear_preserves_none_slot_structure_on_success_and_failure(self):
+        tokenizer = self._encoder()
+        vae = tokenizer.model
+        vae.cache = ["stale", None, None]
+        result = FeedbackEncoder(tokenizer, device="cpu").encode(self.frame, precision="native")
+        self.assertTrue(result["evidence"]["cache_cleared_after"])
+        self.assertEqual(vae.cache, [None, None, None])
+
+        failing = self._encoder(fail=True)
+        failing.model.cache = ["stale", None, None]
+        with self.assertRaisesRegex(RuntimeError, "encoder exploded"):
+            FeedbackEncoder(failing, device="cpu").encode(self.frame, precision="native")
+        self.assertEqual(failing.model.cache, [None, None, None])
+
+    def test_encoder_value_error_is_not_retried(self):
+        tokenizer = self._encoder(fail_value=True)
+        with self.assertRaisesRegex(ValueError, "encoder value failure"):
+            FeedbackEncoder(tokenizer, device="cpu").encode(self.frame, precision="native")
+        self.assertEqual(tokenizer.model.model.calls, 1)
+
+    def test_fp32_restore_failure_still_cleans_hook_and_cache_and_does_not_publish(self):
+        tokenizer = self._encoder()
+        inner = tokenizer.model.model
+        original_encode = inner.encode.__func__
+        original_restore = __import__("umi_task7_encoder")._PrecisionSnapshot.restore
+        old_tf32 = (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32)
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+        def restore_then_fail(snapshot):
+            original_restore(snapshot)
+            raise RuntimeError("restore failed")
+
+        with mock.patch("umi_task7_encoder._PrecisionSnapshot.restore", restore_then_fail):
+            with self.assertRaisesRegex(RuntimeError, "restore failed"):
+                FeedbackEncoder(tokenizer, device="cpu").encode(self.frame, precision="temporary_fp32")
+        self.assertTrue(torch.backends.cuda.matmul.allow_tf32)
+        self.assertTrue(torch.backends.cudnn.allow_tf32)
+        torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = old_tf32
+        self.assertIs(inner.encode.__func__, original_encode)
+        self.assertEqual(tokenizer.cache, {})
+        self.assertEqual(tokenizer.model.cache, [None, None, None])
+
+    def test_fp32_fails_closed_when_dispatch_observer_is_unavailable(self):
+        tokenizer = self._encoder()
+        real_import = __import__("builtins").__import__
+
+        def missing_observer(name, *args, **kwargs):
+            if name == "torch.utils._python_dispatch":
+                raise ImportError("observer unavailable")
+            return real_import(name, *args, **kwargs)
+
+        with mock.patch("builtins.__import__", side_effect=missing_observer):
+            with self.assertRaisesRegex(EncoderPrecisionError, "dispatch observer"):
+                FeedbackEncoder(tokenizer, device="cpu").encode(self.frame, precision="temporary_fp32")
+
+    def test_fp32_evidence_records_per_call_state_dtypes(self):
+        tokenizer = self._encoder()
+        result = FeedbackEncoder(tokenizer, device="cpu").encode(self.frame, precision="temporary_fp32")
+        state = result["evidence"]["state_dtypes"]
+        self.assertTrue(state["parameters"])
+        self.assertTrue(state["buffers"])
+        self.assertTrue(state["constants"])
+        self.assertTrue(all(dtype == "float32" for dtype in state["parameters"].values()))
+        self.assertTrue(all(dtype == "float32" for dtype in state["buffers"].values()))
+        self.assertTrue(all(dtype == "float32" for dtype in state["constants"].values()))
+
+    def test_silent_precision_restore_noop_is_detected_before_publication(self):
+        tokenizer = self._encoder()
+        inner = tokenizer.model.model
+        with mock.patch("umi_task7_encoder._PrecisionSnapshot.restore", lambda snapshot: None):
+            with self.assertRaisesRegex(EncoderPrecisionError, "round-trip"):
+                FeedbackEncoder(tokenizer, device="cpu").encode(self.frame, precision="temporary_fp32")
+        self.assertEqual(tokenizer.cache, {})
 
     def test_native_path_preserves_native_inner_dtype_and_normalizes_rgb(self):
         tokenizer = self._encoder()
@@ -130,14 +224,14 @@ if torch is not None:
         self.assertTrue(tokenizer.training)
         self.assertIs(inner.encode.__func__, original_encode)
         self.assertEqual(tokenizer.cache, {})
-        self.assertEqual(tokenizer.model.cache, {})
+        self.assertEqual(tokenizer.model.cache, [None, None, None])
 
     def test_temporary_fp32_rejects_hidden_bfloat16_even_if_public_output_is_float32(self):
         tokenizer = self._encoder(force_bf16=True)
         with self.assertRaises(EncoderPrecisionError):
             FeedbackEncoder(tokenizer, device="cpu").encode(self.frame, precision="temporary_fp32")
         self.assertEqual(tokenizer.model.model.weight.dtype, torch.bfloat16)
-        self.assertEqual(tokenizer.model.cache, {})
+        self.assertEqual(tokenizer.model.cache, [None, None, None])
 
     def test_validation_rejects_integer_or_invalid_rgb_frames(self):
         api = FeedbackEncoder(self._encoder(), device="cpu")
@@ -162,7 +256,7 @@ if torch is not None:
         self.assertEqual(tokenizer.model.mean.dtype, torch.bfloat16)
         self.assertTrue(tokenizer.training)
         self.assertEqual(tokenizer.cache, {})
-        self.assertEqual(tokenizer.model.cache, {})
+        self.assertEqual(tokenizer.model.cache, [None, None, None])
 
     def test_context_manager_restores_state_and_two_calls_do_not_retain_payloads(self):
         tokenizer = self._encoder()

@@ -13,6 +13,7 @@ restored in ``finally`` blocks, including on encoder failure.
 from __future__ import annotations
 
 from contextlib import contextmanager
+import inspect
 from typing import Any, Iterator
 
 import numpy as np
@@ -45,6 +46,79 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     return repr(value)
+
+
+def _cache_has_values(value: Any) -> bool:
+    """Return whether a cache contains payloads, preserving None-slot lists."""
+    if value is None:
+        return False
+    if isinstance(value, dict):
+        return any(_cache_has_values(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_cache_has_values(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return bool(value)
+    if isinstance(value, np.ndarray):
+        return bool(value.size)
+    try:
+        return len(value) != 0
+    except TypeError:
+        return True
+
+
+def _tensor_signature(value: Any) -> dict[str, Any]:
+    detached = value.detach()
+    flat = detached.reshape(-1)
+    try:
+        storage = int(detached.untyped_storage().data_ptr())
+    except (AttributeError, RuntimeError):
+        storage = id(detached)
+    return {
+        "dtype": _dtype_name(detached),
+        "shape": tuple(int(item) for item in detached.shape),
+        "numel": int(detached.numel()),
+        "storage": storage,
+        "requires_grad": bool(getattr(detached, "requires_grad", False)),
+        "probe": flat[:16].clone(),
+    }
+
+
+def _value_signature(value: Any, torch: Any) -> Any:
+    if _torch_tensor(torch, value):
+        return ("tensor", _tensor_signature(value))
+    if isinstance(value, tuple):
+        return ("tuple", tuple(_value_signature(item, torch) for item in value))
+    if isinstance(value, list):
+        return ("list", tuple(_value_signature(item, torch) for item in value))
+    if isinstance(value, dict):
+        return ("dict", tuple(sorted((str(key), _value_signature(item, torch)) for key, item in value.items())))
+    return ("object", id(value))
+
+
+def _same_tensor_signature(value: Any, signature: dict[str, Any]) -> bool:
+    observed = _tensor_signature(value)
+    if any(observed[name] != signature[name] for name in ("dtype", "shape", "numel", "storage", "requires_grad")):
+        return False
+    probe = signature["probe"]
+    return bool(value.detach().reshape(-1)[: probe.numel()].equal(probe))
+
+
+def _same_value_signature(value: Any, signature: Any, torch: Any) -> bool:
+    if signature[0] == "tensor":
+        return _torch_tensor(torch, value) and _same_tensor_signature(value, signature[1])
+    if signature[0] == "tuple":
+        return isinstance(value, tuple) and len(value) == len(signature[1]) and all(
+            _same_value_signature(observed, expected, torch) for observed, expected in zip(value, signature[1]))
+    if signature[0] == "list":
+        return isinstance(value, list) and len(value) == len(signature[1]) and all(
+            _same_value_signature(observed, expected, torch) for observed, expected in zip(value, signature[1]))
+    if signature[0] == "dict":
+        if not isinstance(value, dict):
+            return False
+        expected = dict(signature[1])
+        return set(str(key) for key in value) == set(expected) and all(
+            _same_value_signature(value[key], expected[str(key)], torch) for key in value)
+    return id(value) == signature[1]
 
 
 def _dtype_name(value: Any) -> str | None:
@@ -89,6 +163,21 @@ def _iter_modules(value: Any) -> Iterator[Any]:
                         seen.add(id(module)); yield module
             except (TypeError, RuntimeError):
                 pass
+
+
+def _training_items(modules: list[Any]) -> list[tuple[Any, bool]]:
+    result: list[tuple[Any, bool]] = []
+    for module in modules:
+        if not hasattr(module, "training"):
+            continue
+        descriptor = inspect.getattr_static(type(module), "training", _MISSING)
+        if isinstance(descriptor, property) and descriptor.fset is None:
+            continue
+        try:
+            result.append((module, bool(getattr(module, "training"))))
+        except (AttributeError, TypeError):
+            continue
+    return result
 
 
 def _torch_tensor(torch: Any, value: Any) -> bool:
@@ -219,8 +308,20 @@ class _PrecisionSnapshot:
             for name in ("dtype",) + _CONSTANT_NAMES:
                 if hasattr(owner, name):
                     self.attributes.append((owner, name, getattr(owner, name)))
-        self.training = [(module, bool(getattr(module, "training")))
-                         for module in self.modules if hasattr(module, "training")]
+        self.training = _training_items(self.modules)
+        self.tensor_signatures = [
+            (module, collection_name, name, _tensor_signature(data))
+            for module, collection_name, name, _tensor, data in self.tensors
+        ]
+        self.original_slots = {
+            (id(module), collection_name, name): tensor
+            for module, collection_name, name, tensor, _data in self.tensors
+        }
+        self.attribute_signatures = [
+            (owner, name, _value_signature(value, torch))
+            for owner, name, value in self.attributes
+        ]
+        self.original_attributes = {(id(owner), name): value for owner, name, value in self.attributes}
 
     def convert(self) -> None:
         # Calling ``to`` on the VAE wrapper is important: it reaches floating
@@ -243,18 +344,50 @@ class _PrecisionSnapshot:
                 raise EncoderPrecisionError("FP32 request left a floating parameter or buffer in non-FP32 dtype")
 
     def restore(self) -> None:
+        errors: list[BaseException] = []
         for module, collection_name, name, tensor, data in self.tensors:
-            collection = getattr(module, collection_name, None)
-            if isinstance(collection, dict) and collection.get(name) is not tensor:
-                collection[name] = tensor
             try:
+                collection = getattr(module, collection_name, None)
+                if isinstance(collection, dict) and collection.get(name) is not tensor:
+                    collection[name] = tensor
                 tensor.data = data
-            except (AttributeError, RuntimeError):
-                pass
+            except BaseException as error:
+                errors.append(error)
         for owner, name, value in self.attributes:
-            setattr(owner, name, value)
+            try:
+                setattr(owner, name, value)
+            except BaseException as error:
+                errors.append(error)
         for module, training in self.training:
-            module.training = training
+            try:
+                module.training = training
+            except BaseException as error:
+                errors.append(error)
+        if errors:
+            failure = RuntimeError("encoder state restoration failed")
+            for error in errors:
+                failure.add_note(repr(error))
+            raise failure from errors[0]
+
+    def verify_restored(self) -> None:
+        """Fail closed if restore did not return the original state/slots."""
+        errors: list[str] = []
+        for module, collection_name, name, signature in self.tensor_signatures:
+            collection = getattr(module, collection_name, None)
+            current = collection.get(name) if isinstance(collection, dict) else None
+            original = self.original_slots.get((id(module), collection_name, name))
+            if current is not original or current is None or not _same_tensor_signature(current.data, signature):
+                errors.append(f"tensor slot {collection_name}.{name} did not round-trip")
+        for owner, name, signature in self.attribute_signatures:
+            current = getattr(owner, name, _MISSING)
+            original = self.original_attributes.get((id(owner), name), _MISSING)
+            if current is _MISSING or current is not original or not _same_value_signature(current, signature, self.torch):
+                errors.append(f"attribute {name} did not round-trip")
+        for module, training in self.training:
+            if getattr(module, "training", _MISSING) is not training:
+                errors.append("training metadata did not round-trip")
+        if errors:
+            raise EncoderPrecisionError("encoder round-trip verification failed: " + "; ".join(errors))
 
 
 @contextmanager
@@ -276,32 +409,39 @@ def temporary_encoder_precision(encoder: Any, *, precision: str = "temporary_fp3
         primary_error = error
         raise
     finally:
+        cleanup_errors: list[BaseException] = []
         try:
             snapshot.restore()
-        except BaseException as restore_error:
+        except BaseException as error:
+            cleanup_errors.append(error)
+        try:
+            snapshot.verify_restored()
+        except BaseException as error:
+            cleanup_errors.append(error)
+        if cleanup_errors:
             if primary_error is not None:
-                primary_error.add_note("encoder precision restoration failed: " + repr(restore_error))
+                for error in cleanup_errors:
+                    primary_error.add_note("encoder precision cleanup failed: " + repr(error))
             else:
-                raise
+                raise cleanup_errors[0]
 
 
 def _clear_cache(encoder: Any) -> None:
     for owner in _owners(encoder):
-        for name in ("reset_cache", "clear_cache"):
+        for name in ("clear_decoder_cache", "reset_cache", "clear_cache"):
             method = getattr(owner, name, None)
             if callable(method):
                 method()
                 break
         for name in _CACHE_NAMES:
             value = getattr(owner, name, None)
-            if hasattr(value, "clear"):
+            # Wan's decoder cache is a fixed-length list of None slots after
+            # clear_decoder_cache(); calling list.clear() would destroy its
+            # required structure.  Only clear mutable map/set caches here.
+            if isinstance(value, (dict, set)):
                 value.clear()
-            if value is not None and hasattr(value, "__len__"):
-                try:
-                    if len(value) != 0:
-                        raise RuntimeError("encoder cache did not clear")
-                except TypeError:
-                    pass
+            if _cache_has_values(value):
+                raise RuntimeError("encoder cache did not clear")
 
 
 def _autocast_state(torch: Any, device: str) -> bool | None:
@@ -371,14 +511,58 @@ def _backend_guard(torch: Any, evidence: dict[str, Any]) -> Iterator[None]:
                 raise restore_errors[0]
 
 
+def _state_dtype_evidence(encoder: Any, torch: Any) -> dict[str, dict[str, str]]:
+    """Observe floating weights, buffers, and normalization constants per call."""
+    state: dict[str, dict[str, str]] = {"parameters": {}, "buffers": {}, "constants": {}}
+    used: set[str] = set()
+
+    def put(bucket: str, name: str, value: Any) -> None:
+        if not _torch_tensor(torch, value) or not getattr(value, "is_floating_point", lambda: False)():
+            return
+        key = name
+        suffix = 1
+        while key in used:
+            suffix += 1
+            key = f"{name}#{suffix}"
+        used.add(key); state[bucket][key] = _dtype_name(value) or "unknown"
+
+    def constants(name: str, value: Any) -> None:
+        if _torch_tensor(torch, value):
+            put("constants", name, value)
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                constants(f"{name}.{key}", item)
+        elif isinstance(value, (tuple, list)):
+            for index, item in enumerate(value):
+                constants(f"{name}[{index}]", item)
+
+    for index, module in enumerate(_iter_modules(encoder)):
+        prefix = f"module{index}:{type(module).__module__}.{type(module).__qualname__}"
+        for collection_name, bucket in (("_parameters", "parameters"), ("_buffers", "buffers")):
+            collection = getattr(module, collection_name, None)
+            if isinstance(collection, dict):
+                for name, value in collection.items():
+                    put(bucket, f"{prefix}.{name}", value)
+    for index, owner in enumerate(_owners(encoder)):
+        for name in _CONSTANT_NAMES:
+            if hasattr(owner, name):
+                constants(f"owner{index}.{name}", getattr(owner, name))
+    return state
+
+
 @contextmanager
 def _dispatch_observer(torch: Any, *, precision: str, evidence: dict[str, Any]) -> Iterator[None]:
     try:
         from torch.utils._python_dispatch import TorchDispatchMode
         from torch.utils._pytree import tree_flatten
-    except ImportError:  # pragma: no cover - old torch builds
+    except ImportError as error:  # pragma: no cover - old torch builds
+        evidence["dispatch_observed"] = False
+        if precision == "temporary_fp32":
+            raise EncoderPrecisionError("FP32 encoder dispatch observer unavailable") from error
         yield
         return
+
+    evidence["dispatch_observed"] = True
 
     class Observe(TorchDispatchMode):
         def __torch_dispatch__(self, func, types, args=(), kwargs=None):
@@ -413,13 +597,21 @@ def _call_encoder(encoder: Any, value: Any) -> Any:
         method = encoder if callable(encoder) else None
     if method is None:
         raise ValueError("encoder must expose encode, encode_image, or __call__")
+    # Bind before execution so a keyword-only device parameter can be
+    # supported without retrying an inference that already raised.
     try:
+        signature = inspect.signature(method)
+    except (TypeError, ValueError):
         return method(value)
-    except (TypeError, ValueError) as first:
+    try:
+        signature.bind(value)
+    except TypeError as first:
         try:
-            return method(value, device=getattr(value, "device", None))
+            signature.bind(value, device=getattr(value, "device", None))
         except TypeError:
             raise first
+        return method(value, device=getattr(value, "device", None))
+    return method(value)
 
 
 class FeedbackEncoder:
@@ -463,8 +655,7 @@ class FeedbackEncoder:
             "encoder_input": normalized.copy(),
         }
         snapshot = _PrecisionSnapshot(self.encoder, torch) if precision == "temporary_fp32" else None
-        old_training = [(module, bool(getattr(module, "training")))
-                        for module in _iter_modules(self.encoder) if hasattr(module, "training")]
+        old_training = _training_items(list(_iter_modules(self.encoder)))
         original_inner_encode = getattr(inner, "encode", _MISSING)
         had_instance_encode = hasattr(getattr(inner, "__dict__", {}), "get") and "encode" in inner.__dict__
         primary_error: BaseException | None = None
@@ -493,11 +684,21 @@ class FeedbackEncoder:
                     eval_method()
             if snapshot is not None:
                 snapshot.convert()
+            evidence["state_dtypes"] = _state_dtype_evidence(self.encoder, torch)
+            if precision == "temporary_fp32":
+                floating_state = [dtype for bucket in evidence["state_dtypes"].values()
+                                  for dtype in bucket.values()]
+                if not floating_state or any(dtype != "float32" for dtype in floating_state):
+                    raise EncoderPrecisionError("FP32 encoder state evidence is incomplete or non-FP32")
             if callable(original_inner_encode):
                 setattr(inner, "encode", observed_inner_encode)
             with _backend_guard(torch, evidence), _dispatch_observer(torch, precision=precision, evidence=evidence):
                 with torch.inference_mode():
                     encoded = _call_encoder(wrapper, torch.from_numpy(normalized.copy()).to(device=self.device, dtype=torch.float32))
+            if precision == "temporary_fp32" and (
+                not evidence.get("dispatch_observed") or evidence.get("operation_count", 0) <= 0
+            ):
+                raise EncoderPrecisionError("FP32 encoder dispatch observer produced no operation evidence")
             public = _first_tensor(encoded, torch)
             evidence["output_dtype"] = _dtype_name(public)
             arrays["scaled_latent"] = captured.get("inner_output", _array_copy(public, torch)).copy()
@@ -528,31 +729,43 @@ class FeedbackEncoder:
             primary_error = error
             raise
         finally:
+            cleanup_errors: list[BaseException] = []
             if callable(original_inner_encode):
                 try:
                     if had_instance_encode:
                         setattr(inner, "encode", original_inner_encode)
                     elif "encode" in getattr(inner, "__dict__", {}):
                         delattr(inner, "encode")
-                except BaseException:
-                    if primary_error is None:
-                        raise
+                except BaseException as error:
+                    cleanup_errors.append(error)
             if snapshot is not None:
                 try:
                     snapshot.restore()
                 except BaseException as error:
-                    if primary_error is None:
-                        raise
-                    primary_error.add_note("encoder precision restoration failed: " + repr(error))
+                    cleanup_errors.append(error)
+                try:
+                    snapshot.verify_restored()
+                except BaseException as error:
+                    cleanup_errors.append(error)
             for module, training in old_training:
-                module.training = training
+                try:
+                    module.training = training
+                except BaseException as error:
+                    cleanup_errors.append(error)
             try:
                 _clear_cache(self.encoder)
                 evidence["cache_cleared_after"] = True
             except BaseException as error:
-                if primary_error is None:
-                    raise
-                primary_error.add_note("encoder cache cleanup failed: " + repr(error))
+                cleanup_errors.append(error)
+            if cleanup_errors:
+                if primary_error is not None:
+                    for error in cleanup_errors:
+                        primary_error.add_note("encoder cleanup failed: " + repr(error))
+                else:
+                    failure = cleanup_errors[0]
+                    for error in cleanup_errors[1:]:
+                        failure.add_note("encoder cleanup failed: " + repr(error))
+                    raise failure
 
     __call__ = encode
 
