@@ -1,0 +1,50 @@
+{
+  "smoke": {
+    "gpu_samples.csv_rows": 69,
+    "max_gpu_used_gib": 31.5264892578125,
+    "max_gpu_peak_allocated_gib": 29.212514400482178,
+    "max_gpu_peak_reserved_gib": 30.2109375,
+    "ram_samples.csv_rows": 15,
+    "max_rss_gib": 3.775634765625,
+    "min_cgroup_memory_free_gib": 91.6700325012207,
+    "max_swap_used_gib": 0,
+    "disk_samples.csv_rows": 15,
+    "min_disk_free_gib": 11.954521179199219
+  },
+  "a": {
+    "gpu_samples.csv_rows": 98,
+    "max_gpu_used_gib": 11.7100830078125,
+    "max_gpu_peak_allocated_gib": 10.352314949035645,
+    "max_gpu_peak_reserved_gib": 10.443359375,
+    "ram_samples.csv_rows": 21,
+    "max_rss_gib": 3.753936767578125,
+    "min_cgroup_memory_free_gib": 91.59529876708984,
+    "max_swap_used_gib": 0,
+    "disk_samples.csv_rows": 21,
+    "min_disk_free_gib": 11.84814453125
+  },
+  "b": {
+    "gpu_samples.csv_rows": 248,
+    "max_gpu_used_gib": 31.5264892578125,
+    "max_gpu_peak_allocated_gib": 29.212514400482178,
+    "max_gpu_peak_reserved_gib": 30.2109375,
+    "ram_samples.csv_rows": 51,
+    "max_rss_gib": 3.7747344970703125,
+    "min_cgroup_memory_free_gib": 91.56343460083008,
+    "max_swap_used_gib": 0,
+    "disk_samples.csv_rows": 51,
+    "min_disk_free_gib": 10.9769287109375
+  },
+  "c": {
+    "gpu_samples.csv_rows": 568,
+    "max_gpu_used_gib": 31.5264892578125,
+    "max_gpu_peak_allocated_gib": 29.212514400482178,
+    "max_gpu_peak_reserved_gib": 30.2109375,
+    "ram_samples.csv_rows": 115,
+    "max_rss_gib": 3.75146484375,
+    "min_cgroup_memory_free_gib": 89.82431030273438,
+    "max_swap_used_gib": 0,
+    "disk_samples.csv_rows": 115,
+    "min_disk_free_gib": 8.72018814086914
+  }
+}

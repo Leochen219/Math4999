@@ -1,0 +1,14 @@
+{
+  "a_run_status_sha256": "40030ca387fe689457ba5b87d71fd799dc5d45b0b2fa08c90a53ae99746b46db",
+  "a_samples_manifest_sha256": "9f7d2b391c0838d6e4c8fe79420321f65685019e21b3fa42be45744bbb168767",
+  "a_scientific_pass": true,
+  "analysis_code_sha256": "12db24efebed2f0858b69448c370d7d73757c73fa2a03fc12cfdcfe11bb306fc",
+  "analysis_version": "task7-offline-evidence-v1",
+  "b_engineering_pass": true,
+  "b_repeatability_pass": true,
+  "b_run_status_sha256": "ccb75a5d46301eacf0fcec35ac603608ef69744fbb7bb4e252d17914f6adecff",
+  "b_samples_manifest_sha256": "9aafd588c42c3f0189711392c7bf94d4d63e24915af54ae410800153a152fcfb",
+  "code_sha256": "b679e3569da033339a57e082ef12dc27a8e05720c0cea73ec9f4753ba89e7648",
+  "schema_version": "umi-task7-analysis-gate-v1",
+  "source_sha256": "aad298ac85adf2e6ffae36a7eff5ab6465f997f032301439afa189d6c2a90ec8"
+}

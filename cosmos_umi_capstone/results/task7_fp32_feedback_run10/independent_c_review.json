@@ -1,0 +1,314 @@
+{
+  "C_completed": 38,
+  "C_failed": 0,
+  "C_floor": 0,
+  "all_precision_noise_condition_checks": true,
+  "evaluation_truth": "paired B step1 output minus B baseline step1 output (beta=1)",
+  "estimator_beta": 0.1,
+  "rows": [
+    {
+      "direction": "delta1_00",
+      "B_trajectory": "v0_alpha_00_plus",
+      "local_window": "PASS",
+      "status": "PASS",
+      "Eprop": 0.03325861512840712,
+      "manual_Eprop": 0.033258612896523626,
+      "reasons": [],
+      "window": {
+        "status": "PASS",
+        "candidate_status": "PASS",
+        "reliable": true,
+        "reasons": [],
+        "failure_reasons": "",
+        "point_count": 3,
+        "window_alphas": [
+          0.1,
+          0.2,
+          0.4
+        ],
+        "floor": 0,
+        "secants": [
+          {
+            "from_alpha": 0.1,
+            "to_alpha": 0.2,
+            "cosine": 0.9994614194725336,
+            "relative_change": 0.03291782492952269,
+            "denominator": 1.1274968707781592
+          },
+          {
+            "from_alpha": 0.2,
+            "to_alpha": 0.4,
+            "cosine": 0.9998544067414027,
+            "relative_change": 0.01708718268114101,
+            "denominator": 1.1298107346635768
+          }
+        ],
+        "plus_fit": {
+          "slope": 1.0005061076017523,
+          "intercept": 0.1247667335868492,
+          "r2": 0.9999956434549497
+        },
+        "minus_fit": {
+          "slope": 0.9993063991459153,
+          "intercept": 0.11675006124383103,
+          "r2": 0.9999999984920668
+        },
+        "additivity_status": "NOT_TESTED"
+      }
+    },
+    {
+      "direction": "delta1_01",
+      "B_trajectory": "v0_alpha_00_minus",
+      "local_window": "PASS",
+      "status": "PASS",
+      "Eprop": 0.03504649273076276,
+      "manual_Eprop": 0.03504649285060068,
+      "reasons": [],
+      "window": {
+        "status": "PASS",
+        "candidate_status": "PASS",
+        "reliable": true,
+        "reasons": [],
+        "failure_reasons": "",
+        "point_count": 3,
+        "window_alphas": [
+          0.1,
+          0.2,
+          0.4
+        ],
+        "floor": 0,
+        "secants": [
+          {
+            "from_alpha": 0.1,
+            "to_alpha": 0.2,
+            "cosine": 0.9994591549234946,
+            "relative_change": 0.032940540606034095,
+            "denominator": 1.1218420016172626
+          },
+          {
+            "from_alpha": 0.2,
+            "to_alpha": 0.4,
+            "cosine": 0.9998496275897072,
+            "relative_change": 0.017346281780263432,
+            "denominator": 1.1233877857275512
+          }
+        ],
+        "plus_fit": {
+          "slope": 0.9988957712418751,
+          "intercept": 0.10805732709929572,
+          "r2": 0.9999999736730507
+        },
+        "minus_fit": {
+          "slope": 1.0006305162612064,
+          "intercept": 0.1202602570535305,
+          "r2": 0.9999984246997807
+        },
+        "additivity_status": "NOT_TESTED"
+      }
+    },
+    {
+      "direction": "delta1_02",
+      "B_trajectory": "v0_alpha_01_plus",
+      "local_window": "PASS",
+      "status": "PASS",
+      "Eprop": 0.038356508383604285,
+      "manual_Eprop": 0.03835651220742651,
+      "reasons": [],
+      "window": {
+        "status": "PASS",
+        "candidate_status": "PASS",
+        "reliable": true,
+        "reasons": [],
+        "failure_reasons": "",
+        "point_count": 3,
+        "window_alphas": [
+          0.1,
+          0.2,
+          0.4
+        ],
+        "floor": 0,
+        "secants": [
+          {
+            "from_alpha": 0.1,
+            "to_alpha": 0.2,
+            "cosine": 0.9999115553751325,
+            "relative_change": 0.013309306518423587,
+            "denominator": 1.1342350294321542
+          },
+          {
+            "from_alpha": 0.2,
+            "to_alpha": 0.4,
+            "cosine": 0.9999783805235024,
+            "relative_change": 0.006607919867072588,
+            "denominator": 1.1335605914386855
+          }
+        ],
+        "plus_fit": {
+          "slope": 0.9984269202236442,
+          "intercept": 0.11113923600940367,
+          "r2": 0.9999999996665399
+        },
+        "minus_fit": {
+          "slope": 1.0015462193597593,
+          "intercept": 0.1404518830737027,
+          "r2": 0.9999986206794127
+        },
+        "additivity_status": "NOT_TESTED"
+      }
+    },
+    {
+      "direction": "delta1_03",
+      "B_trajectory": "v0_alpha_01_minus",
+      "local_window": "PASS",
+      "status": "PASS",
+      "Eprop": 0.04216283529731301,
+      "manual_Eprop": 0.04216283068074236,
+      "reasons": [],
+      "window": {
+        "status": "PASS",
+        "candidate_status": "PASS",
+        "reliable": true,
+        "reasons": [],
+        "failure_reasons": "",
+        "point_count": 3,
+        "window_alphas": [
+          0.1,
+          0.2,
+          0.4
+        ],
+        "floor": 0,
+        "secants": [
+          {
+            "from_alpha": 0.1,
+            "to_alpha": 0.2,
+            "cosine": 0.9999181188941508,
+            "relative_change": 0.012796832780600984,
+            "denominator": 1.1165884606925178
+          },
+          {
+            "from_alpha": 0.2,
+            "to_alpha": 0.4,
+            "cosine": 0.9999784681408644,
+            "relative_change": 0.006567160184562466,
+            "denominator": 1.1165623518538572
+          }
+        ],
+        "plus_fit": {
+          "slope": 1.0017229453028627,
+          "intercept": 0.12594442267833816,
+          "r2": 0.9999996483746554
+        },
+        "minus_fit": {
+          "slope": 0.998487400049145,
+          "intercept": 0.09665165904556439,
+          "r2": 0.9999999402688591
+        },
+        "additivity_status": "NOT_TESTED"
+      }
+    },
+    {
+      "direction": "delta1_04",
+      "B_trajectory": "v0_alpha_02_plus",
+      "local_window": "PASS",
+      "status": "FAIL",
+      "Eprop": 0.1065987310424795,
+      "manual_Eprop": 0.1065987320514556,
+      "reasons": [
+        "Eprop above 0.10"
+      ],
+      "window": {
+        "status": "PASS",
+        "candidate_status": "PASS",
+        "reliable": true,
+        "reasons": [],
+        "failure_reasons": "",
+        "point_count": 3,
+        "window_alphas": [
+          0.1,
+          0.2,
+          0.4
+        ],
+        "floor": 0,
+        "secants": [
+          {
+            "from_alpha": 0.1,
+            "to_alpha": 0.2,
+            "cosine": 0.9999900496429673,
+            "relative_change": 0.004488809284496088,
+            "denominator": 1.1514708438802363
+          },
+          {
+            "from_alpha": 0.2,
+            "to_alpha": 0.4,
+            "cosine": 0.999970754148408,
+            "relative_change": 0.007688869524389023,
+            "denominator": 1.1520337311094904
+          }
+        ],
+        "plus_fit": {
+          "slope": 0.9952026502416818,
+          "intercept": 0.10242768127899193,
+          "r2": 0.9999997658782724
+        },
+        "minus_fit": {
+          "slope": 1.008222298521594,
+          "intercept": 0.20486416494340975,
+          "r2": 0.9999984827861371
+        },
+        "additivity_status": "NOT_TESTED"
+      }
+    },
+    {
+      "direction": "delta1_05",
+      "B_trajectory": "v0_alpha_02_minus",
+      "local_window": "PASS",
+      "status": "FAIL",
+      "Eprop": 0.11740912678210816,
+      "manual_Eprop": 0.11740912884871264,
+      "reasons": [
+        "Eprop above 0.10"
+      ],
+      "window": {
+        "status": "PASS",
+        "candidate_status": "PASS",
+        "reliable": true,
+        "reasons": [],
+        "failure_reasons": "",
+        "point_count": 3,
+        "window_alphas": [
+          0.1,
+          0.2,
+          0.4
+        ],
+        "floor": 0,
+        "secants": [
+          {
+            "from_alpha": 0.1,
+            "to_alpha": 0.2,
+            "cosine": 0.9999904719395488,
+            "relative_change": 0.004377026548424441,
+            "denominator": 1.0995476038660945
+          },
+          {
+            "from_alpha": 0.2,
+            "to_alpha": 0.4,
+            "cosine": 0.9999808500681667,
+            "relative_change": 0.006189670340024807,
+            "denominator": 1.09988886446782
+          }
+        ],
+        "plus_fit": {
+          "slope": 1.0046099266877961,
+          "intercept": 0.13074389470787384,
+          "r2": 0.9999995198260646
+        },
+        "minus_fit": {
+          "slope": 0.9972756401361186,
+          "intercept": 0.07302882866618976,
+          "r2": 0.9999998116322312
+        },
+        "additivity_status": "NOT_TESTED"
+      }
+    }
+  ]
+}
