@@ -19,3 +19,7 @@ Review roles: explicit user requests main as independent reviewer; main performs
 Task1 implementer /root/luna_task7_encoder (Luna xhigh). Main authorized ONLY small-code CPU-test upload to fresh task7-cpu-check directory with CUDA_VISIBLE_DEVICES empty, no model loading. GPU experiments not released.
 Preliminary review while tests developed: guard torch=None class definitions; repair invalid test RGB >1 and missing fixture train state; snapshot actual parameter/buffer collection slots because Module.to replaces buffers; inspect converted slot not old reference; control cuda.matmul.allow_tf32; never silently swallow restore failures. Implementer notified; final review pending.
 Read-only environment: CUDA torch2.10.0+cu130, GPUused0, cgroup110GiB, disk12.1GiB. Data source8 frames and raw hash confirmed. docs/task7-source-review.md and task7-mathematical-interpretation.md completed by main; docs/task7-task2-brief.md prepared but not dispatched.
+
+Task 1: fix round 1/5 (4 addressed, 0 open; code commits 35064b3..b55c6ce). Main scoped review docs/task7-task1-review.md; local/remote hashes equal and 12 Torch CPU tests PASS. No model/GPU calls.
+Task 1: complete (commits 439e845..b55c6ce, encoder-seam review clean). Real native parity/FP32 compute remain live stage gates, not certified by fixtures.
+Task 2: released for code implementation only. Task3 brief ready; no live stage release.
