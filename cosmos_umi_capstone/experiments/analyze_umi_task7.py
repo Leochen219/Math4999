@@ -1079,10 +1079,18 @@ def _validate_encoder_evidence(record: Mapping[str, Any], source_row: Mapping[st
         if not isinstance(value, np.ndarray):
             reasons.append(f"A {name} arrays.{key} is missing")
     state = evidence.get("state_dtypes")
-    if not isinstance(state, Mapping) or any(not isinstance(state.get(bucket), Mapping) or not state[bucket]
-                                             for bucket in ("parameters", "buffers", "constants")):
+    # The runner records the three state categories independently.  A real
+    # encoder may have no registered floating buffers, so an empty ``buffers``
+    # mapping is valid; the schema and the parameter/constant evidence must
+    # still be present.  FP32 checks below validate every observed value.
+    if not isinstance(state, Mapping) or any(
+        bucket not in state or not isinstance(state.get(bucket), Mapping)
+        for bucket in ("parameters", "buffers", "constants")
+    ):
         reasons.append(f"A {name} state_dtypes is incomplete")
     else:
+        if not state["parameters"] or not state["constants"]:
+            reasons.append(f"A {name} state_dtypes parameters/constants evidence is incomplete")
         for bucket in ("parameters", "buffers", "constants"):
             if any(not isinstance(dtype, str) for dtype in state[bucket].values()):
                 reasons.append(f"A {name} state_dtypes contains an invalid dtype")

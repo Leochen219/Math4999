@@ -338,7 +338,7 @@ class Task7SavedEvidenceAOnlyTests(unittest.TestCase):
 
     @staticmethod
     def _write_a_stage(run: Path, source, *, native_parity=True, native_science_fail=False,
-                       bad_fp32_evidence=False):
+                       bad_fp32_evidence=False, empty_buffers=False):
         stage = run / "stages" / "A"; store = runner.Task7SampleStore(stage / "samples")
         plan = runner.build_stage_plan("A")
         baseline = np.array([1.0, -1.0], dtype=np.float32)
@@ -366,7 +366,9 @@ class Task7SavedEvidenceAOnlyTests(unittest.TestCase):
                 "encoder_input_shape": list(encoder_input.shape), "encoder_input_dtype": "float32",
                 "operation_count": 1, "operation_dtypes": {"float32": 1}, "encoder_identity": {"fixture": True},
                 "output_dtype": "float32", "inner_input_dtype": "float32", "inner_output_dtype": "float32",
-                "state_dtypes": {"parameters": {"p": "float32"}, "buffers": {"b": "float32"}, "constants": {"c": "float32"}},
+                "state_dtypes": {"parameters": {"p": "float32"},
+                                  "buffers": {} if empty_buffers else {"b": "float32"},
+                                  "constants": {"c": "float32"}},
                 "actual_encoder_input_dtype": "float32", "scaled_latent_dtype": "float32", "actual_output_dtype": "float32",
                 "dispatch_observed": True, "autocast_disabled": True, "tf32_disabled": True,
                 "cache_cleared_before": True, "cache_cleared_after": True,
@@ -433,6 +435,16 @@ class Task7SavedEvidenceAOnlyTests(unittest.TestCase):
                                                output_dir=Path(temp) / "analysis")
             self.assertFalse(result["A"]["a_engineering_pass"])
             self.assertTrue(any("operation_dtypes" in reason for reason in result["A"]["engineering_reasons"]))
+
+    def test_empty_registered_buffer_bucket_is_valid_with_schema_and_state_evidence(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "run"; root.mkdir(); source = self._source_fixture()
+            self._write_a_stage(root, source, empty_buffers=True)
+            with mock.patch.object(api, "_load_source_evidence", return_value=source):
+                result = api.analyze_task7_run(root, stage="A", raw_root="raw", decoder_root="decoder",
+                                               output_dir=Path(temp) / "analysis")
+            self.assertTrue(result["A"]["a_engineering_pass"])
+            self.assertTrue(result["A"]["a_scientific_pass"])
 
     def test_foreign_stage_binding_fails_before_a_science(self):
         with tempfile.TemporaryDirectory() as temp:
