@@ -1341,15 +1341,23 @@ def make_stage_executor(stage: str, *, source: Mapping[str, Any], feedback: Any,
     trajectories: dict[str, np.ndarray] = {}
     trajectory_noise: dict[int, str] = {}
     b_store = None
+    b_store_root: Path | None = None
     if stage == "B" and run_dir is not None:
         candidate = Path(run_dir) / "stages" / "B" / "samples"
         if not candidate.is_dir() and (Path(run_dir) / "samples").is_dir():
             candidate = Path(run_dir) / "samples"
-        b_store = Task7SampleStore(candidate)
+        # Stage setup owns creation of the sample store.  The executor only
+        # needs a store when a resumed step 1 must reload a verified step 0;
+        # constructing Task7SampleStore eagerly would create ``samples`` and
+        # trip run_stage's strict non-empty-directory guard on a fresh run.
+        b_store_root = candidate
     c_state: dict[str, Any] = {}
 
     def _verified_prior_condition(trajectory: str) -> np.ndarray:
+        nonlocal b_store
         condition = trajectories.get(trajectory)
+        if condition is None and b_store is None and b_store_root is not None and b_store_root.is_dir():
+            b_store = Task7SampleStore(b_store_root)
         if condition is None and b_store is not None:
             prior = b_store.load_record(f"B_{trajectory}_step_0").get("record", {})
             condition = prior.get("encoded_condition")

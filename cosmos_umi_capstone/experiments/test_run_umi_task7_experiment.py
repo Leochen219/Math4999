@@ -930,6 +930,50 @@ class Task7RunnerTests(unittest.TestCase):
                 resumed(spec1)
             np.testing.assert_array_equal(feedback.seen[-1], condition1)
 
+    def test_b_make_executor_then_run_stage_does_not_precreate_stage_store(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source_root = root / "source"; source_root.mkdir()
+            condition = np.zeros((1, 1, 1, 1, 2), dtype=np.float32)
+            full = np.zeros((1, 1, 3, 1, 2), dtype=np.float32)
+            np.save(source_root / "output_full.npy", full)
+            mask = np.zeros_like(full, dtype=bool); mask[:, :, 0, :, :] = True
+            source = {"raw_root": str(source_root), "decoder_root": str(source_root)}
+
+            class Feedback:
+                def __init__(self): self.mask = mask
+                def extract_condition(self, value): return np.asarray(value)[:, :, :1, :, :].copy()
+                def embed_condition(self, value):
+                    carrier = np.zeros_like(full)
+                    carrier[:, :, :1, :, :] = np.asarray(value)
+                    return carrier
+                def step(self, value, step):
+                    value = np.asarray(value).copy()
+                    encoded = value.copy()
+                    carrier = self.embed_condition(value)
+                    return {"full_latent": full.copy(), "predicted_latent": full.copy(),
+                            "encoded_condition": encoded,
+                            "next_condition_fp32": encoded.copy(), "condition_input_fp32": value,
+                            "actual": {key: carrier.copy() for key in
+                                       ("prepared_condition", "initial_condition", "reference_condition",
+                                        "first_condition", "last_condition")}
+                                      | {"condition_steps": np.repeat(carrier[None], 30, axis=0)},
+                            "evidence": {"operation_counts": {"G": 1, "D": 1, "E": 1},
+                                         "prediction_noise_hash": f"noise-{step}"}}
+
+            with mock.patch.object(runner, "_source_condition",
+                                   return_value=(condition.copy(), condition.copy())), \
+                 mock.patch.object(runner, "_source_sample_root", return_value=source_root):
+                executor = runner.make_stage_executor("B", source=source, feedback=Feedback(), run_dir=root)
+                self.assertFalse(root.joinpath("stages", "B", "samples").exists())
+                result = runner.run_stage("B", root / "stages" / "B", execute=executor,
+                                          binding=runner.test_binding("B"),
+                                          monitor=runner.StaticMonitor(_safe_snapshot()))
+
+            self.assertEqual(result["status"], "COMPLETE")
+            self.assertEqual(result["completed_count"], 16)
+            self.assertEqual(result["observed_counts"], {"G": 16, "D": 16, "E": 16})
+
     def test_c_source_uses_b_step0_condition_and_b_step1_baseline(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp); samples = root / "stages" / "B" / "samples"
