@@ -619,6 +619,81 @@ class Task7SampleStore:
                 stage.rename(self.root / f"{sample_id}.failed-attempt.{index:03d}")
             raise
 
+    def stage_success(self, sample_id: str, payload: Any, *, operation_counts: Mapping[str, Any] | None = None,
+                      required_files: tuple[str, ...] = ("record.json",)) -> dict[str, Any]:
+        """Serialize a success into an uncommitted directory.
+
+        The caller may release the live record and run cleanup before adding
+        final post-cleanup evidence and atomically publishing this directory.
+        """
+        destination = self._path(sample_id)
+        if destination.exists():
+            raise FileExistsError(destination)
+        stage = Path(tempfile.mkdtemp(prefix=f".{sample_id}.stage.", dir=str(self.root)))
+        arrays: dict[str, np.ndarray] = {}
+        def encode(value: Any, name: str) -> Any:
+            if isinstance(value, np.ndarray):
+                filename = name.replace("/", "_").replace("\\", "_") + ".npy"
+                if filename in arrays:
+                    raise ValueError("duplicate Task 7 array artifact")
+                arrays[filename] = np.array(value, copy=True)
+                return {"artifact": filename, "dtype": str(value.dtype), "shape": list(value.shape)}
+            if isinstance(value, Mapping):
+                return {str(key): encode(item, f"{name}_{key}") for key, item in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [encode(item, f"{name}_{index}") for index, item in enumerate(value)]
+            return _safe(value)
+        try:
+            _atomic_json(stage / "record.json", encode(payload, "record"))
+            for filename, array in arrays.items():
+                with (stage / filename).open("wb") as stream:
+                    np.save(stream, array, allow_pickle=False); stream.flush(); os.fsync(stream.fileno())
+            return {"sample_id": sample_id, "stage": stage, "destination": destination,
+                    "operation_counts": dict(operation_counts or {}), "required_files": tuple(required_files)}
+        except BaseException:
+            if stage.exists():
+                stage.rename(self.root / f"{sample_id}.failed-attempt.001")
+            raise
+
+    def finalize_staged(self, token: Mapping[str, Any], *, record_updates: Mapping[str, Any] | None = None) -> Path:
+        stage, destination = Path(token["stage"]), Path(token["destination"])
+        if destination.exists():
+            raise FileExistsError(destination)
+        try:
+            if record_updates:
+                record = _load_json(stage / "record.json")
+                if not isinstance(record, Mapping):
+                    raise ResumeMismatch("staged Task 7 record is not a mapping")
+                updated = dict(record); updated.update(record_updates)
+                _atomic_json(stage / "record.json", updated)
+            hashes = {path.name: sha256_file(path) for path in sorted(stage.iterdir()) if path.is_file()}
+            required = tuple(token.get("required_files", ("record.json",)))
+            if any(name not in hashes for name in required):
+                raise ValueError("required Task 7 artifact was not serialized")
+            _atomic_json(stage / "status.json", {"status": "success", "required_artifacts": list(required),
+                                                  "artifact_sha256": hashes,
+                                                  "operation_counts": dict(token.get("operation_counts", {}))})
+            publish_directory(stage, destination)
+            return destination
+        except BaseException:
+            if stage.exists():
+                index = 1
+                candidate = self.root / f"{token['sample_id']}.failed-attempt.{index:03d}"
+                while candidate.exists():
+                    index += 1; candidate = self.root / f"{token['sample_id']}.failed-attempt.{index:03d}"
+                stage.rename(candidate)
+            raise
+
+    def abort_staged(self, token: Mapping[str, Any]) -> None:
+        stage = Path(token.get("stage", ""))
+        if not stage.exists():
+            return
+        index = 1
+        candidate = self.root / f"{token['sample_id']}.failed-attempt.{index:03d}"
+        while candidate.exists():
+            index += 1; candidate = self.root / f"{token['sample_id']}.failed-attempt.{index:03d}"
+        stage.rename(candidate)
+
     def write_success(self, sample_id: str, payload: Any, *, operation_counts: Mapping[str, Any] | None = None,
                       required_files: tuple[str, ...] = ("record.json",)) -> Path:
         return self._publish(sample_id, payload, status="success", operation_counts=operation_counts, required_files=required_files)
@@ -700,6 +775,34 @@ def _error_counts(error: BaseException) -> dict[str, int]:
         return _empty_counts()
 
 
+def _validate_stage_payload(stage: str, payload: Mapping[str, Any]) -> None:
+    """Reject resumable records that lack the approved scientific evidence."""
+    stage = str(stage).upper()
+    if not isinstance(payload, Mapping) or not isinstance(payload.get("spec"), Mapping):
+        raise ResumeMismatch("Task 7 sample record lacks its immutable spec")
+    if payload.get("status") == "SKIPPED_C":
+        if stage != "C" or not isinstance(payload.get("reason_code"), str) or not isinstance(payload.get("reason"), str):
+            raise ResumeMismatch("invalid explicit C skip record")
+        return
+    record = payload.get("record")
+    if not isinstance(record, Mapping):
+        raise ResumeMismatch("Task 7 sample record lacks its runtime record")
+    required = {"encoded_condition", "evidence"} if stage == "A" else {
+        "full_latent", "predicted_latent", "encoded_condition", "condition_input_fp32", "actual", "evidence"}
+    missing = sorted(key for key in required if key not in record)
+    if missing:
+        raise ResumeMismatch(f"{stage} sample record lacks required evidence: {missing}")
+    if not isinstance(record.get("evidence"), Mapping) or not isinstance(record["evidence"].get("operation_counts"), Mapping):
+        raise ResumeMismatch(f"{stage} sample record lacks observed operation counts")
+    if stage == "A" and not isinstance(record.get("encoder"), Mapping):
+        raise ResumeMismatch("A sample record lacks encoder evidence")
+    if stage in {"B", "C"}:
+        actual = record.get("actual")
+        if not isinstance(actual, Mapping) or any(key not in actual for key in (
+                "prepared_condition", "initial_condition", "reference_condition", "first_condition", "last_condition", "condition_steps")):
+            raise ResumeMismatch(f"{stage} sample record lacks full condition-chain evidence")
+
+
 def _measured_success_bytes(root: Path, *, stage: str | None = None) -> int | None:
     sizes: list[int] = []
     # A formal stage lives at run/stages/{A,B,C}; smoke lives beside stages.
@@ -707,12 +810,13 @@ def _measured_success_bytes(root: Path, *, stage: str | None = None) -> int | No
     # encoder-only artifact must never become the forecast class for a full
     # generation stage.
     smoke_sizes: list[int] = []
-    if str(stage).upper() in {"B", "C"}:
+    if str(stage).upper() in {"A", "B", "C"}:
         for status_path in root.parent.parent.glob("smoke/samples/smoke_baseline/status.json"):
             sample = status_path.parent
             try:
                 status = _load_json(status_path); hashes = status.get("artifact_sha256", {})
-                if status.get("status") == "success" and all((sample / name).is_file() and sha256_file(sample / name) == digest for name, digest in hashes.items()):
+                if (status.get("status") == "success" and isinstance(hashes, Mapping) and bool(hashes)
+                        and all((sample / name).is_file() and sha256_file(sample / name) == digest for name, digest in hashes.items())):
                     smoke_sizes.append(sum(path.stat().st_size for path in sample.rglob("*") if path.is_file()))
             except (OSError, ValueError, KeyError):
                 pass
@@ -731,15 +835,42 @@ def _measured_success_bytes(root: Path, *, stage: str | None = None) -> int | No
             try:
                 status = _load_json(status_path)
                 hashes = status.get("artifact_sha256", {})
-                if status.get("status") == "success" and all((sample / name).is_file() and sha256_file(sample / name) == digest
-                                                               for name, digest in hashes.items()):
+                if (status.get("status") == "success" and isinstance(hashes, Mapping) and bool(hashes)
+                        and all((sample / name).is_file() and sha256_file(sample / name) == digest
+                                                               for name, digest in hashes.items())):
                     sizes.append(sum(path.stat().st_size for path in sample.rglob("*") if path.is_file()))
             except (OSError, ValueError, KeyError):
                 continue
     return int(sum(sizes) / len(sizes)) if sizes else None
+
+
+def _release_sample_memory() -> dict[str, Any]:
+    """Release Python/Torch request state before post-cleanup sampling."""
+    import gc
+    evidence = {"gc_collected": int(gc.collect()), "cuda_cache_cleared": False}
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            evidence["cuda_cache_cleared"] = True
+    except ImportError:
+        pass
+    return evidence
+
+
+def _reset_sample_peak_memory() -> None:
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats(0)
+    except ImportError:
+        pass
+
+
 def run_stage(stage: str, run_dir: str | Path, *, execute: Callable[[Mapping[str, Any]], Any],
               binding: Mapping[str, Any], resume: bool = False, monitor: Any | None = None,
-              allowed_skips: bool = False) -> dict[str, Any]:
+              allowed_skips: bool = False, cleanup_sample: Callable[[], Mapping[str, Any]] | None = None,
+              reset_sample_peak: Callable[[], None] | None = None) -> dict[str, Any]:
     """Run exactly one stage with a process lock and strict evidence resume."""
     stage = str(stage).upper()
     if stage not in {"A", "B", "C"}:
@@ -797,6 +928,7 @@ def run_stage(stage: str, run_dir: str | Path, *, execute: Callable[[Mapping[str
                 for spec in plan:
                     path = store._path(spec["sample_id"]); store._verify(path)
                     record = _load_json(path / "record.json")
+                    _validate_stage_payload(stage, record)
                     counts = _load_json(path / "status.json").get("operation_counts")
                     if not isinstance(counts, Mapping):
                         raise ResumeMismatch("complete sample lacks observed operation counts")
@@ -845,6 +977,9 @@ def run_stage(stage: str, run_dir: str | Path, *, execute: Callable[[Mapping[str
                 raise ResourceStop(f"{result.get('reason_code', 'MONITOR_HARD_STOP')}: {result.get('reason', 'monitor capture stopped')}")
             return dict(result)
 
+        release_sample = cleanup_sample or _release_sample_memory
+        reset_peak = reset_sample_peak or _reset_sample_peak_memory
+
         write_status("RUNNING")
         for ordinal, spec in enumerate(plan):
             try:
@@ -865,43 +1000,77 @@ def run_stage(stage: str, run_dir: str | Path, *, execute: Callable[[Mapping[str
             disposition = store.prepare(spec["sample_id"], resume=resume)
             if disposition == "skip":
                 prior_record = store.load_record(spec["sample_id"])
+                _validate_stage_payload(stage, prior_record)
                 counts = prior_record.get("_status", {}).get("operation_counts")
                 if not isinstance(counts, Mapping):
                     raise ResumeMismatch("successful sample lacks observed operation counts")
-                _add_counts(attempt_counts, counts); _add_counts(completed_counts, counts)
-                completed.append(spec["sample_id"]); continue
+                _add_counts(attempt_counts, counts)
+                if prior_record.get("status") == "SKIPPED_C":
+                    skipped.append(spec["sample_id"])
+                else:
+                    _add_counts(completed_counts, counts)
+                    completed.append(spec["sample_id"])
+                continue
             resource_pre: dict[str, Any] = {}
             resource_post: dict[str, Any] = {}
             resource_cleanup: dict[str, Any] = {}
             observed_counts = _empty_counts()
             counts_added = False
+            staged: dict[str, Any] | None = None
             try:
+                reset_peak()
                 resource_pre = capture_sample(spec["sample_id"], "pre_call", len(plan) - ordinal)
                 value = execute(dict(spec))
                 if isinstance(value, SkipSample):
                     if not allowed_skips: raise RuntimeError("skip is not allowed for this stage")
-                    resource_post = capture_sample(spec["sample_id"], "post_call", len(plan) - ordinal - 1)
-                    resource_cleanup = capture_sample(spec["sample_id"], "post_cleanup", len(plan) - ordinal - 1)
-                    store.write_success(spec["sample_id"], {"spec": spec, "status": "SKIPPED_C",
+                    skip_payload = {"spec": spec, "status": "SKIPPED_C",
                         "reason_code": value.reason_code, "reason": value.reason,
                         "resource_pre": resource_pre, "resource_post": resource_post,
-                        "resource_cleanup": resource_cleanup}, operation_counts=_empty_counts())
+                        "resource_cleanup": {}}
+                    _validate_stage_payload(stage, skip_payload)
+                    resource_post = capture_sample(spec["sample_id"], "post_call", len(plan) - ordinal - 1)
+                    skip_payload["resource_post"] = resource_post
+                    staged = store.stage_success(spec["sample_id"], skip_payload, operation_counts=_empty_counts())
+                    del value
+                    release_sample()
+                    resource_cleanup = capture_sample(spec["sample_id"], "post_cleanup", len(plan) - ordinal - 1)
+                    store.finalize_staged(staged, record_updates={"resource_cleanup": resource_cleanup})
+                    staged = None
                     skipped.append(spec["sample_id"]); continue
                 if not isinstance(value, Mapping):
                     raise ValueError("stage executor must return a mapping record")
                 observed_counts = _capture_counts(value)
+                payload = {"spec": spec, "record": value,
+                    "resource_pre": resource_pre, "resource_post": resource_post,
+                    "resource_cleanup": {}}
+                _validate_stage_payload(stage, payload)
                 _add_counts(attempt_counts, observed_counts); counts_added = True
                 resource_post = capture_sample(spec["sample_id"], "post_call", len(plan) - ordinal - 1)
+                payload["resource_post"] = resource_post
+                staged = store.stage_success(spec["sample_id"], payload, operation_counts=observed_counts)
+                # The staged directory owns serialized arrays now.  Release
+                # the live record and all callback-local references before
+                # collecting caches and taking the cleanup sample.
+                del value
+                release_sample()
                 resource_cleanup = capture_sample(spec["sample_id"], "post_cleanup", len(plan) - ordinal - 1)
-                store.write_success(spec["sample_id"], {"spec": spec, "record": value,
-                    "resource_pre": resource_pre, "resource_post": resource_post,
-                    "resource_cleanup": resource_cleanup}, operation_counts=observed_counts)
+                store.finalize_staged(staged, record_updates={"resource_cleanup": resource_cleanup})
+                staged = None
                 _add_counts(completed_counts, observed_counts)
                 completed.append(spec["sample_id"]); write_status("RUNNING")
             except SkipSample as skip:
                 if not allowed_skips: raise
-                store.write_success(spec["sample_id"], {"spec": spec, "status": "SKIPPED_C",
-                    "reason_code": skip.reason_code, "reason": skip.reason}, operation_counts=_empty_counts())
+                resource_post = capture_sample(spec["sample_id"], "post_call", len(plan) - ordinal - 1)
+                skip_payload = {"spec": spec, "status": "SKIPPED_C",
+                    "reason_code": skip.reason_code, "reason": skip.reason,
+                    "resource_pre": resource_pre, "resource_post": resource_post,
+                    "resource_cleanup": {}}
+                _validate_stage_payload(stage, skip_payload)
+                staged = store.stage_success(spec["sample_id"], skip_payload, operation_counts=_empty_counts())
+                release_sample()
+                resource_cleanup = capture_sample(spec["sample_id"], "post_cleanup", len(plan) - ordinal - 1)
+                store.finalize_staged(staged, record_updates={"resource_cleanup": resource_cleanup})
+                staged = None
                 skipped.append(spec["sample_id"]); write_status("RUNNING")
             except (KeyboardInterrupt, InterruptedError) as error:
                 counts = _error_counts(error); _add_counts(attempt_counts, counts)
@@ -915,6 +1084,9 @@ def run_stage(stage: str, run_dir: str | Path, *, execute: Callable[[Mapping[str
                 return write_status("RUNNING", interrupted_sample=spec["sample_id"],
                                     interrupted=True, reason_code=type(error).__name__, reason=str(error))
             except BaseException as error:
+                if staged is not None:
+                    store.abort_staged(staged)
+                    staged = None
                 # Capture the observed boundary even when the monitor or
                 # serializer fails after a successful executor return.
                 if not counts_added and any(observed_counts.values()):
@@ -972,9 +1144,12 @@ def _prepare_c_source(source: dict[str, Any], run_root: Path) -> None:
     if not isinstance(z1, np.ndarray):
         raise ResumeMismatch("B baseline step-0 record lacks encoded_condition")
     baseline_step1 = b_store.load_record("B_baseline_pre_step_1").get("record", {})
-    z2 = baseline_step1.get("full_latent")
-    if not isinstance(z2, np.ndarray):
-        raise ResumeMismatch("B baseline step-1 record lacks full_latent for C parity")
+    z2 = baseline_step1.get("encoded_condition")
+    if not isinstance(z2, np.ndarray) or z2.dtype != np.float32:
+        raise ResumeMismatch("B baseline step-1 record lacks encoded_condition for C parity")
+    z2_full = baseline_step1.get("full_latent")
+    if not isinstance(z2_full, np.ndarray):
+        raise ResumeMismatch("B baseline step-1 record lacks full_latent for diagnostic parity")
     baseline_evidence = baseline_step1.get("evidence")
     b_seed1_noise = baseline_evidence.get("prediction_noise_hash") if isinstance(baseline_evidence, Mapping) else None
     if not isinstance(b_seed1_noise, str) or not b_seed1_noise:
@@ -988,8 +1163,8 @@ def _prepare_c_source(source: dict[str, Any], run_root: Path) -> None:
         if not isinstance(encoded, np.ndarray) or encoded.shape != z1.shape or encoded.dtype != np.float32:
             raise ResumeMismatch(f"B step-0 encoded_condition is missing or malformed: {name}")
         directions[f"delta1_{index:02d}"] = np.subtract(encoded, z1, dtype=np.float32)
-    source["z1"], source["b_z2"], source["b_seed1_noise_hash"], source["delta1_directions"] = (
-        np.array(z1, copy=True), np.array(z2, copy=True), b_seed1_noise, directions)
+    source["z1"], source["b_z2"], source["b_z2_full"], source["b_seed1_noise_hash"], source["delta1_directions"] = (
+        np.array(z1, copy=True), np.array(z2, copy=True), np.array(z2_full, copy=True), b_seed1_noise, directions)
 
 
 def make_stage_executor(stage: str, *, source: Mapping[str, Any], feedback: Any,
@@ -1041,28 +1216,60 @@ def make_stage_executor(stage: str, *, source: Mapping[str, Any], feedback: Any,
         actual = record.get("actual")
         if not isinstance(actual, Mapping):
             raise ResumeMismatch("feedback record lacks actual condition-chain evidence")
+        full_mask = np.asarray(getattr(feedback, "mask", None), dtype=bool)
+        if full_mask.ndim == 0 or not np.any(full_mask):
+            raise ResumeMismatch("feedback runtime mask is unavailable for condition-chain verification")
+        embed = getattr(feedback, "embed_condition", None)
+        if callable(embed):
+            expected_full = np.asarray(embed(condition), dtype=np.float32)
+        elif tuple(condition.shape) == tuple(full_mask.shape):
+            expected_full = np.asarray(condition, dtype=np.float32)
+        else:
+            raise ResumeMismatch("feedback runtime cannot embed condition-only chain evidence")
+        if expected_full.shape != full_mask.shape:
+            raise ResumeMismatch("feedback embedded condition shape differs from runtime mask")
+        input_condition = record.get("condition_input_fp32", record.get("condition_only_fp32"))
+        if not isinstance(input_condition, np.ndarray) or not np.array_equal(input_condition, condition):
+            raise ResumeMismatch("feedback condition input differs from the requested condition")
         for key in ("prepared_condition", "initial_condition", "reference_condition", "first_condition", "last_condition"):
-            if not isinstance(actual.get(key), np.ndarray) or not np.array_equal(actual[key], condition):
+            observed = actual.get(key)
+            if not isinstance(observed, np.ndarray) or observed.shape != expected_full.shape or not np.array_equal(observed[full_mask], expected_full[full_mask]):
                 raise ResumeMismatch(f"feedback {key} differs from the requested condition")
         steps = actual.get("condition_steps")
-        if not isinstance(steps, np.ndarray) or steps.shape[0] != 30 or not all(np.array_equal(item, condition) for item in steps):
+        if (not isinstance(steps, np.ndarray) or steps.shape != (30,) + expected_full.shape
+                or not all(np.array_equal(item[full_mask], expected_full[full_mask]) for item in steps)):
             raise ResumeMismatch("feedback per-step conditions differ from the requested condition")
+
+    def _validate_record_with_counts(record: Mapping[str, Any], condition: np.ndarray) -> None:
+        try:
+            _verify_feedback_chain(record, condition)
+        except BaseException as error:
+            error.capture = {"operation_counts": _capture_counts(record), "stage_boundary": "feedback_validation"}
+            raise
 
     def execute(spec: Mapping[str, Any]) -> Any:
         if stage == "A":
             encoder = getattr(feedback, "encoder", None)
             if encoder is None or not callable(getattr(encoder, "encode", None)):
                 raise BlockedExecution("Stage A requires the reviewed FeedbackEncoder")
-            result = encoder.encode(_source_frame(source, spec["source_name"]), precision=spec["precision"])
+            try:
+                result = encoder.encode(_source_frame(source, spec["source_name"]), precision=spec["precision"])
+            except BaseException as error:
+                error.capture = {"operation_counts": {"G": 0, "D": 0, "E": 1}, "stage_boundary": "encoder"}
+                raise
             arrays = result.get("arrays", {}) if isinstance(result, Mapping) else {}
             output = arrays.get("actual_output")
             if output is None:
                 raise ValueError("Stage A encoder did not expose actual output")
             historical = _load_array(_decoder_sample_root(Path(source["decoder_root"]), spec["source_name"]) / "direct_condition_latent_float32.npy")
-            if np.asarray(output).dtype != np.float32 or tuple(np.asarray(output).shape) != tuple(historical.shape):
-                raise ValueError("Stage A encoder output shape/dtype differs from frozen condition layout")
-            if spec["precision"] == "native" and not np.array_equal(np.asarray(output), historical):
-                raise ValueError("Stage A native output differs from historical direct condition")
+            try:
+                if np.asarray(output).dtype != np.float32 or tuple(np.asarray(output).shape) != tuple(historical.shape):
+                    raise ValueError("Stage A encoder output shape/dtype differs from frozen condition layout")
+                if spec["precision"] == "native" and not np.array_equal(np.asarray(output), historical):
+                    raise ValueError("Stage A native output differs from historical direct condition")
+            except BaseException as error:
+                error.capture = {"operation_counts": {"G": 0, "D": 0, "E": 1}, "stage_boundary": "encoder_validation"}
+                raise
             return {"source_name": spec["source_name"], "precision": spec["precision"],
                     "encoded_condition": np.array(output, copy=True), "encoder": result,
                     "evidence": {"operation_counts": {"G": 0, "D": 0, "E": 1}}}
@@ -1081,7 +1288,7 @@ def make_stage_executor(stage: str, *, source: Mapping[str, Any], feedback: Any,
                     actual = record["generation"].get("output_full")
                 if actual is None or not np.array_equal(np.asarray(actual), expected):
                     raise ValueError("B step 0 G output differs from historical output_full")
-                _verify_feedback_chain(record, np.asarray(condition))
+                _validate_record_with_counts(record, np.asarray(condition))
                 noise = record.get("evidence", {}).get("prediction_noise_hash") if isinstance(record.get("evidence"), Mapping) else None
                 if not isinstance(noise, str) or not noise:
                     raise ResumeMismatch("B step 0 lacks prediction-noise identity")
@@ -1093,7 +1300,7 @@ def make_stage_executor(stage: str, *, source: Mapping[str, Any], feedback: Any,
                     raise ResumeMismatch("B step 0 lacks encoded_condition")
                 trajectories[trajectory] = np.array(encoded, dtype=np.float32, copy=True)
             else:
-                _verify_feedback_chain(record, np.asarray(condition))
+                _validate_record_with_counts(record, np.asarray(condition))
                 noise = record.get("evidence", {}).get("prediction_noise_hash") if isinstance(record.get("evidence"), Mapping) else None
                 if not isinstance(noise, str) or not noise:
                     raise ResumeMismatch("B step 1 lacks prediction-noise identity")
@@ -1135,16 +1342,27 @@ def make_stage_executor(stage: str, *, source: Mapping[str, Any], feedback: Any,
 
         if str(spec["kind"]).startswith("baseline"):
             record = feedback.step(_condition_only(c_state["z1"]), 1)
-            _check_c_noise(record)
-            expected_z2 = source.get("b_z2")
-            actual_z2 = record.get("full_latent") if isinstance(record, Mapping) else None
-            if isinstance(expected_z2, np.ndarray) and isinstance(actual_z2, np.ndarray) and not np.array_equal(actual_z2, expected_z2):
-                raise ResumeMismatch("C baseline output differs from B baseline step-1 full latent")
+            try:
+                _check_c_noise(record)
+                expected_z2 = source.get("b_z2")
+                actual_z2 = record.get("encoded_condition") if isinstance(record, Mapping) else None
+                if expected_z2 is not None and (not isinstance(expected_z2, np.ndarray) or not isinstance(actual_z2, np.ndarray)
+                                                or not np.array_equal(actual_z2, expected_z2)):
+                    raise ResumeMismatch("C baseline encoded condition differs from B baseline step-1 encoded_condition")
+                expected_full = source.get("b_z2_full")
+                actual_full = record.get("full_latent") if isinstance(record, Mapping) else None
+                if isinstance(expected_full, np.ndarray) and isinstance(actual_full, np.ndarray) and not np.array_equal(actual_full, expected_full):
+                    raise ResumeMismatch("C baseline generated full latent differs from B baseline step-1 full latent")
+            except BaseException as error:
+                error.capture = {"operation_counts": _capture_counts(record), "stage_boundary": "c_baseline_validation"}
+                raise
             return record
         direction = c_state["directions"].get(spec["direction_id"]) if isinstance(c_state["directions"], Mapping) else None
         if direction is None:
             raise ResumeMismatch(f"C required delta1 ray is missing: {spec['direction_id']}")
         direction = np.asarray(direction, dtype=np.float32)
+        if not np.all(np.isfinite(direction)):
+            raise ResumeMismatch(f"C delta1 ray is nonfinite: {spec['direction_id']}")
         full_mask = np.asarray(feedback.mask, dtype=bool)
         if direction.shape == full_mask.shape:
             ray_mask = full_mask
@@ -1154,14 +1372,16 @@ def make_stage_executor(stage: str, *, source: Mapping[str, Any], feedback: Any,
             # it from the full mask gives the corresponding condition mask.
             try:
                 ray_mask = np.asarray(feedback.extract_condition(full_mask.astype(np.float32)), dtype=bool)
-            except (AttributeError, TypeError, ValueError):
-                ray_mask = np.ones(direction.shape, dtype=bool)
+            except (AttributeError, TypeError, ValueError) as error:
+                raise ResumeMismatch("C runtime cannot derive the authoritative condition mask") from error
             if ray_mask.shape != direction.shape:
                 raise ResumeMismatch(f"C ray shape differs from condition mask: {direction.shape} vs {ray_mask.shape}")
         if direction.shape != np.asarray(c_state["z1"]).shape:
             raise ResumeMismatch("C delta1 ray shape differs from shared baseline z1")
         rms = float(np.sqrt(np.mean(direction[ray_mask].astype(np.float64) ** 2)))
-        if not np.isfinite(rms) or rms == 0:
+        if not np.isfinite(rms):
+            raise ResumeMismatch(f"C delta1 ray RMS is nonfinite: {spec['direction_id']}")
+        if rms == 0:
             raise SkipSample("SKIPPED_C_ZERO_RAY", f"{spec['direction_id']} has zero delta1 RMS")
         target = c_state["z1"].copy()
         normalized = np.zeros_like(direction, dtype=np.float32)
@@ -1169,7 +1389,11 @@ def make_stage_executor(stage: str, *, source: Mapping[str, Any], feedback: Any,
         increment = np.float32(spec["sign"] * spec["beta"] * rms) * normalized
         target[ray_mask] += increment[ray_mask]
         record = feedback.step(_condition_only(target), 1)
-        _check_c_noise(record)
+        try:
+            _check_c_noise(record)
+        except BaseException as error:
+            error.capture = {"operation_counts": _capture_counts(record), "stage_boundary": "c_feedback_validation"}
+            raise
         return record
 
     return execute
@@ -1281,134 +1505,148 @@ def _default_factory(args: argparse.Namespace, source: Mapping[str, Any]) -> Any
         run_dir=args.run_dir, resume=args.resume)
 
 
-def _record_live_failure(root: Path, error: BaseException, *, generation_started: bool = False) -> None:
+def _precheck_resume(root: Path, args: argparse.Namespace) -> int | None:
+    """Reject terminal failures and reuse verified success before model load."""
+    if not args.resume:
+        return None
+    root_status_path = root / "run_status.json"
+    if root_status_path.is_file():
+        root_status = _load_json(root_status_path)
+        if root_status.get("status") in {"FAILED", "RESOURCE_STOP"}:
+            raise ResumeMismatch("root run is terminal and cannot be reused")
+
+    def verify_identity(status: Mapping[str, Any], *, stage: str) -> None:
+        binding = status.get("binding")
+        if not isinstance(binding, Mapping):
+            raise ResumeMismatch("complete resume record lacks immutable binding")
+        stored_source = binding.get("source", binding.get("source_tree_sha256"))
+        stored_code = binding.get("task7_code_sha256")
+        if stored_source is None or not args.raw_root or not args.decoder_root:
+            raise ResumeMismatch("resume source binding is incomplete")
+        current_source = validate_task7_sources(args.raw_root, args.decoder_root)
+        if current_source.get("source_tree_sha256") != stored_source:
+            raise ResumeMismatch("resume source identity differs")
+        if stored_code is None or _code_digest() != stored_code:
+            raise ResumeMismatch("resume Task 7 code identity differs")
+        contract = None
+        stored_contract = binding.get("launch_contract_sha256")
+        if stored_contract is not None and not args.launch_contract:
+            raise ResumeMismatch("resume launch-contract binding is incomplete")
+        if args.launch_contract:
+            contract = _load_contract(args.launch_contract)
+            if stored_contract is not None and sha256_file(args.launch_contract) != stored_contract:
+                raise ResumeMismatch("resume launch-contract identity differs")
+            checkpoint = contract.get("checkpoint_identity", {}).get("sha256", "")
+            if binding.get("model") not in (None, "") and binding.get("model") != checkpoint:
+                raise ResumeMismatch("resume checkpoint identity differs")
+            if binding.get("vae") not in (None, "") and binding.get("vae") != contract.get("vae_sha256", ""):
+                raise ResumeMismatch("resume VAE identity differs")
+            if binding.get("framework") not in (None, "") and binding.get("framework") != contract.get("framework_commit", ""):
+                raise ResumeMismatch("resume framework identity differs")
+        elif any(binding.get(key) not in (None, "") for key in ("model", "vae", "framework")):
+            raise ResumeMismatch("resume model binding is incomplete")
+        config = binding.get("config")
+        expected_config = {"stage": stage} if stage == "smoke" else {
+            "stage": stage, "plan": build_stage_plan(stage)}
+        if config is not None and canonical_json(config) != canonical_json(expected_config):
+            raise ResumeMismatch("resume stage configuration differs")
+
+    if args.stage == "smoke":
+        status_path = root / "smoke" / "run_status.json"
+        if not status_path.is_file():
+            return None
+        status = _load_json(status_path)
+        if status.get("status") == "SMOKE_COMPLETE":
+            verify_identity(status, stage="smoke")
+            if status.get("formal_counts") != _empty_counts() or not isinstance(status.get("observed_counts"), Mapping):
+                raise ResumeMismatch("smoke completion counters are incomplete")
+            store = Task7SampleStore(root / "smoke" / "samples")
+            store._verify(store._path("smoke_baseline"))
+            observed = status.get("observed_counts")
+            sample_counts = _load_json(store._path("smoke_baseline") / "status.json").get("operation_counts")
+            if observed != sample_counts:
+                raise ResumeMismatch("smoke counters do not match verified sample evidence")
+            return 0
+        if status.get("status") in {"FAILED", "RESOURCE_STOP"}:
+            raise ResumeMismatch("existing smoke run is terminal and cannot be retried")
+        return None
+    stage_root = root / "stages" / str(args.stage).upper()
+    status_path = stage_root / "run_status.json"
+    if not status_path.is_file():
+        return None
+    status = _load_json(status_path)
+    if status.get("status") in {"FAILED", "RESOURCE_STOP"}:
+        raise ResumeMismatch("existing Task 7 stage is terminal and cannot be retried")
+    if status.get("status") == "COMPLETE":
+        verify_identity(status, stage=str(args.stage).upper())
+        plan_ids = {spec["sample_id"] for spec in build_stage_plan(args.stage)}
+        listed = set(status.get("completed_samples", [])) | set(status.get("skipped_samples", []))
+        if listed != plan_ids:
+            raise ResumeMismatch("existing complete stage has an incomplete sample set")
+        if (status.get("planned_samples") != len(plan_ids) or status.get("failed_count") != 0
+                or status.get("formal_counts") != stage_counts(args.stage)
+                or status.get("attempt_counts") != status.get("observed_counts")):
+            raise ResumeMismatch("existing complete stage counters are incomplete")
+        store = Task7SampleStore(stage_root / "samples")
+        for sample_id in plan_ids:
+            sample_path = store._path(sample_id)
+            store._verify(sample_path)
+            _validate_stage_payload(str(args.stage).upper(), _load_json(sample_path / "record.json"))
+        skipped = len(status.get("skipped_samples", []))
+        expected_completed = stage_counts(args.stage)
+        if str(args.stage).upper() == "C":
+            expected_completed = {key: max(0, value - skipped) for key, value in expected_completed.items()}
+        if status.get("completed_counts") != expected_completed:
+            raise ResumeMismatch("existing complete stage counts do not match verified samples")
+        return 0
+    return None
+
+
+def _record_live_failure(root: Path, error: BaseException, *, generation_started: bool = False,
+                         binding: Mapping[str, Any] | None = None, source: Mapping[str, Any] | None = None,
+                         monitor: Any | None = None, cleanup_errors: list[BaseException] | None = None) -> None:
+    counts = _error_counts(error)
     _atomic_json(root / "run_status.json", {"schema_version": "umi-task7-run-v2",
         "status": "RESOURCE_STOP" if isinstance(error, ResourceStop) else "FAILED",
-        "generation_started": bool(generation_started), "reason_code": type(error).__name__, "reason": str(error)})
+        "generation_started": bool(generation_started or counts.get("G", 0) > 0),
+        "reason_code": type(error).__name__, "reason": str(error),
+        "operation_counts": counts, "binding": dict(binding or {}),
+        "source": {key: source[key] for key in ("source_tree_sha256", "task7_code_sha256", "z0", "mask", "v0") if key in (source or {})},
+        "last_resources": getattr(monitor, "last_resources", {}) or {},
+        "cleanup_errors": [repr(item) for item in (cleanup_errors or [])],
+        "primary_error": repr(error)})
 
 
-def _legacy_main(argv: list[str] | None = None, *, factory: Any | None = None,
-         monitor: Any | None = None) -> int:
+def _mark_stage_cleanup_failure(root: Path, stage: str, cleanup_errors: list[BaseException]) -> None:
+    status_path = root / "stages" / str(stage).upper() / "run_status.json"
+    if not status_path.is_file():
+        return
+    status = _load_json(status_path)
+    if not isinstance(status, Mapping):
+        return
+    updated = dict(status)
+    updated.update({"status": "RESOURCE_STOP", "reason_code": "CLEANUP_FAILURE",
+                    "reason": "Task 7 factory/monitor cleanup failed",
+                    "cleanup_errors": [repr(item) for item in cleanup_errors]})
+    _atomic_json(status_path, updated)
+
+
+def _preflight_main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    if args.stage == "preflight":
-        try:
-            _preflight(args)
-            return 0
-        except BaseException as error:
-            if args.run_dir:
-                root = Path(args.run_dir).resolve()
-                # Do not write a failure marker until the target has passed
-                # the same containment check used by the successful path.
-                validate_run_roots(root, raw_root=args.raw_root, decoder_root=args.decoder_root)
-                root.mkdir(parents=True, exist_ok=True)
-                _atomic_json(root / "run_status.json", {"schema_version": "umi-task7-run-v2",
-                    "status": "RESOURCE_STOP" if isinstance(error, ResourceStop) else "FAILED",
-                    "generation_started": False, "reason_code": type(error).__name__, "reason": str(error)})
-            raise
-    if not args.run_dir:
-        raise BlockedExecution("--run-dir is required for smoke/A/B/C")
-    root = Path(args.run_dir).resolve(); validate_run_roots(root, raw_root=args.raw_root, decoder_root=args.decoder_root)
     try:
-        source = validate_task7_sources(args.raw_root, args.decoder_root) if args.raw_root and args.decoder_root else {}
-        contract = _load_contract(args.launch_contract)
+        _preflight(args)
+        return 0
     except BaseException as error:
-        _record_live_failure(root, error, generation_started=False)
-        raise
-    source.update({"task7_code_sha256": _code_digest(), "launch_contract": contract})
-    if monitor is None:
-        try:
-            from .run_umi_task6_official import resource_samplers
-        except ImportError:
-            from run_umi_task6_official import resource_samplers
-        samplers = resource_samplers(str(root), gpu_index=args.gpu_index)
-        monitor = ResourceMonitor(root / "monitor", gpu_sampler=samplers["gpu"], ram_sampler=samplers["ram"], disk_sampler=samplers["disk"])
-        monitor.start()
-    if not callable(getattr(monitor, "check", None)):
-        raise BlockedExecution("live stages require Task 6 ResourceMonitor")
-    try:
-        preload = monitor.check(phase="preload", starting_new_sample=False)
-        if not isinstance(preload, Mapping) or preload.get("status") == "HARD_STOP":
-            raise ResourceStop(str(preload))
-        # Re-check with the strict Task 7 field-completeness wrapper.  The
-        # Task-6 evaluator's defaults are intentionally not trusted here.
-        require_resource_snapshot(getattr(monitor, "last_resources", {}), phase="preload")
-    except BaseException:
         if args.run_dir:
-            _atomic_json(root / "run_status.json", {"schema_version": "umi-task7-run-v2", "status": "RESOURCE_STOP",
-                "generation_started": False, "reason_code": "PRELOAD_RESOURCE_STOP"})
+            root = Path(args.run_dir).resolve()
+            # Do not write a failure marker until the target has passed
+            # the same containment check used by the successful path.
+            validate_run_roots(root, raw_root=args.raw_root, decoder_root=args.decoder_root)
+            root.mkdir(parents=True, exist_ok=True)
+            _atomic_json(root / "run_status.json", {"schema_version": "umi-task7-run-v2",
+                "status": "RESOURCE_STOP" if isinstance(error, ResourceStop) else "FAILED",
+                "generation_started": False, "reason_code": type(error).__name__, "reason": str(error)})
         raise
-    try:
-        if factory is None:
-            factory = _default_factory(args, source)
-        built = factory.build() if hasattr(factory, "build") else (factory(args, source) if callable(factory) else factory)
-    except BaseException as error:
-        _record_live_failure(root, error, generation_started=False)
-        raise
-    if not isinstance(built, (tuple, list)) or len(built) < 3:
-        raise BlockedExecution("factory must return (Task6RuntimeAdapter, inputs, encoder)")
-    adapter, inputs, encoder = built[0], built[1], built[2]
-    try:
-        from .umi_task7_runtime import FeedbackRuntime
-    except ImportError:
-        from umi_task7_runtime import FeedbackRuntime
-    official = getattr(adapter, "runtime", None)
-    if official is None:
-        raise BlockedExecution("factory result lacks underlying OfficialPrecisionRuntime")
-    try:
-        source_z0, _ = _source_condition(source, "baseline_pre")
-        source_mask = _load_array(_source_sample_root(Path(source["raw_root"]), "baseline_pre") / "mask.npy").astype(bool, copy=False)
-        source_v0 = _load_array(_source_sample_root(Path(source["raw_root"]), "v0_alpha_00_plus") / "direction.npy").astype(np.float32, copy=False)
-        if (_array_hash(source_z0) != _array_hash(inputs.z0) or _array_hash(source_mask) != _array_hash(inputs.geometry.mask)
-                or _array_hash(source_v0) != _array_hash(inputs.directions["v0"])):
-            raise ResumeMismatch("factory frozen z0/mask/v0 differs from immutable source artifacts")
-    except BaseException as error:
-        _record_live_failure(root, error, generation_started=False)
-        raise
-    try:
-        from .umi_task7_encoder import FeedbackEncoder
-    except ImportError:
-        from umi_task7_encoder import FeedbackEncoder
-    if not isinstance(encoder, FeedbackEncoder):
-        encoder = FeedbackEncoder(getattr(encoder, "encoder", encoder), device="cuda")
-    try:
-        feedback = FeedbackRuntime(official, encoder=encoder, z0=source_z0, mask=source_mask,
-                                   condition_indexes=inputs.geometry.condition_indexes, v0=source_v0, seed=0)
-    except BaseException as error:
-        _record_live_failure(root, error, generation_started=False)
-        raise
-    source.update({"z0": _array_hash(source_z0), "mask": _array_hash(source_mask), "v0": _array_hash(source_v0)})
-    try:
-        if args.stage == "smoke":
-            require_resource_snapshot(getattr(monitor, "last_resources", {}), phase="smoke")
-            _, consumed = _source_condition(source, "baseline_pre")
-            record = feedback.step(feedback.extract_condition(consumed), 0)
-            store = Task7SampleStore(root / "smoke" / "samples")
-            store.write_success("smoke_baseline", {"record": record, "engineering": True}, operation_counts=_capture_counts(record))
-            _atomic_json(root / "smoke" / "run_status.json", {"status": "SMOKE_COMPLETE", "engineering": True,
-                "formal_counts": _empty_counts(), "observed_counts": _capture_counts(record)})
-            return 0
-        if args.stage == "C":
-            _prepare_c_source(source, root)
-        binding = {"source": source.get("source_tree_sha256", "source-bound"), "task7_code_sha256": source["task7_code_sha256"],
-                   "config": {"stage": args.stage, "plan": build_stage_plan(args.stage)},
-                   "model": contract.get("checkpoint_identity", {}).get("sha256", ""), "vae": contract.get("vae_sha256", ""),
-                   "framework": contract.get("framework_commit", ""), "mask": source["mask"], "z0": source["z0"],
-                   "v0": source["v0"], "noise_policy": "prediction-region-seed-paired"}
-        executor = make_stage_executor(args.stage, source=source, feedback=feedback, run_dir=root)
-        result = run_stage(args.stage, root / "stages" / args.stage, execute=executor, binding=binding,
-                           resume=args.resume, monitor=monitor, allowed_skips=args.stage == "C")
-        return 0 if result.get("status") == "COMPLETE" else 1
-    except BaseException as error:
-        _record_live_failure(root, error, generation_started=True)
-        raise
-    finally:
-        if callable(getattr(monitor, "stop", None)):
-            try: monitor.stop()
-            except BaseException as cleanup_error:
-                _record_live_failure(root, cleanup_error, generation_started=True)
-                raise
-        if callable(getattr(factory, "unload", None)):
-            factory.unload()
 
 
 def _monitor_capture(monitor: Any, *, sample_id: str, phase: str, remaining: int, run_dir: Path) -> dict[str, Any]:
@@ -1445,13 +1683,13 @@ def _monitor_peak_snapshot(monitor: Any, capture: Mapping[str, Any] | None = Non
     result = dict(getattr(monitor, "last_resources", {}) or {})
     result["gpu_peak_nvml_used_gib"] = peak("gpu_used_gib", "nvml_used_gib")
     result["gpu_peak_allocated_gib"] = peak("gpu_peak_allocated_gib", "gpu_allocated_gib")
-    result["gpu_peak_reserved_gib"] = peak("gpu_reserved_gib", "torch_reserved_gib")
+    result["gpu_peak_reserved_gib"] = peak("gpu_peak_reserved_gib", "torch_peak_reserved_gib", "gpu_reserved_gib", "torch_reserved_gib")
     return result
 
 
 def _require_live_gpu_telemetry(monitor: Any) -> None:
     """Reject Task-6's ambiguous all-zero Torch telemetry after model load."""
-    if not isinstance(monitor, ResourceMonitor):
+    if not isinstance(monitor, ResourceMonitor) or not getattr(monitor, "_task7_strict_gpu_sampler", False):
         return
     sampler = getattr(monitor, "gpu_sampler", None)
     if not callable(sampler):
@@ -1466,6 +1704,28 @@ def _require_live_gpu_telemetry(monitor: Any) -> None:
         raise ResourceStop("MONITOR_GPU_TELEMETRY_UNAVAILABLE: Torch allocation sampler returned ambiguous zeros")
 
 
+def _strict_gpu_sampler(base_sampler: Callable[[], Mapping[str, Any]], gpu_index: int) -> Callable[[], Mapping[str, Any]]:
+    """Overlay direct Torch allocation/peak queries on Task-6's NVML row."""
+    def sample() -> Mapping[str, Any]:
+        row = dict(base_sampler())
+        if row.get("monitor_failure") or row.get("monitor_error"):
+            return row
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                return {"monitor_failure": "Torch CUDA is unavailable for Task 7 GPU telemetry"}
+            device = int(gpu_index)
+            row.update({"gpu_allocated_gib": float(torch.cuda.memory_allocated(device) / 2**30),
+                        "gpu_reserved_gib": float(torch.cuda.memory_reserved(device) / 2**30),
+                        "gpu_peak_allocated_gib": float(torch.cuda.max_memory_allocated(device) / 2**30),
+                        "gpu_peak_reserved_gib": float(torch.cuda.max_memory_reserved(device) / 2**30),
+                        "task7_torch_telemetry": "direct"})
+            return row
+        except Exception as error:
+            return {"monitor_failure": f"Task 7 direct Torch telemetry failed: {error}"}
+    return sample
+
+
 def _run_live(args: argparse.Namespace, root: Path, *, factory: Any | None, monitor: Any | None) -> int:
     """Run one live stage under the run-wide lock with exception-safe cleanup."""
     if args.gpu_index != 0:
@@ -1478,7 +1738,14 @@ def _run_live(args: argparse.Namespace, root: Path, *, factory: Any | None, moni
     monitor_owned = monitor is None
     primary: BaseException | None = None
     result_code = 1
+    smoke_staged: dict[str, Any] | None = None
+    source: dict[str, Any] = {}
+    binding: dict[str, Any] = {}
     try:
+        reused = _precheck_resume(root, args)
+        if reused is not None:
+            result_code = reused
+            return result_code
         source = validate_task7_sources(args.raw_root, args.decoder_root)
         contract = _load_contract(args.launch_contract)
         if args.action:
@@ -1490,7 +1757,17 @@ def _run_live(args: argparse.Namespace, root: Path, *, factory: Any | None, moni
             except ImportError:
                 from run_umi_task6_official import resource_samplers
             samplers = resource_samplers(str(root), gpu_index=0)
-            monitor = ResourceMonitor(root / "monitor", gpu_sampler=samplers["gpu"], ram_sampler=samplers["ram"], disk_sampler=samplers["disk"])
+            monitor_root = root / "monitor" / str(args.stage).lower()
+            if monitor_root.exists():
+                index = 1
+                candidate = root / "monitor" / f"{str(args.stage).lower()}-attempt-{index:03d}"
+                while candidate.exists():
+                    index += 1
+                    candidate = root / "monitor" / f"{str(args.stage).lower()}-attempt-{index:03d}"
+                monitor_root = candidate
+            monitor = ResourceMonitor(monitor_root, gpu_sampler=_strict_gpu_sampler(samplers["gpu"], 0),
+                                     ram_sampler=samplers["ram"], disk_sampler=samplers["disk"])
+            monitor._task7_strict_gpu_sampler = True
             monitor.start()
         if not callable(getattr(monitor, "check", None)):
             raise BlockedExecution("live stages require Task 6 ResourceMonitor")
@@ -1512,6 +1789,26 @@ def _run_live(args: argparse.Namespace, root: Path, *, factory: Any | None, moni
         official = getattr(adapter, "runtime", None)
         if official is None:
             raise BlockedExecution("factory result lacks underlying OfficialPrecisionRuntime")
+        if all(getattr(args, key, None) for key in ("action", "video", "task5_root", "checkpoint", "vae", "framework_root")):
+            try:
+                from .umi_task6_operational import (extract_task5_directions, observe_live_launch,
+                    validate_launch_contract, verify_pinned_bridge_assets)
+            except ImportError:
+                from umi_task6_operational import (extract_task5_directions, observe_live_launch,
+                    validate_launch_contract, verify_pinned_bridge_assets)
+            live_assets = verify_pinned_bridge_assets(args.action, args.video,
+                expected_hashes=contract.get("bridge_asset_hashes"))
+            task5 = extract_task5_directions(args.task5_root,
+                expected_manifest_sha256=contract.get("task5", {}).get("manifest_sha256"),
+                expected_plan_sha256=contract.get("task5", {}).get("plan_sha256"),
+                expected_direction_file_hashes=contract.get("task5", {}).get("direction_file_sha256"),
+                expected_direction_hashes=contract.get("task5", {}).get("direction_sha256"))
+            observed_launch = observe_live_launch(contract, runtime=official, inputs=inputs,
+                assets=live_assets, task5=task5, checkpoint=args.checkpoint, vae=args.vae,
+                framework_root=args.framework_root)
+            validate_launch_contract(contract, observed=observed_launch)
+            source["observed_launch"] = observed_launch
+            _atomic_json(root / "launch_observed.json", observed_launch)
         source_z0, _ = _source_condition(source, "baseline_pre")
         source_mask = _load_array(_source_sample_root(Path(source["raw_root"]), "baseline_pre") / "mask.npy").astype(bool, copy=False)
         source_v0 = _load_array(_source_sample_root(Path(source["raw_root"]), "v0_alpha_00_plus") / "direction.npy").astype(np.float32, copy=False)
@@ -1528,13 +1825,22 @@ def _run_live(args: argparse.Namespace, root: Path, *, factory: Any | None, moni
                                    condition_indexes=inputs.geometry.condition_indexes, v0=source_v0, seed=0)
         source.update({"z0": _array_hash(source_z0), "mask": _array_hash(source_mask), "v0": _array_hash(source_v0)})
         if args.stage == "smoke":
+            _reset_sample_peak_memory()
             pre = _monitor_capture(monitor, sample_id="smoke_baseline", phase="pre_call", remaining=1, run_dir=root)
             require_resource_snapshot(_monitor_peak_snapshot(monitor, pre), phase="smoke")
             _, consumed = _source_condition(source, "baseline_pre")
-            record = feedback.step(feedback.extract_condition(consumed), 0)
+            try:
+                record = feedback.step(feedback.extract_condition(consumed), 0)
+            except BaseException:
+                raise
             expected = _load_array(_source_sample_root(Path(source["raw_root"]), "baseline_pre") / "output_full.npy")
-            if record.get("full_latent") is None or not np.array_equal(np.asarray(record["full_latent"]), expected):
-                raise ResumeMismatch("smoke first-G output differs from historical baseline output_full")
+            try:
+                if record.get("full_latent") is None or not np.array_equal(np.asarray(record["full_latent"]), expected):
+                    raise ResumeMismatch("smoke first-G output differs from historical baseline output_full")
+            except BaseException as error:
+                error.capture = dict(getattr(error, "capture", {}))
+                error.capture.setdefault("operation_counts", _capture_counts(record))
+                raise
             post = _monitor_capture(monitor, sample_id="smoke_baseline", phase="post_call", remaining=0, run_dir=root)
             post_snapshot = _monitor_peak_snapshot(monitor, post)
             require_resource_snapshot(post_snapshot, phase="smoke")
@@ -1543,15 +1849,31 @@ def _run_live(args: argparse.Namespace, root: Path, *, factory: Any | None, moni
             if post_snapshot.get("gpu_peak_nvml_used_gib") is not None and float(post_snapshot["gpu_peak_nvml_used_gib"]) > 45:
                 raise ResourceStop("GPU_SMOKE_PEAK_USED_HIGH: accumulated NVML peak exceeds 45 GiB")
             size = _capture_counts(record)
-            cleanup = _monitor_capture(monitor, sample_id="smoke_baseline", phase="post_cleanup", remaining=0, run_dir=root)
-            if cleanup.get("decision_status") == "HARD_STOP":
-                raise ResourceStop("MONITOR_CLEANUP_STOP: cleanup capture stopped")
-            store = Task7SampleStore(root / "smoke" / "samples")
-            store.write_success("smoke_baseline", {"record": record, "engineering": True, "resource_pre": pre, "resource_post": post,
-                                                      "resource_cleanup": cleanup, "peak_snapshot": post_snapshot}, operation_counts=size)
+            try:
+                store = Task7SampleStore(root / "smoke" / "samples")
+                smoke_staged = store.stage_success("smoke_baseline", {"record": record, "engineering": True, "resource_pre": pre,
+                    "resource_post": post, "resource_cleanup": {}, "peak_snapshot": post_snapshot}, operation_counts=size)
+                del record
+                _release_sample_memory()
+                cleanup = _monitor_capture(monitor, sample_id="smoke_baseline", phase="post_cleanup", remaining=0, run_dir=root)
+                if cleanup.get("decision_status") == "HARD_STOP":
+                    raise ResourceStop("MONITOR_CLEANUP_STOP: cleanup capture stopped")
+                store.finalize_staged(smoke_staged, record_updates={"resource_cleanup": cleanup})
+                smoke_staged = None
+            except BaseException as error:
+                error.capture = {"operation_counts": size, "stage_boundary": "smoke_publication"}
+                raise
             _atomic_json(root / "smoke" / "run_status.json", {"status": "SMOKE_COMPLETE", "engineering": True,
                 "formal_counts": _empty_counts(), "observed_counts": size, "resource_pre": pre, "resource_post": post,
-                "resource_cleanup": cleanup, "peak_snapshot": post_snapshot})
+                "resource_cleanup": cleanup, "peak_snapshot": post_snapshot,
+                "binding": {"source": source.get("source_tree_sha256"),
+                            "task7_code_sha256": source.get("task7_code_sha256"),
+                            "launch_contract_sha256": (sha256_file(args.launch_contract)
+                                if args.launch_contract and Path(args.launch_contract).is_file() else None),
+                            "config": {"stage": "smoke"},
+                            "model": contract.get("checkpoint_identity", {}).get("sha256", ""),
+                            "vae": contract.get("vae_sha256", ""),
+                            "framework": contract.get("framework_commit", "")}})
             result_code = 0
         else:
             if args.stage == "C":
@@ -1563,11 +1885,24 @@ def _run_live(args: argparse.Namespace, root: Path, *, factory: Any | None, moni
                        "v0": source["v0"], "noise_policy": "prediction-region-seed-paired"}
             executor = make_stage_executor(args.stage, source=source, feedback=feedback, run_dir=root)
             result = run_stage(args.stage, root / "stages" / args.stage, execute=executor, binding=binding,
-                               resume=args.resume, monitor=monitor, allowed_skips=args.stage == "C")
+                               resume=args.resume, monitor=monitor, allowed_skips=args.stage == "C",
+                               cleanup_sample=_release_sample_memory, reset_sample_peak=_reset_sample_peak_memory)
             result_code = 0 if result.get("status") == "COMPLETE" else 1
+            if result_code:
+                terminal = ResourceStop(result.get("reason", result.get("status", "formal stage failed"))) \
+                    if result.get("status") == "RESOURCE_STOP" else RuntimeError(result.get("reason", "formal stage failed"))
+                _record_live_failure(root, terminal,
+                                     generation_started=bool((result.get("attempt_counts") or {}).get("G", 0)),
+                                     binding=binding, source=source, monitor=monitor)
     except BaseException as error:
         primary = error
-        _record_live_failure(root, error, generation_started=factory is not None)
+        if smoke_staged is not None:
+            try:
+                Task7SampleStore(root / "smoke" / "samples").abort_staged(smoke_staged)
+            except BaseException as staged_error:
+                primary.add_note("smoke staged publication cleanup failed: " + repr(staged_error))
+        _record_live_failure(root, error, generation_started=bool(_error_counts(error).get("G", 0)),
+                             binding=binding, source=source, monitor=monitor)
     finally:
         cleanup_errors: list[BaseException] = []
         if callable(getattr(factory, "unload", None)):
@@ -1583,7 +1918,11 @@ def _run_live(args: argparse.Namespace, root: Path, *, factory: Any | None, moni
         if cleanup_errors:
             cleanup = RuntimeError("Task 7 cleanup failed")
             for error in cleanup_errors: cleanup.add_note(repr(error))
-            _record_live_failure(root, cleanup, generation_started=factory is not None)
+            _record_live_failure(root, primary or cleanup,
+                                 generation_started=bool(_error_counts(primary or cleanup).get("G", 0)),
+                                 binding=binding, source=source, monitor=monitor,
+                                 cleanup_errors=cleanup_errors)
+            _mark_stage_cleanup_failure(root, args.stage, cleanup_errors)
             if primary is None: primary = cleanup
             else:
                 for error in cleanup_errors: primary.add_note("cleanup failed: " + repr(error))
@@ -1596,11 +1935,12 @@ def main(argv: list[str] | None = None, *, factory: Any | None = None,
          monitor: Any | None = None) -> int:
     args = parse_args(argv)
     if args.stage == "preflight":
-        return _legacy_main(argv, factory=factory, monitor=monitor)
+        return _preflight_main(argv)
     if not args.run_dir:
         raise BlockedExecution("--run-dir is required for smoke/A/B/C")
     root = Path(args.run_dir).resolve()
     validate_run_roots(root, raw_root=args.raw_root, decoder_root=args.decoder_root)
+    root.mkdir(parents=True, exist_ok=True)
     with ProcessLock(root / ".runner.lock"):
         return _run_live(args, root, factory=factory, monitor=monitor)
 

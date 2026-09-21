@@ -1,5 +1,7 @@
 import json
+import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 from contextlib import ExitStack
@@ -19,6 +21,11 @@ def _safe_snapshot():
             "cgroup_memory_free_gib": None}
 
 
+def _a_record():
+    return {"encoded_condition": np.zeros((1,), dtype=np.float32), "encoder": {"fixture": True},
+            "evidence": {"operation_counts": {"G": 0, "D": 0, "E": 1}}}
+
+
 class StaticTestMonitor:
     def __init__(self):
         self.last_resources = _safe_snapshot()
@@ -34,6 +41,234 @@ class StaticTestMonitor:
 
 
 class Task7RunnerTests(unittest.TestCase):
+    def _real_monitor(self, root):
+        gpu = {"gpu_used_gib": 0.0, "gpu_free_gib": 100.0, "gpu_reserved_gib": 1.0,
+               "gpu_allocated_gib": 1.0, "gpu_peak_allocated_gib": 2.0,
+               "gpu_peak_reserved_gib": 3.0, "gpu_peak_nvml_used_gib": 4.0}
+        ram = {"ram_available_gib": 500.0, "rss_gib": 1.0, "swap_used_gib": 0.0}
+        disk = {"disk_free_gib": 100.0, "cgroup_memory_limited": False,
+                "cgroup_memory_limit_gib": None, "cgroup_memory_current_gib": None,
+                "cgroup_memory_free_gib": None}
+        return runner.ResourceMonitor(root, gpu_sampler=lambda: dict(gpu),
+                                      ram_sampler=lambda: dict(ram), disk_sampler=lambda: dict(disk),
+                                      sleep=lambda seconds: time.sleep(min(seconds, 0.001)))
+
+    def test_real_resource_monitor_uses_smoke_forecast_and_publishes_after_cleanup(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp); run = base / "run"; stage = run / "stages" / "A"
+            smoke = runner.Task7SampleStore(run / "smoke" / "samples")
+            smoke.write_success("smoke_baseline", {"record": _a_record()},
+                                operation_counts={"G": 1, "D": 1, "E": 1})
+            monitor = self._real_monitor(base / "monitor"); monitor.start()
+            events = []
+            try:
+                result = runner.run_stage("A", stage, execute=lambda spec: _a_record(),
+                                          binding=runner.test_binding("A"), monitor=monitor,
+                                          cleanup_sample=lambda: events.append("release") or {"released": True},
+                                          reset_sample_peak=lambda: events.append("peak_reset"))
+            finally:
+                monitor.stop()
+            self.assertEqual(result["status"], "COMPLETE")
+            self.assertEqual(result["completed_count"], 16)
+            self.assertEqual(events[0], "peak_reset")
+            self.assertIn("release", events)
+            phases = [row["phase"] for row in monitor._sample_rows]
+            self.assertEqual(phases[:3], ["pre_call", "post_call", "post_cleanup"])
+            self.assertTrue((stage / "samples" / "A_baseline_pre_native" / "status.json").is_file())
+
+    def test_strict_gpu_sampler_fails_closed_and_preserves_reserved_peak(self):
+        class Cuda:
+            @staticmethod
+            def is_available(): return True
+            @staticmethod
+            def memory_allocated(_): return 2 * 2**30
+            @staticmethod
+            def memory_reserved(_): return 3 * 2**30
+            @staticmethod
+            def max_memory_allocated(_): return 4 * 2**30
+            @staticmethod
+            def max_memory_reserved(_): return 5 * 2**30
+        torch = type("Torch", (), {"cuda": Cuda})
+        with mock.patch.dict(sys.modules, {"torch": torch}):
+            sample = runner._strict_gpu_sampler(lambda: {"gpu_used_gib": 1.0}, 0)()
+            self.assertEqual(sample["gpu_peak_reserved_gib"], 5.0)
+            self.assertEqual(sample["gpu_reserved_gib"], 3.0)
+        class BrokenCuda:
+            @staticmethod
+            def is_available(): return True
+            @staticmethod
+            def memory_allocated(_): raise RuntimeError("late torch failure")
+        broken = type("Torch", (), {"cuda": BrokenCuda})
+        with mock.patch.dict(sys.modules, {"torch": broken}):
+            failed = runner._strict_gpu_sampler(lambda: {"gpu_used_gib": 1.0}, 0)()
+            self.assertIn("monitor_failure", failed)
+
+    def test_reset_peak_calls_torch_reset_for_each_sample(self):
+        calls = []
+        class Cuda:
+            @staticmethod
+            def is_available(): return True
+            @staticmethod
+            def reset_peak_memory_stats(index): calls.append(index)
+        torch = type("Torch", (), {"cuda": Cuda})
+        with mock.patch.dict(sys.modules, {"torch": torch}):
+            runner._reset_sample_peak_memory()
+        self.assertEqual(calls, [0])
+
+    def _a_executor_fixture(self, output):
+        root = Path(tempfile.mkdtemp()); decoder = root / "decoder"
+        sample = decoder / "bridge_0__seed_0__baseline_pre__temporary_fp32"
+        sample.mkdir(parents=True)
+        np.save(sample / "decoded_final_float32.npy", np.zeros((3, 2, 2), dtype=np.float32))
+        np.save(sample / "direct_condition_latent_float32.npy", np.zeros((1, 1, 1, 1, 2), dtype=np.float32))
+        class Encoder:
+            def encode(self, frame, precision="native"):
+                return {"arrays": {"actual_output": output}, "evidence": {"operation_count": 1}}
+        return root, runner.make_stage_executor("A", source={"decoder_root": str(decoder)},
+                                                feedback=type("Feedback", (), {"encoder": Encoder()})())
+
+    def test_a_encoder_exception_preserves_actual_e_count(self):
+        with tempfile.TemporaryDirectory() as temp:
+            class Encoder:
+                def encode(self, frame, precision="native"):
+                    error = RuntimeError("encoder failed")
+                    error.capture = {"operation_counts": {"G": 0, "D": 0, "E": 1}}
+                    raise error
+            root = Path(temp); decoder = root / "decoder"
+            sample = decoder / "bridge_0__seed_0__baseline_pre__temporary_fp32"; sample.mkdir(parents=True)
+            np.save(sample / "decoded_final_float32.npy", np.zeros((3, 2, 2), dtype=np.float32))
+            executor = runner.make_stage_executor("A", source={"decoder_root": str(decoder)},
+                                                    feedback=type("Feedback", (), {"encoder": Encoder()})())
+            result = runner.run_stage("A", root / "stage", execute=executor,
+                                      binding=runner.test_binding("A"), monitor=runner.StaticMonitor(_safe_snapshot()))
+            self.assertEqual(result["status"], "FAILED")
+            self.assertEqual(result["attempt_counts"], {"G": 0, "D": 0, "E": 1})
+
+    def test_a_post_encode_shape_failure_preserves_encoder_count(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, executor = self._a_executor_fixture(np.zeros((1, 1, 1, 1, 3), dtype=np.float32))
+            result = runner.run_stage("A", root / "stage", execute=executor,
+                                      binding=runner.test_binding("A"), monitor=runner.StaticMonitor(_safe_snapshot()))
+            self.assertEqual(result["status"], "FAILED")
+            self.assertEqual(result["attempt_counts"], {"G": 0, "D": 0, "E": 1})
+
+    def test_smoke_stop_cleanup_failure_marks_root_terminal(self):
+        class Monitor(StaticTestMonitor):
+            def stop(self):
+                self.stopped = True
+                raise RuntimeError("monitor stop failed")
+        root, factory, monitor, patches = self._main_fixture(monitor=Monitor())
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(runner, "_code_digest", return_value="code"))
+            for patch in patches: stack.enter_context(patch)
+            with self.assertRaises(RuntimeError):
+                runner.main(["--stage", "smoke", "--run-dir", str(root), "--raw-root", str(root.parent / "source"),
+                             "--decoder-root", str(root.parent / "source"), "--launch-contract", str(root / "contract")],
+                            factory=factory, monitor=monitor)
+        root_status = json.loads((root / "run_status.json").read_text(encoding="utf-8"))
+        self.assertEqual(root_status["status"], "FAILED")
+        self.assertEqual(root_status["reason_code"], "RuntimeError")
+
+    def test_c_baseline_encoded_z2_mismatch_is_counted_and_rejected(self):
+        z1 = np.zeros((1, 1, 1, 1, 2), dtype=np.float32)
+        z2 = np.ones_like(z1)
+        mask = np.ones_like(z1, dtype=bool)
+        class Feedback:
+            def __init__(self): self.mask = mask
+            def extract_condition(self, value): return np.asarray(value).copy()
+            def step(self, condition, step):
+                return {"encoded_condition": np.full_like(z1, 2.0),
+                        "evidence": {"operation_counts": {"G": 1, "D": 1, "E": 1},
+                                     "prediction_noise_hash": "seed1"}}
+        source = {"analysis_gate": {"a_scientific_pass": True, "b_engineering_pass": True,
+                                     "b_repeatability_pass": True, "source_sha256": "s", "code_sha256": "c"},
+                  "source_tree_sha256": "s", "task7_code_sha256": "c", "z1": z1,
+                  "b_z2": z2, "b_seed1_noise_hash": "seed1", "delta1_directions": {}}
+        executor = runner.make_stage_executor("C", source=source, feedback=Feedback())
+        spec = next(item for item in runner.build_stage_plan("C") if item["kind"] == "baseline_pre")
+        with self.assertRaises(runner.ResumeMismatch) as caught:
+            executor(spec)
+        self.assertEqual(caught.exception.capture["operation_counts"], {"G": 1, "D": 1, "E": 1})
+
+    def test_c_skip_records_resume_as_skipped_not_completed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            def execute(spec):
+                if spec["kind"] == "perturbation":
+                    raise runner.SkipSample("SKIPPED_C_ZERO_RAY", "zero ray")
+                return {"full_latent": np.zeros((1,), dtype=np.float32),
+                        "predicted_latent": np.zeros((1,), dtype=np.float32),
+                        "encoded_condition": np.zeros((1,), dtype=np.float32),
+                        "condition_input_fp32": np.zeros((1,), dtype=np.float32),
+                        "actual": {key: np.zeros((1,), dtype=np.float32) for key in
+                                    ("prepared_condition", "initial_condition", "reference_condition", "first_condition", "last_condition")}
+                                  | {"condition_steps": np.zeros((30, 1), dtype=np.float32)},
+                        "evidence": {"operation_counts": {"G": 1, "D": 1, "E": 1}}}
+            stage = Path(temp) / "stage"
+            first = runner.run_stage("C", stage, execute=execute, binding=runner.test_binding("C"),
+                                     monitor=runner.StaticMonitor(_safe_snapshot()), allowed_skips=True)
+            second = runner.run_stage("C", stage, execute=execute, binding=runner.test_binding("C"),
+                                      monitor=runner.StaticMonitor(_safe_snapshot()), allowed_skips=True, resume=True)
+            self.assertEqual(first["status"], "COMPLETE")
+            self.assertEqual(first["skipped_count"], 36)
+            self.assertEqual(second["skipped_count"], 36)
+            self.assertEqual(second["completed_count"], 2)
+
+    def test_resume_complete_rejects_source_or_code_identity_change_before_load(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); contract = root / "contract.json"
+            contract.write_text(json.dumps({"code_bundle_sha256": "c" * 64}), encoding="utf-8")
+            runner.Task7SampleStore(root / "smoke" / "samples").write_success(
+                "smoke_baseline", {"record": _a_record()}, operation_counts={"G": 1, "D": 1, "E": 1})
+            status = {"status": "SMOKE_COMPLETE", "engineering": True,
+                      "formal_counts": {"G": 0, "D": 0, "E": 0},
+                      "observed_counts": {"G": 1, "D": 1, "E": 1},
+                      "binding": {"source_tree_sha256": "old-source", "task7_code_sha256": "old-code",
+                                  "launch_contract_sha256": runner.sha256_file(contract), "config": {"stage": "smoke"}}}
+            (root / "smoke").mkdir(exist_ok=True)
+            (root / "smoke" / "run_status.json").write_text(json.dumps(status), encoding="utf-8")
+            args = runner.parse_args(["--stage", "smoke", "--run-dir", str(root), "--resume",
+                                      "--raw-root", str(root / "raw"), "--decoder-root", str(root / "decoder"),
+                                      "--launch-contract", str(contract)])
+            with mock.patch.object(runner, "validate_task7_sources", return_value={"source_tree_sha256": "new-source"}), \
+                 mock.patch.object(runner, "_code_digest", return_value="new-code"):
+                with self.assertRaises(runner.ResumeMismatch):
+                    runner._precheck_resume(root, args)
+
+    def test_smoke_complete_is_not_reused_after_root_cleanup_failure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); smoke = root / "smoke"
+            runner.Task7SampleStore(smoke / "samples").write_success(
+                "smoke_baseline", {"record": _a_record()}, operation_counts={"G": 1, "D": 1, "E": 1})
+            (smoke / "run_status.json").write_text(json.dumps({"status": "SMOKE_COMPLETE"}), encoding="utf-8")
+            (root / "run_status.json").write_text(json.dumps({"status": "FAILED", "reason_code": "CLEANUP_FAILURE"}), encoding="utf-8")
+            args = runner.parse_args(["--stage", "smoke", "--run-dir", str(root), "--resume"])
+            with self.assertRaises(runner.ResumeMismatch):
+                runner._precheck_resume(root, args)
+
+    def test_owned_monitor_paths_are_stage_scoped_and_not_reused(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "run"; root.mkdir(); created = []
+            class FakeMonitor:
+                def __init__(self, monitor_root, **kwargs):
+                    created.append(Path(monitor_root)); Path(monitor_root).mkdir(parents=True, exist_ok=True)
+                    self.last_resources = _safe_snapshot()
+                def start(self): return self
+                def check(self, **kwargs): return {"status": "HARD_STOP", "reason_code": "TEST_STOP"}
+                def stop(self): pass
+            args_base = ["--run-dir", str(root), "--raw-root", str(root.parent / "raw"),
+                         "--decoder-root", str(root.parent / "decoder"), "--launch-contract", str(root / "contract")]
+            with mock.patch.object(runner, "validate_task7_sources", return_value={"source_tree_sha256": "s"}), \
+                 mock.patch.object(runner, "_load_contract", return_value={"code_bundle_sha256": "c" * 64}), \
+                 mock.patch.object(runner, "_code_digest", return_value="code"), \
+                 mock.patch.object(runner, "ResourceMonitor", FakeMonitor):
+                for stage in ("A", "B", "A"):
+                    with self.assertRaises(runner.ResourceStop):
+                        runner.main(["--stage", stage, *args_base])
+            self.assertEqual(created[0], root / "monitor" / "a")
+            self.assertEqual(created[1], root / "monitor" / "b")
+            self.assertEqual(created[2], root / "monitor" / "a-attempt-001")
+            self.assertEqual(len(set(created)), 3)
+
     def test_cli_exposes_all_task7_bindings(self):
         args = runner.parse_args([
             "--stage", "A", "--run-dir", "run", "--resume", "--raw-root", "raw",
@@ -113,7 +348,7 @@ class Task7RunnerTests(unittest.TestCase):
                     error = KeyboardInterrupt("operator stop")
                     error.capture = {"operation_counts": {"G": 1, "D": 0, "E": 0}}
                     raise error
-                return {"evidence": {"operation_counts": {"G": 0, "D": 0, "E": 1}}}
+                return _a_record()
             interrupted = runner.run_stage("A", temp, execute=execute,
                                            binding=runner.test_binding("A"),
                                            monitor=runner.StaticMonitor(_safe_snapshot()))
@@ -140,7 +375,7 @@ class Task7RunnerTests(unittest.TestCase):
                         return {"decision_status": "HARD_STOP", "reason_code": "POST_GATE"}
                     return {"decision_status": "OK"}
             result = runner.run_stage("A", temp,
-                execute=lambda spec: {"evidence": {"operation_counts": {"G": 0, "D": 0, "E": 1}}},
+                execute=lambda spec: _a_record(),
                 binding=runner.test_binding("A"), monitor=Monitor())
             self.assertEqual(result["status"], "RESOURCE_STOP")
             self.assertEqual(result["attempt_counts"], {"G": 0, "D": 0, "E": 1})
@@ -327,19 +562,29 @@ class Task7RunnerTests(unittest.TestCase):
             source_root = root / "source"; source_root.mkdir()
             condition0 = np.zeros((1, 1, 1, 1, 2), dtype=np.float32)
             condition1 = np.full_like(condition0, 2.0)
-            full = np.zeros((1, 1, 1, 1, 2), dtype=np.float32)
-            mask = np.ones_like(full, dtype=bool)
+            # Approved FeedbackRuntime schema: conditions are extracted from a
+            # full carrier, and ``actual`` stores full carriers.  Keep the
+            # temporal axis distinct so a condition-only mock cannot pass.
+            full = np.zeros((1, 1, 3, 1, 2), dtype=np.float32)
+            mask = np.zeros_like(full, dtype=bool)
+            mask[:, :, 0, :, :] = True
             source = {"raw_root": str(source_root), "decoder_root": str(source_root)}
             class Feedback:
-                def __init__(self): self.seen = []
-                def extract_condition(self, value): return np.asarray(value).copy()
+                def __init__(self): self.seen = []; self.mask = mask
+                def extract_condition(self, value): return np.asarray(value)[:, :, :1, :, :].copy()
+                def embed_condition(self, value):
+                    carrier = np.zeros_like(full)
+                    carrier[:, :, :1, :, :] = np.asarray(value)
+                    return carrier
                 def step(self, condition, step):
                     condition = np.asarray(condition).copy(); self.seen.append(condition)
                     encoded = condition1.copy()
+                    carrier = self.embed_condition(condition)
                     return {"full_latent": full.copy(), "encoded_condition": encoded,
                             "next_condition_fp32": encoded.copy(),
-                            "actual": {key: condition.copy() for key in ("prepared_condition", "initial_condition", "reference_condition", "first_condition", "last_condition")}
-                                      | {"condition_steps": np.repeat(condition[None], 30, axis=0)},
+                            "condition_input_fp32": condition.copy(),
+                            "actual": {key: carrier.copy() for key in ("prepared_condition", "initial_condition", "reference_condition", "first_condition", "last_condition")}
+                                      | {"condition_steps": np.repeat(carrier[None], 30, axis=0)},
                             "evidence": {"operation_counts": {"G": 1, "D": 1, "E": 1},
                                          "prediction_noise_hash": f"noise-{step}"}}
             feedback = Feedback()
@@ -376,13 +621,15 @@ class Task7RunnerTests(unittest.TestCase):
                 store.write_success(spec0["sample_id"], {"spec": spec0, "record": record0}, operation_counts={"G": 1, "D": 1, "E": 1})
             spec1 = next(item for item in runner.build_stage_plan("B") if item["sample_id"] == "B_baseline_pre_step_1")
             store.write_success(spec1["sample_id"], {"spec": spec1, "record": {"full_latent": z2,
+                "encoded_condition": np.full(shape, 3.0, dtype=np.float32),
                 "evidence": {"prediction_noise_hash": "seed1"}}}, operation_counts={"G": 1, "D": 1, "E": 1})
             (root / "analysis_gate.json").write_text(json.dumps({"a_scientific_pass": True, "b_engineering_pass": True,
                 "b_repeatability_pass": True, "source_sha256": "source", "code_sha256": "code"}), encoding="utf-8")
             source = {"source_tree_sha256": "source", "task7_code_sha256": "code"}
             runner._prepare_c_source(source, root)
             np.testing.assert_array_equal(source["z1"], z1)
-            np.testing.assert_array_equal(source["b_z2"], z2)
+            np.testing.assert_array_equal(source["b_z2"], np.full(shape, 3.0, dtype=np.float32))
+            np.testing.assert_array_equal(source["b_z2_full"], z2)
             np.testing.assert_array_equal(source["delta1_directions"]["delta1_00"], np.full(shape, len("v0_alpha_00_plus"), dtype=np.float32))
 
     def test_success_record_references_must_be_manifest_bound(self):

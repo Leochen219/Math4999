@@ -72,13 +72,18 @@ sample. There is no deletion or retry path after an OOM or monitor failure.
 
 Live orchestration now takes a run-wide lock before preload, pins the launch to
 GPU 0 with `HF_HUB_OFFLINE=1`, and keeps factory unload plus monitor stop in a
-single cleanup path.  Formal samples persist synchronous `pre_call`,
+single cleanup path. After factory construction, the approved
+`observe_live_launch`/`validate_launch_contract` path is run and its evidence is
+persisted before the first G call. Formal samples persist synchronous `pre_call`,
 `post_call`, and `post_cleanup` monitor captures when the production monitor is
-used; accumulated allocated/reserved/NVML peaks are derived from monitor rows,
+used; Python/Torch sample state is released and peak stats are reset between
+samples; accumulated allocated/reserved/NVML peaks are derived from monitor rows,
 and ambiguous post-load all-zero Torch allocation telemetry is a hard stop.
 Smoke requires historical first-G latent parity, a complete post-call resource
 gate, the 35/45 GiB accumulated peak limits, measured artifact publication,
-and final cleanup capture before `SMOKE_COMPLETE` is written.
+and final cleanup capture before `SMOKE_COMPLETE` is written. Owned monitor
+telemetry is stored under stage/attempt-specific directories so later stages or
+resumes do not overwrite earlier evidence.
 
 ## Verification
 
@@ -87,20 +92,24 @@ Using the required bundled NumPy interpreter:
 ```text
 python -m py_compile run_umi_task7_experiment.py
 python -m unittest test_run_umi_task7_experiment
-Ran 21 tests in 0.606s; OK
+Ran 32 tests in 2.199s; OK
 python -m unittest test_run_umi_task7_experiment test_umi_task7_runtime \
     test_umi_task7_encoder test_umi_task7_official_deferred
-Ran 34 tests in 0.652s; OK (skipped=2)
+Ran 45 tests in 2.271s; OK (skipped=2)
 ```
 
-The dependency aggregate is 34 tests with 2 existing optional real-Torch skips
+The dependency aggregate is 45 tests with 2 existing optional real-Torch skips
 (`test_run_umi_task7_experiment test_umi_task7_runtime test_umi_task7_encoder
 test_umi_task7_official_deferred`). No model, GPU, download, environment
 installation, or remote mutation was performed. Focused runner tests cover
 CLI bindings, exact plans/counts, strict resource failures, protected-root
 containment, source-contract historical action hashing, atomic artifact
-references, interrupted resume accounting, all-16 A orchestration, B own-step
-resume, and all-38 C ray/probe inputs.
+references, interrupted resume accounting, all-16 A orchestration, A encoder
+and post-parity failure counts, B own-step resume, approved full-carrier
+feedback evidence, all-38 C ray/probe inputs, C skip resume accounting, real
+Task-6 `ResourceMonitor` fake samplers, strict Torch telemetry/peak reset,
+stage-scoped monitor paths, smoke cleanup failure status, and resume identity
+guards.
 
 The independent analyzer remains responsible for scientific A/B/C decisions;
 the runner only consumes an explicitly bound C gate.
