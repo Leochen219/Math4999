@@ -2,10 +2,15 @@
 from __future__ import annotations
 
 import unittest
+import json
+import tempfile
+from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
 import analyze_umi_task7 as api
+import run_umi_task7_experiment as runner
 
 
 class Task7NumericalTests(unittest.TestCase):
@@ -302,6 +307,99 @@ class Task7NumericalTests(unittest.TestCase):
             api.rms64(np.array([np.nan], np.float32))
         with self.assertRaises(api.EngineeringDataError):
             api.rms64(np.ones(2, np.float32), mask=np.array([False, False]))
+
+
+class Task7SavedEvidenceAOnlyTests(unittest.TestCase):
+    """Synthetic runner-schema evidence is never presented as model output."""
+
+    @staticmethod
+    def _source_fixture():
+        names = ("baseline_pre", "v0_alpha_00_plus", "v0_alpha_00_minus",
+                 "v0_alpha_01_plus", "v0_alpha_01_minus", "v0_alpha_02_plus",
+                 "v0_alpha_02_minus", "baseline_post")
+        direction = np.array([np.sqrt(2.0), 0.0], dtype=np.float32)
+        baseline = np.array([1.0, -1.0], dtype=np.float32)
+        rows = {}
+        for name in names:
+            is_baseline = name.startswith("baseline")
+            alpha = 0.0 if is_baseline else (0.001 if "00" in name else (0.003 if "01" in name else 0.01))
+            sign = 0 if is_baseline else (1 if name.endswith("plus") else -1)
+            delta = np.zeros(2, dtype=np.float32) if is_baseline else (np.float32(sign * alpha) * direction)
+            rows[name] = {"name": name, "direct": baseline.copy(), "delta_condition": delta,
+                          "consumed_condition": (baseline + delta).astype(np.float32),
+                          "z0_condition": baseline.copy(), "condition_mask": np.ones(2, bool),
+                          "mask": np.ones(2, bool), "raw": Path("raw"), "decoder": Path("decoder")}
+        rows["baseline_post"]["direct"] = (baseline + np.float32(1e-7)).astype(np.float32)
+        return {"raw_root": "raw", "decoder_root": "decoder", "source_tree_sha256": "fixture-source",
+                "z0_sha256": "z0", "mask_sha256": "mask", "v0_sha256": "v0", "rows": rows,
+                "v0_condition": direction, "z0_condition": baseline,
+                "condition_mask": np.ones(2, bool), "mask": np.ones(2, bool)}
+
+    @staticmethod
+    def _write_a_stage(run: Path, source, *, native_parity=True):
+        stage = run / "stages" / "A"; store = runner.Task7SampleStore(stage / "samples")
+        plan = runner.build_stage_plan("A")
+        baseline = np.array([1.0, -1.0], dtype=np.float32)
+        for spec in plan:
+            name, precision = spec["source_name"], spec["precision"]
+            row = source["rows"][name]
+            if name == "baseline_post":
+                output = (baseline + np.float32(1e-7)).astype(np.float32)
+            elif name.startswith("baseline"):
+                output = baseline.copy()
+            else:
+                output = (baseline + np.float32(2.0) * row["delta_condition"]).astype(np.float32)
+            if native_parity or name != "v0_alpha_00_plus":
+                row["direct"] = output.copy()
+            if precision == "native" and not native_parity and name == "v0_alpha_00_plus":
+                row["direct"] = (output + np.array([1e-4, 0], np.float32)).astype(np.float32)
+            store.write_success(spec["sample_id"], {"spec": spec, "record": {
+                "source_name": name, "precision": precision, "encoded_condition": output,
+                "encoder": {"schema_version": "fixture"},
+                "evidence": {"operation_counts": {"G": 0, "D": 0, "E": 1}}}},
+                operation_counts={"G": 0, "D": 0, "E": 1})
+        binding = {"source": "fixture-source", "task7_code_sha256": "fixture-code", "config": "fixture",
+                   "model": "fixture", "vae": "fixture", "framework": "fixture", "mask": "mask",
+                   "z0": "z0", "v0": "v0", "noise_policy": "fixed-seed-paired"}
+        (stage / "stage_config.json").write_text(json.dumps({"stage": "A", "plan": plan, "binding": binding}), encoding="utf-8")
+        (stage / "run_status.json").write_text(json.dumps({"schema_version": "umi-task7-run-v2", "status": "COMPLETE",
+            "stage": "A", "planned_samples": 16, "completed_samples": [item["sample_id"] for item in plan],
+            "failed_samples": [], "skipped_samples": [], "completed_count": 16, "failed_count": 0,
+            "skipped_count": 0, "formal_counts": {"G": 0, "D": 0, "E": 16}}), encoding="utf-8")
+
+    def test_a_only_complete_flow_uses_nonzero_saved_floor_and_writes_artifacts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "run"; root.mkdir(); source = self._source_fixture(); self._write_a_stage(root, source)
+            with mock.patch.object(api, "_load_source_evidence", return_value=source):
+                result = api.analyze_task7_run(root, stage="A", raw_root="raw", decoder_root="decoder",
+                                               output_dir=Path(temp) / "analysis")
+            self.assertTrue(result["A"]["a_engineering_pass"])
+            self.assertTrue(result["A"]["a_scientific_pass"])
+            self.assertGreater(result["A"]["precision"]["native"]["floor"], 0.0)
+            self.assertTrue((Path(temp) / "analysis" / "a_geometry.csv").is_file())
+            self.assertTrue((Path(temp) / "analysis" / "a_secants.csv").is_file())
+
+    def test_a_native_parity_is_engineering_failure_not_scientific_zero(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "run"; root.mkdir(); source = self._source_fixture(); self._write_a_stage(root, source, native_parity=False)
+            with mock.patch.object(api, "_load_source_evidence", return_value=source):
+                result = api.analyze_task7_run(root, stage="A", raw_root="raw", decoder_root="decoder",
+                                               output_dir=Path(temp) / "analysis")
+            self.assertFalse(result["A"]["a_engineering_pass"])
+            self.assertIn("native output differs", " ".join(result["A"]["engineering_reasons"]))
+
+    def test_a_tampered_artifact_fails_before_science(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "run"; root.mkdir(); source = self._source_fixture(); self._write_a_stage(root, source)
+            sample = root / "stages" / "A" / "samples" / "A_baseline_pre_native"
+            artifact = next(sample.glob("*.npy"))
+            with artifact.open("ab") as stream:
+                stream.write(b"tamper")
+            with mock.patch.object(api, "_load_source_evidence", return_value=source):
+                result = api.analyze_task7_run(root, stage="A", raw_root="raw", decoder_root="decoder",
+                                               output_dir=Path(temp) / "analysis")
+            self.assertFalse(result["A"]["a_engineering_pass"])
+            self.assertEqual(result["A"]["scientific_status"], "NOT_RUN")
 
 
 if __name__ == "__main__":

@@ -1,14 +1,27 @@
-"""Pure NumPy numerical contracts for the Task7 FP32 feedback analysis.
+"""Pure NumPy numerical contracts and offline evidence analysis for Task7.
 
-This module deliberately has no artifact loading, model, filesystem, or CLI
-code.  Task3b consumes these small functions when it adds evidence handling.
+The numerical functions at the top of this module are intentionally small and
+model-free.  The lower-level evidence adapter consumes only the reviewed
+Task7 runner schema; it never loads a model or launches inference.  Runner
+code and this analyzer are separate identities: the analyzer records its own
+source digest and does not pretend to be the frozen live runner.
 Inputs at the feedback interface are condition-carrier arrays and an explicit
 boolean condition mask.  Differences are performed in FP32; scalar
 reductions and fits are performed in FP64.
 """
 from __future__ import annotations
 
+import argparse
+import csv
+import hashlib
+import json
 import math
+import os
+import shutil
+import tempfile
+import zipfile
+from collections.abc import Iterator
+from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
@@ -571,10 +584,1058 @@ def evaluate_fixed_beta_predictions(
     return rows
 
 
+# ---------------------------------------------------------------------------
+# Saved-evidence adapter (Task3b)
+
+ANALYSIS_SCHEMA_VERSION = "umi-task7-analysis-v1"
+ANALYSIS_VERSION = "task7-offline-evidence-v1"
+TASK7_ALPHAS = (0.001, 0.003, 0.01)
+TASK7_BETAS = (0.1, 0.2, 0.4)
+
+
+def _runner_module() -> Any:
+    """Import the released runner without duplicating its artifact schema."""
+    try:
+        from . import run_umi_task7_experiment as module
+    except ImportError:  # direct execution from experiments/
+        import run_umi_task7_experiment as module
+    return module
+
+
+def _json_safe(value: Any) -> Any:
+    """Convert derived values to strict JSON without serializing tensors."""
+    if isinstance(value, np.generic):
+        return _json_safe(value.item())
+    if isinstance(value, np.ndarray):
+        return {"dtype": str(value.dtype), "shape": list(value.shape)}
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        raise EngineeringDataError("non-finite derived value cannot be serialized")
+    return value
+
+
+def _write_json(path: Path, value: Mapping[str, Any]) -> None:
+    path.write_text(json.dumps(_json_safe(value), ensure_ascii=False, sort_keys=True,
+                               indent=2, allow_nan=False) + "\n", encoding="utf-8")
+
+
+def _sha256_file(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _analysis_source_sha256() -> str:
+    """Digest this analyzer only; it is intentionally not the runner digest."""
+    return _sha256_file(Path(__file__).resolve())
+
+
+def _canonical(value: Any) -> str:
+    return json.dumps(_json_safe(value), sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def _strict_bool_mask(value: Any, name: str, shape: tuple[int, ...] | None = None) -> np.ndarray:
+    array = np.asarray(value)
+    if array.dtype != np.dtype(bool):
+        raise EngineeringDataError(f"{name} must have dtype bool, got {array.dtype}")
+    if shape is not None and array.shape != shape:
+        raise EngineeringDataError(f"{name} shape {array.shape} does not match {shape}")
+    if array.size == 0 or not np.any(array):
+        raise EngineeringDataError(f"{name} must select at least one coordinate")
+    return np.ascontiguousarray(array)
+
+
+def _load_runner_array(path: Path, *, name: str, dtype: np.dtype = np.dtype(np.float32)) -> np.ndarray:
+    """Load through the runner helper, which copies and closes mmap handles."""
+    module = _runner_module()
+    try:
+        value = module._load_array(path)
+    except Exception as error:
+        raise EngineeringDataError(f"unable to load {name}: {path}: {error}") from error
+    array = np.asarray(value)
+    if array.dtype != dtype:
+        raise EngineeringDataError(f"{name} must have dtype {dtype}, got {array.dtype}")
+    if array.size == 0 or not np.all(np.isfinite(array)):
+        raise EngineeringDataError(f"{name} must be finite and nonempty")
+    return np.ascontiguousarray(array)
+
+
+def _condition_indexes(mask: np.ndarray) -> tuple[int, ...]:
+    """Return the runner's condition-frame coordinates from the full mask."""
+    if mask.ndim < 4:
+        raise EngineeringDataError("Task7 carrier mask must include temporal and spatial axes")
+    temporal_axis = mask.ndim - 3
+    indexes = tuple(index for index in range(mask.shape[temporal_axis])
+                    if bool(np.all(np.take(mask, index, axis=temporal_axis))))
+    if not indexes:
+        raise EngineeringDataError("authoritative mask contains no complete condition frame")
+    return indexes
+
+
+def _condition_view(value: Any, mask: np.ndarray, *, name: str) -> np.ndarray:
+    array = np.asarray(value)
+    if array.dtype != np.dtype(np.float32):
+        raise EngineeringDataError(f"{name} must have dtype float32, got {array.dtype}")
+    if tuple(array.shape) != tuple(mask.shape):
+        raise EngineeringDataError(f"{name} shape {array.shape} differs from full carrier {mask.shape}")
+    indexes = _condition_indexes(mask)
+    temporal_axis = mask.ndim - 3
+    selected = np.take(array, indexes, axis=temporal_axis)
+    return np.ascontiguousarray(selected)
+
+
+def _array_from_record(record: Mapping[str, Any], key: str, *, dtype: np.dtype = np.dtype(np.float32)) -> np.ndarray:
+    value = record.get(key)
+    if not isinstance(value, np.ndarray):
+        raise EngineeringDataError(f"record is missing tensor evidence: {key}")
+    array = np.asarray(value)
+    if array.dtype != dtype:
+        raise EngineeringDataError(f"record {key} must have dtype {dtype}, got {array.dtype}")
+    if array.size == 0 or not np.all(np.isfinite(array)):
+        raise EngineeringDataError(f"record {key} must be finite and nonempty")
+    return np.ascontiguousarray(array)
+
+
+def _record_payload(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    if not isinstance(payload, Mapping) or not isinstance(payload.get("record"), Mapping):
+        raise EngineeringDataError("Task7 sample payload lacks a runtime record")
+    return payload["record"]
+
+
+class _LazyStageRecords(Mapping[str, Mapping[str, Any]]):
+    """Verified stage index whose large arrays are loaded one sample at a time."""
+
+    def __init__(self, store: Any, sample_ids: Sequence[str], skipped: set[str]):
+        self._store = store
+        self._sample_ids = tuple(sample_ids)
+        self._skipped = set(skipped)
+
+    def __getitem__(self, sample_id: str) -> Mapping[str, Any]:
+        if sample_id not in self._sample_ids:
+            raise KeyError(sample_id)
+        payload = self._store.load_record(sample_id)
+        if sample_id in self._skipped:
+            return payload
+        return _record_payload(payload)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._sample_ids)
+
+    def __len__(self) -> int:
+        return len(self._sample_ids)
+
+    def get(self, sample_id: str, default: Any = None) -> Any:
+        try:
+            return self[sample_id]
+        except KeyError:
+            return default
+
+
+def _baseline_floor(post: Any, pre: Any, *, name: str) -> float:
+    """Compute a floor from the saved baseline pair, never from a caller flag."""
+    post_array = _array_from_record(post, "encoded_condition") if isinstance(post, Mapping) else _float32(post, f"{name} post")
+    pre_array = _array_from_record(pre, "encoded_condition") if isinstance(pre, Mapping) else _float32(pre, f"{name} pre")
+    if post_array.shape != pre_array.shape:
+        raise EngineeringDataError(f"{name} baseline pair shapes differ")
+    return rms64(fp32_difference(post_array, pre_array))
+
+
+def _operation_counts(record: Mapping[str, Any], stage: str) -> dict[str, int]:
+    evidence = record.get("evidence")
+    counts = evidence.get("operation_counts") if isinstance(evidence, Mapping) else None
+    if not isinstance(counts, Mapping):
+        raise EngineeringDataError(f"{stage} record lacks observed operation_counts")
+    result: dict[str, int] = {}
+    for key in ("G", "D", "E"):
+        value = counts.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or int(value) < 0:
+            raise EngineeringDataError(f"{stage} operation count {key} is invalid")
+        result[key] = int(value)
+    return result
+
+
+def _load_source_evidence(raw_root: str | Path, decoder_root: str | Path) -> dict[str, Any]:
+    """Validate immutable Task6 pairs, then load only their approved artifacts."""
+    module = _runner_module()
+    try:
+        source = module.validate_task7_sources(raw_root, decoder_root)
+    except Exception as error:
+        raise EngineeringDataError(f"Task7 source validation failed: {error}") from error
+    rows: dict[str, dict[str, Any]] = {}
+    v0: np.ndarray | None = None
+    z0_view: np.ndarray | None = None
+    mask_view: np.ndarray | None = None
+    for row in source["samples"]:
+        name = str(row["name"])
+        raw = Path(row["raw"]); decoder = Path(row["decoder"])
+        # The runner currently converts mask arrays to bool in its source
+        # validator.  Re-check the stored dtype here: a casted mask cannot be
+        # accepted as byte-exact engineering evidence.
+        raw_mask = _load_runner_array(raw / "mask.npy", name=f"{name} mask", dtype=np.dtype(bool))
+        mask = _strict_bool_mask(raw_mask, f"{name} mask")
+        z0 = _load_runner_array(raw / "z_bar.npy", name=f"{name} z0")
+        consumed = _load_runner_array(raw / "consumed_input_fp32.npy", name=f"{name} consumed input")
+        direction_path = raw / "direction.npy"
+        direction = _load_runner_array(direction_path, name=f"{name} direction") if direction_path.is_file() else None
+        direct = _load_runner_array(decoder / "direct_condition_latent_float32.npy", name=f"{name} direct condition")
+        if z0.shape != mask.shape or consumed.shape != z0.shape:
+            raise EngineeringDataError(f"{name} source carrier/mask shape mismatch")
+        delta = fp32_difference(consumed, z0)
+        if np.any(delta[~mask] != 0.0):
+            raise EngineeringDataError(f"{name} consumed condition changes coordinates outside authoritative mask")
+        if not name.startswith("baseline") and direction is None:
+            raise EngineeringDataError(f"{name} lacks the saved v0 direction artifact")
+        if direction is not None:
+            if direction.shape != z0.shape or np.any(direction[~mask] != 0.0):
+                raise EngineeringDataError(f"{name} direction is not bound to the authoritative mask")
+            if name.startswith("baseline") and np.any(direction != 0.0):
+                raise EngineeringDataError(f"{name} baseline direction is not exactly zero")
+            if not name.startswith("baseline"):
+                if v0 is None:
+                    v0 = direction.copy()
+                elif not byte_equal(direction, v0):
+                    raise EngineeringDataError(f"{name} direction differs bytewise from v0")
+        condition_mask = np.ones_like(_condition_view(z0, mask, name=f"{name} z0"), dtype=bool)
+        row_data = {
+            "name": name, "raw": raw, "decoder": decoder, "direct": direct,
+            # Keep only compact condition-coordinate tensors. Full chunks are
+            # released at the end of this iteration; baseline_pre owns the
+            # authoritative mask view used for later chain checks.
+            "mask": mask if name == "baseline_pre" else None,
+            "z0_condition": _condition_view(z0, mask, name=f"{name} z0"),
+            "consumed_condition": _condition_view(consumed, mask, name=f"{name} consumed"),
+            "condition_mask": condition_mask,
+            "direction_condition": None if direction is None else _condition_view(direction, mask, name=f"{name} direction"),
+            "delta_condition": _condition_view(delta, mask, name=f"{name} delta"),
+        }
+        if z0_view is None:
+            z0_view, mask_view = row_data["z0_condition"], condition_mask
+        elif not byte_equal(row_data["z0_condition"], z0_view):
+            raise EngineeringDataError(f"{name} does not share the immutable z0 condition")
+        rows[name] = row_data
+    if v0 is None:
+        raise EngineeringDataError("Task7 source contains no v0 direction")
+    source["rows"] = rows
+    source["mask"] = next(iter(rows.values()))["mask"] if next(iter(rows.values())).get("mask") is not None else None
+    source["v0"] = v0
+    source["v0_condition"] = _condition_view(v0, next(iter(rows.values()))["mask"], name="v0")
+    source["z0_condition"] = z0_view
+    source["condition_mask"] = mask_view
+    return source
+
+
+def load_task7_stage(run_dir: str | Path, stage: str) -> dict[str, Any]:
+    """Load one complete stage through the runner's verified sample store.
+
+    A partial, failed, skipped, tampered, or count-inconsistent stage is an
+    engineering failure.  In particular, this function never substitutes a
+    missing sample with zeros and never searches for guessed ``.npy`` names.
+    """
+    module = _runner_module()
+    stage_name = str(stage).upper()
+    if stage_name not in {"A", "B", "C"}:
+        raise EngineeringDataError("stage must be A, B, or C")
+    root = Path(run_dir).resolve() / "stages" / stage_name
+    status_path, config_path = root / "run_status.json", root / "stage_config.json"
+    if not status_path.is_file() or not config_path.is_file():
+        raise EngineeringDataError(f"Task7 stage {stage_name} is missing run_status.json or stage_config.json")
+    try:
+        status = module._load_json(status_path)
+        config = module._load_json(config_path)
+        plan = module.build_stage_plan(stage_name)
+        store = module.Task7SampleStore(root / "samples")
+    except Exception as error:
+        raise EngineeringDataError(f"unable to load Task7 stage {stage_name}: {error}") from error
+    if not isinstance(status, Mapping) or status.get("status") != "COMPLETE":
+        raise EngineeringDataError(f"Task7 stage {stage_name} is not COMPLETE (engineering status={status.get('status') if isinstance(status, Mapping) else None})")
+    expected = [str(spec["sample_id"]) for spec in plan]
+    completed, skipped, failed = status.get("completed_samples"), status.get("skipped_samples"), status.get("failed_samples")
+    if not isinstance(completed, list) or not isinstance(skipped, list) or not isinstance(failed, list):
+        raise EngineeringDataError(f"Task7 stage {stage_name} completion lists are malformed")
+    if any(not isinstance(item, str) for item in (*completed, *skipped, *failed)):
+        raise EngineeringDataError(f"Task7 stage {stage_name} completion list contains a non-string id")
+    if (len(completed) != len(set(completed)) or len(skipped) != len(set(skipped))
+            or len(failed) != len(set(failed))):
+        raise EngineeringDataError(f"Task7 stage {stage_name} completion lists contain duplicates")
+    if stage_name != "C" and (set(completed) != set(expected) or skipped or failed):
+        raise EngineeringDataError(f"Task7 stage {stage_name} has incomplete sample IDs")
+    if stage_name == "C" and ((set(completed) | set(skipped)) != set(expected)
+                               or bool(set(completed) & set(skipped)) or bool(failed)):
+        raise EngineeringDataError(f"Task7 stage C has inconsistent sample IDs")
+    try:
+        formal_counts = module.stage_counts(stage_name)
+    except Exception as error:
+        raise EngineeringDataError(f"Task7 stage {stage_name} count schema is unavailable") from error
+    if (status.get("schema_version") != "umi-task7-run-v2"
+            or status.get("planned_samples") != len(expected)
+            or status.get("completed_count") != len(completed)
+            or status.get("failed_count") != len(failed)
+            or status.get("skipped_count") != len(skipped)
+            or status.get("formal_counts") != formal_counts):
+        raise EngineeringDataError(f"Task7 stage {stage_name} run-status counts/schema are inconsistent")
+    records: dict[str, Mapping[str, Any]] = {}
+    for sample_id in expected:
+        try:
+            # _verify checks every manifest-bound artifact and JSON reference
+            # without materializing any .npy payload.  Arrays are loaded by
+            # _LazyStageRecords only when the stage analysis reaches a sample.
+            store._verify(store._path(sample_id))
+            payload_json = module._load_json(store._path(sample_id) / "record.json")
+        except Exception as error:
+            raise EngineeringDataError(f"Task7 sample evidence failed verification: {sample_id}: {error}") from error
+        if sample_id in skipped and payload_json.get("status") != "SKIPPED_C":
+            raise EngineeringDataError(f"Task7 skipped C sample lacks explicit SKIPPED_C evidence: {sample_id}")
+        payload_spec = payload_json.get("spec")
+        spec = next(item for item in plan if item["sample_id"] == sample_id)
+        if _canonical(payload_spec) != _canonical(spec):
+            raise EngineeringDataError(f"Task7 sample spec differs from immutable plan: {sample_id}")
+    lazy_records = _LazyStageRecords(store, expected, set(skipped))
+    return {"run_dir": Path(run_dir).resolve(), "stage_root": root, "status": status,
+            "config": config, "plan": plan, "records": lazy_records}
+
+
+def _record_map(stage_data: Mapping[str, Any]) -> Mapping[str, Mapping[str, Any]]:
+    records = stage_data["records"]
+    if not isinstance(records, Mapping):
+        raise EngineeringDataError("Task7 stage record index is not a mapping")
+    return records  # type: ignore[return-value]
+
+
+def _binding(stage_data: Mapping[str, Any]) -> Mapping[str, Any]:
+    config = stage_data.get("config")
+    if not isinstance(config, Mapping) or not isinstance(config.get("binding"), Mapping):
+        raise EngineeringDataError("Task7 stage config lacks immutable binding")
+    return config["binding"]
+
+
+def _check_condition_chain(record: Mapping[str, Any], condition: np.ndarray, *, name: str,
+                           full_mask: np.ndarray | None = None) -> list[str]:
+    """Verify chain evidence at condition coordinates, returning diagnostics."""
+    reasons: list[str] = []
+    try:
+        input_condition = _array_from_record(record, "condition_input_fp32")
+        if not byte_equal(input_condition, condition):
+            reasons.append(f"{name}: condition_input_fp32 differs from requested condition")
+        encoded = _array_from_record(record, "encoded_condition")
+        next_condition = record.get("next_condition_fp32")
+        if not isinstance(next_condition, np.ndarray) or not byte_equal(encoded, next_condition):
+            reasons.append(f"{name}: encoded_condition differs from next_condition_fp32")
+    except EngineeringDataError as error:
+        reasons.append(str(error))
+    actual = record.get("actual")
+    if not isinstance(actual, Mapping):
+        reasons.append(f"{name}: missing actual condition-chain evidence")
+        return reasons
+    expected_keys = ("prepared_condition", "initial_condition", "reference_condition",
+                     "first_condition", "last_condition", "condition_steps")
+    for key in expected_keys:
+        value = actual.get(key)
+        if not isinstance(value, np.ndarray):
+            reasons.append(f"{name}: missing actual.{key}")
+            continue
+        array = np.asarray(value)
+        if array.dtype != np.dtype(np.float32) or not np.all(np.isfinite(array)):
+            reasons.append(f"{name}: actual.{key} is not finite FP32")
+            continue
+        candidate = array
+        if key == "condition_steps":
+            if array.ndim < 1:
+                reasons.append(f"{name}: actual.condition_steps shape differs from condition")
+                continue
+            if tuple(array.shape[1:]) == tuple(condition.shape):
+                candidate = array
+            elif full_mask is not None and tuple(array.shape[1:]) == tuple(full_mask.shape):
+                candidate = np.stack([_condition_view(item, full_mask, name=f"{name} {key}") for item in array])
+            else:
+                reasons.append(f"{name}: actual.condition_steps shape differs from condition")
+                continue
+            if not all(byte_equal(item, condition) for item in candidate):
+                reasons.append(f"{name}: actual.condition_steps differ from consumed condition")
+            continue
+        if tuple(candidate.shape) != tuple(condition.shape) and full_mask is not None and tuple(candidate.shape) == tuple(full_mask.shape):
+            candidate = _condition_view(candidate, full_mask, name=f"{name} {key}")
+        if tuple(candidate.shape) != tuple(condition.shape):
+            # Full carrier evidence is accepted only when the condition-only
+            # coordinates are exactly the requested input; no all-element
+            # equality is inferred from a shape coincidence.
+            reasons.append(f"{name}: actual.{key} shape differs from condition")
+            continue
+        if not byte_equal(candidate, condition):
+            reasons.append(f"{name}: actual.{key} differs from consumed condition")
+    return reasons
+
+
+def _a_stage_analysis(stage_data: Mapping[str, Any], source: Mapping[str, Any], *, tensors: dict[str, np.ndarray]) -> dict[str, Any]:
+    records = _record_map(stage_data)
+    rows = source["rows"]
+    engineering_reasons: list[str] = []
+    precision_results: dict[str, Any] = {}
+    for precision in ("native", "temporary_fp32"):
+        outputs: dict[str, np.ndarray] = {}
+        floors: dict[str, float] = {}
+        for name in ("baseline_pre", "v0_alpha_00_plus", "v0_alpha_00_minus",
+                     "v0_alpha_01_plus", "v0_alpha_01_minus", "v0_alpha_02_plus",
+                     "v0_alpha_02_minus", "baseline_post"):
+            sample_id = f"A_{name}_{precision}"
+            record = records.get(sample_id)
+            if record is None:
+                engineering_reasons.append(f"A missing record: {sample_id}")
+                continue
+            try:
+                counts = _operation_counts(record, "A")
+                if counts != {"G": 0, "D": 0, "E": 1}:
+                    engineering_reasons.append(f"A {sample_id} operation counts differ: {counts}")
+                output = _array_from_record(record, "encoded_condition")
+            except EngineeringDataError as error:
+                engineering_reasons.append(str(error)); continue
+            outputs[name] = output
+            if precision == "native" and not byte_equal(output, rows[name]["direct"]):
+                engineering_reasons.append(f"A native output differs bytewise from saved direct condition: {name}")
+            expected_shape = rows[name]["direct"].shape
+            if tuple(output.shape) != tuple(expected_shape):
+                engineering_reasons.append(f"A output shape differs from source direct condition: {name}")
+        if len(outputs) != 8:
+            continue
+        baseline = outputs["baseline_pre"]
+        direction = source["v0_condition"]
+        # Each encoder's own baseline pair defines its measured FP32 floor.
+        # It is deliberately computed only after both baseline tensors are
+        # loaded; no record flag can manufacture a floor or a scientific pass.
+        try:
+            floor = rms64(fp32_difference(outputs["baseline_post"], outputs["baseline_pre"]),
+                          np.ones_like(outputs["baseline_pre"], dtype=bool))
+        except EngineeringDataError as error:
+            engineering_reasons.append(f"A {precision} baseline floor invalid: {error}")
+            continue
+        plus_inputs = [rows[f"v0_alpha_{ordinal:02d}_plus"]["delta_condition"] for ordinal in range(3)]
+        minus_inputs = [rows[f"v0_alpha_{ordinal:02d}_minus"]["delta_condition"] for ordinal in range(3)]
+        plus_outputs = [outputs[f"v0_alpha_{ordinal:02d}_plus"] for ordinal in range(3)]
+        minus_outputs = [outputs[f"v0_alpha_{ordinal:02d}_minus"] for ordinal in range(3)]
+        try:
+            window = one_direction_window(TASK7_ALPHAS, direction, plus_inputs, minus_inputs,
+                                          plus_outputs, minus_outputs, baseline,
+                                          source["condition_mask"], floor=floor,
+                                          output_mask=np.ones_like(baseline, dtype=bool))
+        except EngineeringDataError as error:
+            engineering_reasons.append(f"A {precision} numerical input invalid: {error}")
+            continue
+        precision_results[precision] = {
+            "status": window["status"], "floor": floor, "window": _json_safe(window),
+            "points": [{key: value for key, value in point.items() if key != "central_q"}
+                       for point in window["points"]],
+        }
+        for ordinal, point in enumerate(window["points"]):
+            for sign in ("plus", "minus"):
+                name = f"a_{precision}_{ordinal}_{sign}_response"
+                base_name = f"v0_alpha_{ordinal:02d}_{sign}"
+                tensors[name] = fp32_difference(outputs[base_name], baseline)
+    scientific_pass = (len(precision_results) == 2 and not engineering_reasons
+                       and all(item["status"] == "PASS" for item in precision_results.values()))
+    return {"engineering_pass": not engineering_reasons, "engineering_reasons": engineering_reasons,
+            "scientific_pass": scientific_pass, "scientific_status": "PASS" if scientific_pass else "FAIL",
+            "precision": precision_results, "a_scientific_pass": scientific_pass,
+            "a_engineering_pass": not engineering_reasons}
+
+
+def _b_stage_analysis(stage_data: Mapping[str, Any], source: Mapping[str, Any], a_result: Mapping[str, Any],
+                      *, tensors: dict[str, np.ndarray]) -> dict[str, Any]:
+    records = _record_map(stage_data)
+    source_rows = source["rows"]
+    engineering_reasons: list[str] = []
+    noise_by_seed: dict[int, str] = {}
+    trajectory_metrics: dict[str, Any] = {}
+    condition_mask = source["condition_mask"]
+    # Validate every record before deriving any deltas.  A scientific FAIL in
+    # A does not suppress B's finite propagation measurements, but any wiring
+    # or evidence failure does.
+    for spec in stage_data["plan"]:
+        sample_id = str(spec["sample_id"])
+        record = records.get(sample_id)
+        if record is None:
+            engineering_reasons.append(f"B missing record: {sample_id}")
+            continue
+        try:
+            counts = _operation_counts(record, "B")
+            if counts != {"G": 1, "D": 1, "E": 1}:
+                engineering_reasons.append(f"B {sample_id} operation counts differ: {counts}")
+            condition = _array_from_record(record, "condition_input_fp32")
+            encoded = _array_from_record(record, "encoded_condition")
+            expected_condition = source_rows[str(spec["source_name"])] ["consumed_condition"] if int(spec["step_index"]) == 0 else None
+            if expected_condition is not None and not byte_equal(condition, expected_condition):
+                engineering_reasons.append(f"B step-0 condition differs from saved source: {sample_id}")
+            chain_reasons = _check_condition_chain(record, condition, name=sample_id,
+                                                   full_mask=source_rows["baseline_pre"]["mask"])
+            engineering_reasons.extend(chain_reasons)
+            evidence = record.get("evidence")
+            noise = evidence.get("prediction_noise_hash") if isinstance(evidence, Mapping) else None
+            seed = int(spec.get("seed", spec.get("step_index", -1)))
+            if not isinstance(noise, str) or not noise:
+                engineering_reasons.append(f"B {sample_id} lacks prediction_noise_hash")
+            elif seed in noise_by_seed and noise_by_seed[seed] != noise:
+                engineering_reasons.append(f"B seed-{seed} prediction noise is not paired: {sample_id}")
+            elif isinstance(noise, str):
+                noise_by_seed[seed] = noise
+            if int(spec["step_index"]) == 0:
+                full = _array_from_record(record, "full_latent")
+                expected_full = _load_runner_array(source_rows[str(spec["source_name"])] ["raw"] / "output_full.npy",
+                                                    name=f"B {sample_id} historical output")
+                if not byte_equal(full, expected_full):
+                    engineering_reasons.append(f"B step-0 full latent differs from historical output: {sample_id}")
+        except EngineeringDataError as error:
+            engineering_reasons.append(str(error))
+    if set(noise_by_seed) >= {0, 1} and noise_by_seed[0] == noise_by_seed[1]:
+        engineering_reasons.append("B seed-0 and seed-1 prediction noise identities must differ")
+    if len(noise_by_seed) < 2:
+        engineering_reasons.append("B does not provide paired seed-0/seed-1 noise identities")
+
+    # A temporary-FP32 encoder output is the cross-stage first-step reference.
+    # Native parity is checked by A independently; only this exact mapping is
+    # allowed to carry A's local window into B/C.
+    a_records: dict[str, Mapping[str, Any]] | None = None
+    # The A records are not embedded in a_result; load them from the same run
+    # so the adapter remains explicit and does not duplicate artifact paths.
+    try:
+        a_data = load_task7_stage(stage_data["run_dir"], "A")
+        a_records = _record_map(a_data)
+        for name in ("baseline_pre", "v0_alpha_00_plus", "v0_alpha_00_minus", "v0_alpha_01_plus",
+                     "v0_alpha_01_minus", "v0_alpha_02_plus", "v0_alpha_02_minus", "baseline_post"):
+            b_record = records.get(f"B_{name}_step_0")
+            a_record = a_records.get(f"A_{name}_temporary_fp32")
+            if b_record is None or a_record is None:
+                engineering_reasons.append(f"B/A cross-stage record missing: {name}")
+                continue
+            b_encoded = _array_from_record(b_record, "encoded_condition")
+            a_encoded = _array_from_record(a_record, "encoded_condition")
+            if not byte_equal(b_encoded, a_encoded):
+                engineering_reasons.append(f"B step-0 encoded condition differs from A FP32 encoder: {name}")
+    except EngineeringDataError as error:
+        engineering_reasons.append(f"B/A cross-stage check unavailable: {error}")
+
+    baseline0 = records.get("B_baseline_pre_step_0")
+    baseline1 = records.get("B_baseline_pre_step_1")
+    baseline_post0 = records.get("B_baseline_post_step_0")
+    baseline_post1 = records.get("B_baseline_post_step_1")
+    baseline_repeatability_ok = False
+    if baseline0 is None or baseline1 is None or baseline_post0 is None or baseline_post1 is None:
+        engineering_reasons.append("B baseline-pre records are missing")
+    else:
+        try:
+            b0_in = _array_from_record(baseline0, "condition_input_fp32")
+            b0_out = _array_from_record(baseline0, "encoded_condition")
+            b1_in = _array_from_record(baseline1, "condition_input_fp32")
+            b1_out = _array_from_record(baseline1, "encoded_condition")
+            # Floors are measured independently at z0/z1/z2 from the saved
+            # baseline-pre/post pair, with FP32 subtraction and FP64 RMS.
+            z0_floor = rms64(fp32_difference(
+                _array_from_record(baseline_post0, "condition_input_fp32"), b0_in), condition_mask)
+            z1_floor = rms64(fp32_difference(
+                _array_from_record(baseline_post0, "encoded_condition"), b0_out), condition_mask)
+            z2_floor = rms64(fp32_difference(
+                _array_from_record(baseline_post1, "encoded_condition"), b1_out), condition_mask)
+            if not byte_equal(b1_in, b0_out):
+                engineering_reasons.append("B baseline step-1 input differs from baseline step-0 encoded condition")
+            baseline_repeatability_ok = all((
+                byte_equal(_array_from_record(baseline_post0, "condition_input_fp32"), b0_in),
+                byte_equal(_array_from_record(baseline_post0, "encoded_condition"), b0_out),
+                byte_equal(_array_from_record(baseline_post1, "condition_input_fp32"), b1_in),
+                byte_equal(_array_from_record(baseline_post1, "encoded_condition"), b1_out),
+            ))
+            if not baseline_repeatability_ok:
+                engineering_reasons.append("B baseline-pre/post replay is not byte-identical at z0/z1/z2")
+            for name in ("v0_alpha_00_plus", "v0_alpha_00_minus", "v0_alpha_01_plus", "v0_alpha_01_minus",
+                         "v0_alpha_02_plus", "v0_alpha_02_minus"):
+                first = records.get(f"B_{name}_step_0")
+                second = records.get(f"B_{name}_step_1")
+                if first is None or second is None:
+                    engineering_reasons.append(f"B trajectory records are missing: {name}")
+                    continue
+                d0 = fp32_difference(_array_from_record(first, "condition_input_fp32"), b0_in)
+                d1 = fp32_difference(_array_from_record(first, "encoded_condition"), b0_out)
+                d2 = fp32_difference(_array_from_record(second, "encoded_condition"), b1_out)
+                tensors[f"b_{name}_delta0"] = d0
+                tensors[f"b_{name}_delta1"] = d1
+                tensors[f"b_{name}_delta2"] = d2
+                metrics = propagation_metrics(d0, d1, d2, condition_mask,
+                                              floor0=z0_floor, floor1=z1_floor, floor2=z2_floor)
+                trajectory_metrics[name] = _json_safe(metrics)
+        except EngineeringDataError as error:
+            engineering_reasons.append(f"B propagation input invalid: {error}")
+    finite_pass = bool(trajectory_metrics) and all(
+        value.get("status") in {"PASS", "UNRELIABLE"} for value in trajectory_metrics.values())
+    engineering_pass = not engineering_reasons
+    repeatability_pass = engineering_pass and baseline_repeatability_ok and bool(trajectory_metrics) and len(trajectory_metrics) == 6
+    return {"engineering_pass": engineering_pass, "engineering_reasons": engineering_reasons,
+            "repeatability_pass": repeatability_pass, "b_engineering_pass": engineering_pass,
+            "b_repeatability_pass": repeatability_pass, "finite_propagation": finite_pass,
+            "trajectory": trajectory_metrics, "noise_by_seed": noise_by_seed,
+            "floors": {"z0": locals().get("z0_floor", None), "z1": locals().get("z1_floor", None),
+                       "z2": locals().get("z2_floor", None)}}
+
+
+def _c_stage_analysis(stage_data: Mapping[str, Any], source: Mapping[str, Any], b_result: Mapping[str, Any],
+                      *, tensors: dict[str, np.ndarray]) -> dict[str, Any]:
+    records = _record_map(stage_data)
+    reasons: list[str] = []
+    condition_mask = source["condition_mask"]
+    baseline_pre = records.get("C_baseline_pre")
+    baseline_post = records.get("C_baseline_post")
+    if baseline_pre is None or baseline_post is None:
+        return {"engineering_pass": False, "engineering_reasons": ["C shared baseline records are missing"],
+                "scientific_pass": False, "status": "ENGINEERING_FAIL", "rows": []}
+    try:
+        z1 = _array_from_record(baseline_pre, "condition_input_fp32")
+        z2 = _array_from_record(baseline_pre, "encoded_condition")
+        z2_post = _array_from_record(baseline_post, "encoded_condition")
+        c_floor = rms64(fp32_difference(z2_post, z2), condition_mask)
+        b_data = load_task7_stage(stage_data["run_dir"], "B")
+        b_records = _record_map(b_data)
+        b_z1 = _array_from_record(b_records["B_baseline_pre_step_0"], "encoded_condition")
+        b_z2 = _array_from_record(b_records["B_baseline_pre_step_1"], "encoded_condition")
+        if not byte_equal(z1, b_z1):
+            reasons.append("C baseline input differs bytewise from B baseline step-0 encoded condition")
+        if not byte_equal(z2, b_z2) or not byte_equal(z2_post, b_z2):
+            reasons.append("C baseline output differs bytewise from B baseline step-1 encoded condition")
+    except (EngineeringDataError, KeyError) as error:
+        reasons.append(f"C/B baseline parity unavailable: {error}")
+        z1 = z2 = None
+
+    seed1_noise = None
+    if isinstance(baseline_pre.get("evidence"), Mapping):
+        seed1_noise = baseline_pre["evidence"].get("prediction_noise_hash")
+    if not isinstance(seed1_noise, str) or not seed1_noise:
+        reasons.append("C baseline lacks seed-1 prediction-noise identity")
+    rows: list[dict[str, Any]] = []
+    direction_metrics = b_result.get("trajectory", {}) if isinstance(b_result, Mapping) else {}
+    for index in range(6):
+        direction_name = f"delta1_{index:02d}"
+        # B trajectories are ordered by source name, preserving all six signed
+        # directions as independent rays; no original-v0 projection is used.
+        source_name = ("v0_alpha_00_plus", "v0_alpha_00_minus", "v0_alpha_01_plus",
+                       "v0_alpha_01_minus", "v0_alpha_02_plus", "v0_alpha_02_minus")[index]
+        direction_record = b_records.get(f"B_{source_name}_step_0") if "b_records" in locals() else None
+        if direction_record is None or z1 is None or z2 is None:
+            reasons.append(f"C direction source is missing: {direction_name}")
+            continue
+        try:
+            ray = fp32_difference(_array_from_record(direction_record, "encoded_condition"), b_z1)
+            direction_floor = c_floor
+            beta_records: dict[tuple[float, int], Mapping[str, Any]] = {}
+            for beta in TASK7_BETAS:
+                for sign, label in ((1, "plus"), (-1, "minus")):
+                    sample_id = f"C_delta1_{index:02d}_beta_{beta:g}_{label}"
+                    record = records.get(sample_id)
+                    if record is None:
+                        reasons.append(f"C missing record: {sample_id}"); continue
+                    counts = _operation_counts(record, "C")
+                    if counts != {"G": 1, "D": 1, "E": 1}:
+                        reasons.append(f"C {sample_id} operation counts differ: {counts}")
+                    evidence = record.get("evidence")
+                    noise = evidence.get("prediction_noise_hash") if isinstance(evidence, Mapping) else None
+                    if noise != seed1_noise:
+                        reasons.append(f"C {sample_id} seed-1 prediction noise differs from B")
+                    reasons.extend(_check_condition_chain(
+                        record, _array_from_record(record, "condition_input_fp32"),
+                        name=sample_id, full_mask=source["rows"]["baseline_pre"]["mask"]))
+                    beta_records[(float(beta), int(sign))] = record
+            plus_inputs: list[np.ndarray] = []
+            minus_inputs: list[np.ndarray] = []
+            plus_outputs: list[np.ndarray] = []
+            minus_outputs: list[np.ndarray] = []
+            for beta in TASK7_BETAS:
+                plus = beta_records.get((beta, 1)); minus = beta_records.get((beta, -1))
+                if plus is None or minus is None:
+                    continue
+                plus_inputs.append(fp32_difference(_array_from_record(plus, "condition_input_fp32"), z1))
+                minus_inputs.append(fp32_difference(_array_from_record(minus, "condition_input_fp32"), z1))
+                plus_outputs.append(_array_from_record(plus, "encoded_condition"))
+                minus_outputs.append(_array_from_record(minus, "encoded_condition"))
+            local_window = None
+            if len(plus_inputs) == 3 and len(minus_inputs) == 3:
+                local_window = one_direction_window(TASK7_BETAS, ray, plus_inputs, minus_inputs,
+                                                     plus_outputs, minus_outputs, z2, condition_mask,
+                                                     floor=direction_floor, output_mask=np.ones_like(z2, dtype=bool))
+            beta1_plus = beta_records.get((0.1, 1)); beta1_minus = beta_records.get((0.1, -1))
+            if beta1_plus is None or beta1_minus is None:
+                continue
+            actual_plus = fp32_difference(_array_from_record(beta1_plus, "encoded_condition"), z2)
+            prediction = fixed_beta_prediction(
+                actual_delta1=ray,
+                beta_plus_input=fp32_difference(_array_from_record(beta1_plus, "condition_input_fp32"), z1),
+                beta_minus_input=fp32_difference(_array_from_record(beta1_minus, "condition_input_fp32"), z1),
+                beta_plus_output=_array_from_record(beta1_plus, "encoded_condition"),
+                beta_minus_output=_array_from_record(beta1_minus, "encoded_condition"),
+                baseline_output=z2, actual_delta2=actual_plus, mask=condition_mask,
+                beta=0.1, local_window_pass=(local_window is not None and local_window["status"] == "PASS"),
+                response_reliable=(local_window is not None and
+                                   bool(local_window["points"][0]["response_reliable"]["plus"]) and
+                                   bool(local_window["points"][0]["response_reliable"]["minus"])),
+                output_mask=np.ones_like(z2, dtype=bool))
+            tensors[f"c_{direction_name}_actual_delta2"] = actual_plus
+            rows.append({"direction_id": direction_name, "status": prediction["status"],
+                         "Eprop": prediction["Eprop"], "delta1_rms": prediction["delta1_rms"],
+                         "local_window_status": None if local_window is None else local_window["status"],
+                         "reliable": prediction["reliable"], "reasons": prediction["reasons"]})
+        except EngineeringDataError as error:
+            reasons.append(f"C {direction_name} numerical evidence invalid: {error}")
+    engineering_pass = not reasons and len(rows) == 6
+    scientific_pass = engineering_pass and all(row["status"] == "PASS" for row in rows)
+    return {"engineering_pass": engineering_pass, "engineering_reasons": reasons,
+            "scientific_pass": scientific_pass, "status": "PASS" if scientific_pass else "FAIL",
+            "rows": rows, "c_engineering_pass": engineering_pass, "c_scientific_pass": scientific_pass}
+
+
+def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]], fieldnames: Sequence[str] | None = None) -> None:
+    if fieldnames is None:
+        fields: list[str] = []
+        for row in rows:
+            for key in row:
+                if key not in fields:
+                    fields.append(str(key))
+        fieldnames = fields
+    with path.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(fieldnames), extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: json.dumps(_json_safe(value), ensure_ascii=False, sort_keys=True)
+                             if isinstance(value, (Mapping, list, tuple)) else _json_safe(value)
+                             for key, value in row.items()})
+
+
+def _render_plots(root: Path, summary: Mapping[str, Any]) -> list[str]:
+    """Render compact diagnostic charts when an existing matplotlib is usable."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return []
+    created: list[str] = []
+    precision = summary.get("A", {}).get("precision", {}) if isinstance(summary.get("A"), Mapping) else {}
+    if precision:
+        figure, axis = plt.subplots(figsize=(5.0, 3.5))
+        for name, value in precision.items():
+            points = value.get("points", []) if isinstance(value, Mapping) else []
+            x = [float(point["h_plus"]) for point in points if point.get("h_plus") is not None]
+            y = [float(point["plus_response_rms"]) for point in points if point.get("plus_response_rms") is not None]
+            if x and y:
+                axis.loglog(x, y, marker="o", label=name)
+        axis.set_xlabel("actual condition step RMS")
+        axis.set_ylabel("response RMS")
+        axis.set_title("Task7 A response / precision (diagnostic)")
+        axis.legend()
+        figure.tight_layout()
+        for extension in ("png", "svg"):
+            filename = f"a_response_precision.{extension}"
+            figure.savefig(root / filename, dpi=150 if extension == "png" else None)
+            created.append(filename)
+        plt.close(figure)
+    b_summary = summary.get("B", {}).get("trajectory", {}) if isinstance(summary.get("B"), Mapping) else {}
+    if b_summary:
+        figure, axis = plt.subplots(figsize=(5.0, 3.5))
+        names, a1, a2 = [], [], []
+        for name, value in b_summary.items():
+            names.append(str(name)); a1.append(value.get("A1")); a2.append(value.get("A2"))
+        axis.plot(names, a1, "o-", label="A1")
+        axis.plot(names, a2, "s-", label="A2")
+        axis.set_xlabel("trajectory (positive/negative retained)")
+        axis.set_ylabel("gain")
+        axis.set_title("Task7 B propagation gains")
+        axis.tick_params(axis="x", labelrotation=70)
+        axis.legend(); figure.tight_layout()
+        for extension in ("png", "svg"):
+            filename = f"b_propagation_gains.{extension}"
+            figure.savefig(root / filename, dpi=150 if extension == "png" else None)
+            created.append(filename)
+        plt.close(figure)
+    c_rows = summary.get("C", {}).get("rows", []) if isinstance(summary.get("C"), Mapping) else []
+    if c_rows:
+        figure, axis = plt.subplots(figsize=(5.0, 3.5))
+        axis.bar([str(row.get("direction_id")) for row in c_rows],
+                 [float(row.get("Eprop") or 0.0) for row in c_rows])
+        axis.axhline(0.10, color="red", linestyle="--", label="Eprop=.10")
+        axis.set_xlabel("independent delta1 direction")
+        axis.set_ylabel("Eprop")
+        axis.set_title("Task7 C prediction error (diagnostic)")
+        axis.tick_params(axis="x", labelrotation=70); axis.legend(); figure.tight_layout()
+        for extension in ("png", "svg"):
+            filename = f"c_prediction_errors.{extension}"
+            figure.savefig(root / filename, dpi=150 if extension == "png" else None)
+            created.append(filename)
+        plt.close(figure)
+    return created
+
+
+def _write_report(root: Path, summary: Mapping[str, Any], *, plots: Sequence[str]) -> None:
+    a = summary.get("A", {}) if isinstance(summary.get("A"), Mapping) else {}
+    b = summary.get("B", {}) if isinstance(summary.get("B"), Mapping) else {}
+    c = summary.get("C", {}) if isinstance(summary.get("C"), Mapping) else {}
+    lines = [
+        "# Task7 offline saved-evidence analysis",
+        "",
+        f"Analysis identity: `{summary.get('analysis_version')}`; analyzer source digest: `{summary.get('analysis_code_sha256')}`.",
+        "This package is CPU-only re-analysis of saved tensors. It is not a model, GPU, accuracy, Jacobian, global-stability, or rank claim.",
+        "",
+        "## Stage status",
+        "",
+        f"- A engineering: `{a.get('engineering_pass')}`; scientific window: `{a.get('scientific_status')}`.",
+        f"- B engineering: `{b.get('engineering_pass')}`; baseline repeatability: `{b.get('repeatability_pass')}`.",
+        f"- C: `{c.get('status', 'SKIPPED')}`.",
+        "",
+        "## Precision and metrics",
+        "",
+        "Neural G/D/E computation is recorded as FP32. Approved P range normalization may use a float64 intermediate followed by FP32 storage; this report does not relabel that conversion as an all-FP32 scalar path.",
+        "Differences use explicit FP32 subtraction. RMS, cosine, regression, and floors use FP64 reductions over the authoritative condition mask. Each three-amplitude window is fixed in advance; no point is dropped, and additivity is `NOT_TESTED`.",
+        "A positive/negative input is measured with its actual signed step. Zero denominators remain null with an explicit reliability reason.",
+        "",
+        "## Controlled repeatability",
+        "",
+        "B uses the controlled repeated action with seeds 0 and 1. The analyzer requires paired prediction-noise identities, exact baseline-pre/post replay, and A/B first-step byte parity before permitting a C gate.",
+        "",
+        "## Mathematical note",
+        "",
+        "The central secant is `q=(F_plus-F_minus)/(h_plus+h_minus)` using actual masked steps. Under conditional differentiability, the local prediction error has the usual `O(h^2)+O(u/h)` structure; floor and mask gates decide whether that asymptotic expression is measurable. See `docs/task7-mathematical-interpretation.md`.",
+        "",
+        "## Figures",
+        "",
+    ]
+    if plots:
+        lines.extend(f"- `{plot}`" for plot in plots)
+    else:
+        lines.append("No plots were rendered because an existing matplotlib runtime was unavailable.")
+    lines.extend(["", "Synthetic fixtures, when used by tests, are labelled test evidence and never presented as model results.", ""])
+    text = "\n".join(lines)
+    (root / "task7_report.md").write_text(text, encoding="utf-8")
+    (root / "experiment_report.md").write_text(text, encoding="utf-8")
+
+
+def _write_manifest(root: Path) -> Path:
+    manifest = root / "MANIFEST.sha256"
+    excluded = {"MANIFEST.sha256", "review_bundle.zip"}
+    lines = []
+    for path in sorted((item for item in root.rglob("*") if item.is_file() and item.name not in excluded),
+                       key=lambda item: item.relative_to(root).as_posix()):
+        lines.append(f"{_sha256_file(path)}  {path.relative_to(root).as_posix()}")
+    manifest.write_text("\n".join(lines) + "\n", encoding="ascii")
+    return manifest
+
+
+def _write_light_bundle(root: Path) -> Path:
+    bundle = root / "review_bundle.zip"
+    excluded = {"review_bundle.zip", "MANIFEST.sha256"}
+    with zipfile.ZipFile(bundle, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in sorted((item for item in root.rglob("*") if item.is_file() and item.name not in excluded),
+                           key=lambda item: item.relative_to(root).as_posix()):
+            relative = path.relative_to(root).as_posix()
+            if path.suffix in {".mp4", ".mov", ".safetensors", ".ckpt", ".pt", ".pth"}:
+                continue
+            if "analysis_tensors" in path.parts and path.stat().st_size > 8 * 1024 * 1024:
+                continue
+            info = zipfile.ZipInfo(relative, date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
+            archive.writestr(info, path.read_bytes())
+    return bundle
+
+
+def _stage_skip(reason: str) -> dict[str, Any]:
+    return {"status": "SKIPPED", "engineering_pass": False, "scientific_pass": False,
+            "engineering_reasons": [str(reason)]}
+
+
+def _gate_for_c(run_dir: Path, source: Mapping[str, Any], a: Mapping[str, Any], b: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Create the exact runner-consumable C gate only when all prerequisites pass."""
+    if not bool(a.get("a_scientific_pass")) or not bool(a.get("a_engineering_pass")):
+        return None
+    if not bool(b.get("b_engineering_pass")) or not bool(b.get("b_repeatability_pass")):
+        return None
+    module = _runner_module()
+    try:
+        a_digest = module._stage_completion_digests(run_dir, "A")
+        b_digest = module._stage_completion_digests(run_dir, "B")
+    except Exception:
+        return None
+    binding = _binding(load_task7_stage(run_dir, "B"))
+    source_sha = binding.get("source", binding.get("source_tree_sha256"))
+    code_sha = binding.get("task7_code_sha256")
+    if not isinstance(source_sha, str) or not isinstance(code_sha, str) or not source_sha or not code_sha:
+        return None
+    if source.get("source_tree_sha256") != source_sha:
+        return None
+    return {"schema_version": "umi-task7-analysis-gate-v1", "analysis_version": ANALYSIS_VERSION,
+            "analysis_code_sha256": _analysis_source_sha256(),
+            "a_scientific_pass": True, "b_engineering_pass": True,
+            "b_repeatability_pass": True, "source_sha256": source_sha,
+            "code_sha256": code_sha,
+            "a_run_status_sha256": a_digest["run_status_sha256"],
+            "a_samples_manifest_sha256": a_digest["samples_manifest_sha256"],
+            "b_run_status_sha256": b_digest["run_status_sha256"],
+            "b_samples_manifest_sha256": b_digest["samples_manifest_sha256"]}
+
+
+def analyze_task7_run(run_dir: str | Path, *, stage: str = "all",
+                      raw_root: str | Path | None = None,
+                      decoder_root: str | Path | None = None,
+                      output_dir: str | Path | None = None) -> dict[str, Any]:
+    """Analyze saved Task7 evidence, optionally stopping after A or B.
+
+    ``stage='A'`` is the usable offline path while live B/C data are absent.
+    A scientific FAIL is returned as a valid analysis result; engineering
+    failures are explicit and never converted into zero-valued metrics.
+    """
+    requested = str(stage).upper()
+    if requested not in {"A", "B", "C", "ALL"}:
+        raise EngineeringDataError("stage must be A, B, C, or all")
+    run = Path(run_dir).resolve()
+    if raw_root is None or decoder_root is None:
+        raise EngineeringDataError("raw_root and decoder_root are required for source-bound analysis")
+    source = _load_source_evidence(raw_root, decoder_root)
+    tensor_values: dict[str, np.ndarray] = {}
+    summary: dict[str, Any] = {
+        "schema_version": ANALYSIS_SCHEMA_VERSION, "analysis_version": ANALYSIS_VERSION,
+        "analysis_code_sha256": _analysis_source_sha256(), "run_dir": str(run),
+        "source_tree_sha256": source.get("source_tree_sha256"),
+        "source": {key: source.get(key) for key in ("raw_root", "decoder_root", "z0_sha256", "mask_sha256", "v0_sha256", "source_tree_sha256")},
+    }
+    try:
+        a_data = load_task7_stage(run, "A")
+        a = _a_stage_analysis(a_data, source, tensors=tensor_values)
+    except EngineeringDataError as error:
+        a = {"status": "ENGINEERING_FAIL", "a_engineering_pass": False,
+             "a_scientific_pass": False, "engineering_pass": False,
+             "engineering_reasons": [str(error)], "scientific_status": "NOT_RUN"}
+    summary["A"] = a
+    if requested == "A":
+        summary["B"] = _stage_skip("not requested; A-only analysis")
+        summary["C"] = _stage_skip("not requested; A-only analysis")
+    else:
+        try:
+            b_data = load_task7_stage(run, "B")
+            b = _b_stage_analysis(b_data, source, a, tensors=tensor_values)
+        except EngineeringDataError as error:
+            b = {"status": "ENGINEERING_FAIL", "b_engineering_pass": False,
+                 "b_repeatability_pass": False, "engineering_pass": False,
+                 "engineering_reasons": [str(error)]}
+        summary["B"] = b
+        gate = _gate_for_c(run, source, a, b)
+        if gate is not None:
+            summary["analysis_gate"] = gate
+        if requested == "B":
+            summary["C"] = _stage_skip("not requested; B-only analysis")
+        elif gate is None:
+            summary["C"] = _stage_skip("A scientific/engineering or B repeatability gate did not pass")
+        else:
+            try:
+                gate_path = run / "analysis_gate.json"
+                if not gate_path.is_file():
+                    raise EngineeringDataError("C evidence exists without the analyzer gate consumed by the runner")
+                existing_gate = json.loads(gate_path.read_text(encoding="utf-8"))
+                if _canonical(existing_gate) != _canonical(gate):
+                    raise EngineeringDataError("C analyzer gate lineage/source/code differs from current A/B evidence")
+                c_data = load_task7_stage(run, "C")
+                summary["C"] = _c_stage_analysis(c_data, source, b, tensors=tensor_values)
+            except EngineeringDataError as error:
+                c_root = run / "stages" / "C"
+                if not c_root.exists():
+                    summary["C"] = _stage_skip(f"C stage outputs are not present: {error}")
+                else:
+                    summary["C"] = {"status": "ENGINEERING_FAIL", "c_engineering_pass": False,
+                                     "c_scientific_pass": False, "engineering_pass": False,
+                                     "engineering_reasons": [str(error)]}
+
+    destination = Path(output_dir).resolve() if output_dir is not None else run / "task7_analysis"
+    for immutable in (Path(source["raw_root"]).resolve(), Path(source["decoder_root"]).resolve()):
+        try:
+            destination.relative_to(immutable)
+        except ValueError:
+            continue
+        raise EngineeringDataError("analysis destination is inside an immutable source root")
+    if destination.exists() and any(destination.iterdir()):
+        raise FileExistsError(f"analysis destination already exists and is non-empty: {destination}")
+    destination.mkdir(parents=True, exist_ok=True)
+    tensor_root = destination / "analysis_tensors"
+    tensor_root.mkdir()
+    for name, value in sorted(tensor_values.items()):
+        np.save(tensor_root / f"{name}.npy", np.ascontiguousarray(value, dtype=np.float32), allow_pickle=False)
+    # CSVs consume only small scalar rows, never full tensors.
+    a_rows: list[dict[str, Any]] = []
+    a_geometry_rows: list[dict[str, Any]] = []
+    a_secant_rows: list[dict[str, Any]] = []
+    for precision, value in summary["A"].get("precision", {}).items():
+        for point in value.get("points", []):
+            a_rows.append({"precision": precision, "ordinal": point.get("ordinal"), "alpha": point.get("alpha"),
+                           "h_plus": point.get("h_plus"), "h_minus": point.get("h_minus"),
+                           "plus_response_rms": point.get("plus_response_rms"),
+                           "minus_response_rms": point.get("minus_response_rms"),
+                           "plus_input_cosine": point.get("plus_input_cosine"),
+                           "minus_input_cosine": point.get("minus_input_cosine"),
+                           "opposite_cosine": point.get("opposite_cosine")})
+            a_geometry_rows.append({"precision": precision, "ordinal": point.get("ordinal"), "alpha": point.get("alpha"),
+                                    "h_plus": point.get("h_plus"), "h_minus": point.get("h_minus"),
+                                    "plus_input_cosine": point.get("plus_input_cosine"),
+                                    "minus_input_cosine": point.get("minus_input_cosine"),
+                                    "opposite_cosine": point.get("opposite_cosine"),
+                                    "plus_outside_exact": point.get("plus_outside_exact"),
+                                    "minus_outside_exact": point.get("minus_outside_exact")})
+        for secant in value.get("window", {}).get("secants", []):
+            a_secant_rows.append({"precision": precision, **secant})
+    _write_csv(destination / "a_comparison.csv", a_rows)
+    _write_csv(destination / "a_geometry.csv", a_geometry_rows)
+    _write_csv(destination / "a_secants.csv", a_secant_rows)
+    _write_csv(destination / "b_propagation.csv",
+               [{"trajectory": name, **value} for name, value in summary.get("B", {}).get("trajectory", {}).items()])
+    _write_csv(destination / "c_prediction.csv", summary.get("C", {}).get("rows", []))
+    _write_json(destination / "analysis_summary.json", summary)
+    if isinstance(summary.get("analysis_gate"), Mapping):
+        _write_json(destination / "analysis_gate.json", summary["analysis_gate"])
+        run_gate = run / "analysis_gate.json"
+        if run_gate.exists():
+            try:
+                existing = json.loads(run_gate.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as error:
+                raise EngineeringDataError(f"existing run analysis_gate.json is unreadable: {error}") from error
+            if _canonical(existing) != _canonical(summary["analysis_gate"]):
+                raise EngineeringDataError("existing run analysis_gate.json is bound to different A/B evidence")
+        else:
+            _write_json(run_gate, summary["analysis_gate"])
+    plots = _render_plots(destination, summary)
+    _write_report(destination, summary, plots=plots)
+    _write_light_bundle(destination)
+    _write_manifest(destination)
+    return summary
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Offline Task7 saved-evidence analysis")
+    parser.add_argument("--run-dir", required=True)
+    parser.add_argument("--raw-root", required=True)
+    parser.add_argument("--decoder-root", required=True)
+    parser.add_argument("--stage", choices=("A", "B", "C", "all", "a", "b", "c"), default="all")
+    parser.add_argument("--output-dir")
+    args = parser.parse_args(argv)
+    try:
+        result = analyze_task7_run(args.run_dir, stage=args.stage, raw_root=args.raw_root,
+                                   decoder_root=args.decoder_root, output_dir=args.output_dir)
+    except (EngineeringDataError, FileExistsError, OSError) as error:
+        print(json.dumps({"status": "ENGINEERING_FAIL", "reason": str(error)}, ensure_ascii=False))
+        return 2
+    print(json.dumps(_json_safe(result), ensure_ascii=False, sort_keys=True))
+    engineering_fail = any(isinstance(result.get(key), Mapping) and result[key].get("engineering_pass") is False
+                            and result[key].get("status") == "ENGINEERING_FAIL" for key in ("A", "B", "C"))
+    return 2 if engineering_fail else 0
+
+
 __all__ = [
     "EngineeringDataError", "Task7EngineeringError", "arrays_byte_equal", "byte_equal",
     "compute_input_geometry", "compute_propagation", "cosine64", "evaluate_fixed_beta_predictions",
     "fit_loglog", "fixed_beta_prediction", "float32_difference", "fp32_difference",
     "input_geometry", "one_direction_window", "predict_fixed_beta", "propagation_metrics",
-    "rms64", "analyze_one_direction_window",
+    "rms64", "analyze_one_direction_window", "load_task7_stage", "analyze_task7_run", "main",
 ]
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised by CLI smoke tests
+    raise SystemExit(main())
