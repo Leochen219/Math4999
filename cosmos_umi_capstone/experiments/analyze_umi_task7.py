@@ -1645,6 +1645,22 @@ def _gate_for_c(run_dir: Path, source: Mapping[str, Any], a: Mapping[str, Any], 
             "b_samples_manifest_sha256": b_digest["samples_manifest_sha256"]}
 
 
+def _validate_admission_gate(admission: Mapping[str, Any], recomputed: Mapping[str, Any]) -> None:
+    """Require reanalysis to preserve every admission-gate field but its analyzer hash."""
+    if not isinstance(admission, Mapping) or not isinstance(recomputed, Mapping):
+        raise EngineeringDataError("analysis admission gate must be a mapping")
+    if set(admission) != set(recomputed):
+        missing = sorted(set(recomputed) - set(admission))
+        extra = sorted(set(admission) - set(recomputed))
+        raise EngineeringDataError(f"analysis admission gate fields differ: missing={missing}, extra={extra}")
+    for key in sorted(recomputed):
+        if key == "analysis_code_sha256":
+            continue
+        if _canonical(admission.get(key)) != _canonical(recomputed.get(key)):
+            raise EngineeringDataError(f"analysis admission gate lineage differs at {key}")
+    return None
+
+
 def analyze_task7_run(run_dir: str | Path, *, stage: str = "all",
                       raw_root: str | Path | None = None,
                       decoder_root: str | Path | None = None,
@@ -1690,8 +1706,25 @@ def analyze_task7_run(run_dir: str | Path, *, stage: str = "all",
                  "engineering_reasons": [str(error)]}
         summary["B"] = b
         gate = _gate_for_c(run, source, a, b)
+        admission_gate: Mapping[str, Any] | None = None
         if gate is not None:
-            summary["analysis_gate"] = gate
+            summary["reanalysis_gate"] = gate
+            gate_path = run / "analysis_gate.json"
+            if gate_path.is_file():
+                try:
+                    existing_gate = json.loads(gate_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as error:
+                    raise EngineeringDataError(f"existing run analysis_gate.json is unreadable: {error}") from error
+                _validate_admission_gate(existing_gate, gate)
+                admission_gate = existing_gate
+                summary["admission_gate"] = existing_gate
+                summary["analysis_gate"] = existing_gate
+                summary["admission_gate_sha256"] = _sha256_file(gate_path)
+            else:
+                # First admission may create the runner-consumed gate below;
+                # a reanalysis of an existing gate never takes this branch.
+                summary["admission_gate"] = gate
+                summary["analysis_gate"] = gate
         if requested == "B":
             summary["C"] = _stage_skip("not requested; B-only analysis")
         elif gate is None:
@@ -1699,11 +1732,8 @@ def analyze_task7_run(run_dir: str | Path, *, stage: str = "all",
         else:
             try:
                 gate_path = run / "analysis_gate.json"
-                if not gate_path.is_file():
+                if not gate_path.is_file() or admission_gate is None:
                     raise EngineeringDataError("C evidence exists without the analyzer gate consumed by the runner")
-                existing_gate = json.loads(gate_path.read_text(encoding="utf-8"))
-                if _canonical(existing_gate) != _canonical(gate):
-                    raise EngineeringDataError("C analyzer gate lineage/source/code differs from current A/B evidence")
                 c_data = load_task7_stage(run, "C")
                 summary["C"] = _c_stage_analysis(c_data, source, b, tensors=tensor_values)
             except EngineeringDataError as error:
@@ -1760,15 +1790,10 @@ def analyze_task7_run(run_dir: str | Path, *, stage: str = "all",
     _write_json(destination / "analysis_summary.json", summary)
     if isinstance(summary.get("analysis_gate"), Mapping):
         _write_json(destination / "analysis_gate.json", summary["analysis_gate"])
+        if isinstance(summary.get("reanalysis_gate"), Mapping):
+            _write_json(destination / "reanalysis_gate.json", summary["reanalysis_gate"])
         run_gate = run / "analysis_gate.json"
-        if run_gate.exists():
-            try:
-                existing = json.loads(run_gate.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as error:
-                raise EngineeringDataError(f"existing run analysis_gate.json is unreadable: {error}") from error
-            if _canonical(existing) != _canonical(summary["analysis_gate"]):
-                raise EngineeringDataError("existing run analysis_gate.json is bound to different A/B evidence")
-        else:
+        if not run_gate.exists():
             _write_json(run_gate, summary["analysis_gate"])
     plots = _render_plots(destination, summary)
     _write_report(destination, summary, plots=plots)

@@ -630,5 +630,84 @@ class Task7SavedEvidenceCTests(unittest.TestCase):
         np.testing.assert_array_equal(tensors["c_delta1_00_actual_delta2"], np.array([1.0, 0.0], np.float32))
 
 
+class Task7AnalysisGateLineageTests(unittest.TestCase):
+    """Reanalysis may change analyzer identity, never admission evidence."""
+
+    @staticmethod
+    def _gate():
+        return {
+            "schema_version": "umi-task7-analysis-gate-v1",
+            "analysis_version": "task7-offline-evidence-v1",
+            "analysis_code_sha256": "old-analyzer",
+            "a_scientific_pass": True,
+            "b_engineering_pass": True,
+            "b_repeatability_pass": True,
+            "source_sha256": "source",
+            "code_sha256": "runner",
+            "a_run_status_sha256": "a-status",
+            "a_samples_manifest_sha256": "a-samples",
+            "b_run_status_sha256": "b-status",
+            "b_samples_manifest_sha256": "b-samples",
+        }
+
+    def test_reanalysis_allows_only_analysis_code_identity_change(self):
+        admission = self._gate()
+        recomputed = dict(admission, analysis_code_sha256="new-analyzer")
+        self.assertIsNone(api._validate_admission_gate(admission, recomputed))
+
+    def test_reanalysis_rejects_source_runtime_digest_boolean_and_schema_changes(self):
+        for field, value in (
+            ("source_sha256", "foreign-source"),
+            ("code_sha256", "foreign-runner"),
+            ("a_run_status_sha256", "foreign-a-status"),
+            ("a_samples_manifest_sha256", "foreign-a-samples"),
+            ("b_run_status_sha256", "foreign-b-status"),
+            ("b_samples_manifest_sha256", "foreign-b-samples"),
+            ("a_scientific_pass", False),
+            ("b_engineering_pass", False),
+            ("b_repeatability_pass", False),
+            ("schema_version", "foreign-schema"),
+            ("analysis_version", "foreign-version"),
+        ):
+            with self.subTest(field=field):
+                admission = self._gate()
+                recomputed = dict(admission, analysis_code_sha256="new-analyzer", **{field: value})
+                with self.assertRaises(api.EngineeringDataError):
+                    api._validate_admission_gate(admission, recomputed)
+
+    def test_existing_admission_gate_is_preserved_and_reanalysis_gate_is_separate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "run"
+            root.mkdir()
+            admission = self._gate()
+            recomputed = dict(admission, analysis_code_sha256="new-analyzer")
+            gate_path = root / "analysis_gate.json"
+            gate_path.write_text(json.dumps(admission, sort_keys=True), encoding="utf-8")
+            original_bytes = gate_path.read_bytes()
+            source = {"raw_root": str(Path(temp) / "raw"), "decoder_root": str(Path(temp) / "decoder"),
+                      "source_tree_sha256": "source", "z0_sha256": "z0", "mask_sha256": "mask",
+                      "v0_sha256": "v0"}
+            pass_a = {"a_scientific_pass": True, "a_engineering_pass": True}
+            pass_b = {"b_engineering_pass": True, "b_repeatability_pass": True, "trajectory": {}}
+            pass_c = {"engineering_pass": True, "scientific_pass": True, "rows": []}
+            with mock.patch.object(api, "_load_source_evidence", return_value=source), \
+                 mock.patch.object(api, "load_task7_stage", return_value={}), \
+                 mock.patch.object(api, "_a_stage_analysis", return_value=pass_a), \
+                 mock.patch.object(api, "_b_stage_analysis", return_value=pass_b), \
+                 mock.patch.object(api, "_gate_for_c", return_value=recomputed), \
+                 mock.patch.object(api, "_c_stage_analysis", return_value=pass_c), \
+                 mock.patch.object(api, "_render_plots", return_value=[]):
+                result = api.analyze_task7_run(root, stage="all", raw_root=source["raw_root"],
+                                              decoder_root=source["decoder_root"],
+                                              output_dir=Path(temp) / "analysis")
+            self.assertEqual(result["analysis_gate"], admission)
+            self.assertEqual(result["admission_gate"], admission)
+            self.assertEqual(result["reanalysis_gate"], recomputed)
+            self.assertEqual(gate_path.read_bytes(), original_bytes)
+            output = Path(temp) / "analysis"
+            self.assertEqual(json.loads((output / "analysis_gate.json").read_text()), admission)
+            self.assertEqual(json.loads((output / "reanalysis_gate.json").read_text()), recomputed)
+
+
 if __name__ == "__main__":
     unittest.main()
