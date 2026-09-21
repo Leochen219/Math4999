@@ -1007,12 +1007,31 @@ class Task7RunnerTests(unittest.TestCase):
             action = np.arange(160, dtype=np.float32).reshape(16, 10)
             action_path = Path(temp) / "action.json"
             action_path.write_text(json.dumps(action.tolist()), encoding="utf-8")
-            source = {"metadata": {"action": runner._task6_array_hash(action), "prompt": "Put the pot to the left of the purple item.",
+            stable_action_hash = runner.stable_hash(action)
+            legacy_post_vae_hash = runner._task6_array_hash(action)
+            self.assertNotEqual(stable_action_hash, legacy_post_vae_hash)
+            source = {"metadata": {"action": stable_action_hash, "prompt": "Put the pot to the left of the purple item.",
                                      "state": "bridge_0", "seed": 0}}
             contract = {"prompt": source["metadata"]["prompt"], "group": {"state": "bridge_0", "seed": 0},
                         "action": action.tolist()}
             observed = runner._validate_source_contract(source, contract, action_path)
             np.testing.assert_array_equal(observed, action)
+            source["metadata"]["action"] = legacy_post_vae_hash
+            with self.assertRaisesRegex(runner.ResumeMismatch, "action evidence"):
+                runner._validate_source_contract(source, contract, action_path)
+
+    def test_source_contract_rejects_changed_action_with_stable_hash_protocol(self):
+        with tempfile.TemporaryDirectory() as temp:
+            action = np.arange(160, dtype=np.float32).reshape(16, 10)
+            action_path = Path(temp) / "action.json"
+            action_path.write_text(json.dumps(action.tolist()), encoding="utf-8")
+            source = {"metadata": {"action": runner.stable_hash(action), "prompt": "Put the pot to the left of the purple item.",
+                                     "state": "bridge_0", "seed": 0}}
+            changed = action.copy(); changed[0, 0] += np.float32(1.0)
+            contract = {"prompt": source["metadata"]["prompt"], "group": {"state": "bridge_0", "seed": 0},
+                        "action": changed.tolist()}
+            with self.assertRaisesRegex(runner.ResumeMismatch, "action evidence"):
+                runner._validate_source_contract(source, contract, action_path)
 
 
 if __name__ == "__main__":

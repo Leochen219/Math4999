@@ -136,6 +136,13 @@ match. It also binds `spec.sample_id`, `spec.replay_id`, `spec.seed`,
 hash-tampered, or precision-mismatched records fail closed; no fallback status
 is fabricated.
 
+The launch/source action binding now uses the Task 6 `stable_hash` identity
+protocol (dtype, NUL separator, shape, NUL separator, and contiguous bytes),
+matching the recorded Task 6 plan and launch contract. The older post-VAE
+action hash without separators is not accepted for source provenance, and a
+changed action is rejected before live execution. Other latent and direction
+hashes are unchanged.
+
 ## Verification
 
 Using the required bundled NumPy interpreter:
@@ -143,7 +150,7 @@ Using the required bundled NumPy interpreter:
 ```text
 python -m py_compile run_umi_task7_experiment.py
 python -m unittest test_run_umi_task7_experiment
-Ran 46 tests; OK
+Ran 47 tests; OK
 python -m unittest test_run_umi_task7_experiment test_umi_task7_runtime \
     test_umi_task7_encoder test_umi_task7_official_deferred
 Ran 56 tests; OK (skipped=2)

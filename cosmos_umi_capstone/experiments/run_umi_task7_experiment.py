@@ -18,12 +18,12 @@ from typing import Any, Callable, Mapping
 import numpy as np
 
 try:
-    from .umi_task6_primitives import evaluate_resources, parse_action
+    from .umi_task6_primitives import evaluate_resources, parse_action, stable_hash
     from .umi_fd_post_vae_bridge import construct_delta
     from .run_umi_task6_experiment import ResourceMonitor
     from .umi_precision_storage import ProcessLock, publish_directory
 except ImportError:  # direct import from experiments/
-    from umi_task6_primitives import evaluate_resources, parse_action
+    from umi_task6_primitives import evaluate_resources, parse_action, stable_hash
     from umi_fd_post_vae_bridge import construct_delta
     from run_umi_task6_experiment import ResourceMonitor
     from umi_precision_storage import ProcessLock, publish_directory
@@ -387,7 +387,7 @@ def _validate_source_contract(source: Mapping[str, Any], contract: Mapping[str, 
     if not isinstance(metadata, Mapping):
         raise ResumeMismatch("Task 7 source metadata is incomplete")
     action = parse_action(_load_json(Path(action_path)))
-    action_hash = _task6_array_hash(action)
+    action_hash = stable_hash(action)
     if str(metadata.get("action")) != action_hash:
         raise ResumeMismatch("action evidence differs from the manifest-protected Task 6 plan")
     prompt = metadata.get("prompt")
@@ -398,7 +398,7 @@ def _validate_source_contract(source: Mapping[str, Any], contract: Mapping[str, 
         if group.get("state") != metadata.get("state") or int(group.get("seed", -1)) != int(metadata.get("seed", -2)):
             raise ResumeMismatch("state/seed evidence differs between Task 6 plan and launch contract")
     contract_action = contract.get("action")
-    if contract_action is not None and _task6_array_hash(parse_action(contract_action)) != action_hash:
+    if contract_action is not None and stable_hash(parse_action(contract_action)) != action_hash:
         raise ResumeMismatch("action evidence differs between launch contract and action file")
     settings = metadata.get("settings")
     expected_settings = contract.get("settings")
