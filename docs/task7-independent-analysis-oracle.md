@@ -2,7 +2,7 @@
 
 This is an algebraic test oracle, not experimental/model evidence.
 
-Use a condition mask with two selected scalar coordinates, z0=(0,0), v0=(sqrt(2),0), so mask RMS(v0)=1. Let F0(z)=b0+M0*z, F1(z)=b1+M1*z, with arbitrary fixed offsets b0,b1 and
+Use a condition mask with two selected scalar coordinates, z0=(1,2), v0=(sqrt(2),0), so mask RMS(v0)=1 and the reference RMS is nonzero. Let F0(z)=b0+M0*z, F1(z)=b1+M1*z, with arbitrary fixed offsets b0,b1 and
 
 M0 = [[2,1],[1,3]], M1 = [[1,-1],[2,1]].
 

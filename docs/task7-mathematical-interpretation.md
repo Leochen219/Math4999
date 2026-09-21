@@ -9,14 +9,14 @@ have different coordinates and are not substituted into this norm.
 ## The measured maps
 
 For fixed repeated action and seed s_t (s_0=0, s_1=1), let
-F_t=E_FP32 o P o D_FP32 o G_t. These are the implemented finite-precision
+Fhat_t=E_FP32 o P o D_FP32 o G_t. These are the implemented finite-precision
 maps with the fixed loaded weights, not an assertion about exact real
 arithmetic. z0 is Task6's saved starting condition; we do not retrospectively
 replace its native initial VAE encoding. All feedback encoding thereafter
 uses the tested FP32 path.
 
-Baseline: z1=F0(z0), z2=F1(z1).
-Perturbed: z1'=F0(z0+delta0), z2'=F1(z1').
+Baseline: z1=Fhat_0(z0), z2=Fhat_1(z1).
+Perturbed: z1'=Fhat_0(z0+delta0), z2'=Fhat_1(z1').
 delta1=z1'-z1; delta2=z2'-z2, computed in FP32 and reduced in FP64.
 A1=||delta1||/||delta0|| and A2=||delta2||/||delta0|| measure finite-amplitude
 trajectory sensitivity. If delta1 is nonzero, A2/A1=||delta2||/||delta1||.
@@ -26,14 +26,18 @@ matching a real physical trajectory.
 
 ## Conditional linear prediction
 
-If F1 is Frechet differentiable at baseline z1, then
-delta2=J1 delta1+R1(delta1), where ||R1(delta)||/||delta|| tends to zero as
+For theory only, reserve F1 for an ideal real-arithmetic reference map with
+the same fixed represented weights and specified pipeline. FP32 is not this
+exact reference. Define eta(z)=Fhat_1(z)-F1(z). If F1 is Frechet differentiable
+at the measured baseline z1, its ideal response delta2_star satisfies
+delta2_star=F1(z1+delta1)-F1(z1)=J1 delta1+R1(delta1), where
+||R1(delta)||/||delta|| tends to zero as
 delta tends to zero. This is an assumption on an idealized local map; a
 finite set of observed PASS results does not prove it.
 
 For each independently observed nonzero delta1, define w=delta1/||delta1||.
 For requested h, centered response is
-q_h=[F1(z1+h*w)-F1(z1-h*w)]/(2h).
+q_h=[Fhat_1(z1+h*w)-Fhat_1(z1-h*w)]/(2h).
 Actual FP32 endpoints yield measured positive and negative lengths h+ and
 h-. We use q_actual=(Fplus-Fminus)/(h+ + h-), record directional cosine and
 asymmetry, and reject vanished/changed input directions; recording actual
@@ -49,12 +53,18 @@ silently merge them or project to v0,v1,v2.
 
 ## Error decomposition and noise floors
 
-Write q_actual=J1*w+e_FD. Then
-||delta2-delta2_hat|| <= ||R1(delta1)|| + ||delta1||*||e_FD||.
-This separates local finite-amplitude remainder from directional-estimator
-error under the differentiability assumption. If F1 is C3 along w with
+Write q_actual=J1*w+e_FD. The measured evaluation response is
+delta2=delta2_star+eta(z1+delta1)-eta(z1). Consequently,
+||delta2-delta2_hat|| <= ||R1(delta1)|| + ||delta1||*||e_FD||
+                         + ||eta(z1+delta1)-eta(z1)||.
+This separates local finite-amplitude remainder, directional-estimator error
+and numerical error in the evaluated response. The final term cannot be
+silently omitted for measured FP32 outputs. It vanishes only for ideal exact
+evaluation, not merely because repeated baseline tensors are identical.
+If F1 is C3 along w with
 bounded third derivative M3 and exact symmetric endpoints,
-||q_h-J1*w|| <= M3*h^2/6.
+the exact-reference central quotient q_h_star obeying
+||q_h_star-J1*w|| <= M3*h^2/6.
 If each endpoint evaluation has absolute numerical error at most eta,
 its contribution to quotient error is at most eta/h. Only after assuming
 eta<=C*u at a fixed output scale can this be abbreviated O(h^2)+O(u/h).
