@@ -15,3 +15,15 @@ The second-step derivative ray is w=sign(c)*(2,1)*sqrt(2/5); it is NOT the initi
 A deliberate erroneous implementation that projects delta1 to the old v0 predicts the wrong second-step response; this oracle catches it. Offsets ensure raw-output division or mixing z1/z0 cannot accidentally pass. Use separate baselines for each stage and include a cross-stage baseline tamper case.
 
 For denominator convention, q_next=1.2*q_current gives relative RMS change .2 with current denominator, not 1/6; maintain Task5 convention. Zero floor means NONZERO_ABOVE_EXACT_ZERO only for nonzero response, not infinity in JSON. Two baseline samples cannot establish a calibrated confidence interval.
+
+## Independent FP32 arithmetic check (2026-09-21)
+
+Main evaluated the same matrices with zero offsets, float32 z0=(1,2),
+v0=(sqrt(2),0), absolute input step a=[.001,.003,.01] (not alpha*s_z
+in this small arithmetic check), both signs, and beta=.1. Endpoint and
+response differences were float32, RMS float64; quotient denominators and
+ray scaling were cast to float32. Across six cases A1 ranged
+2.2360491289--2.2362564684, A2 ranged 5.0989765321--5.0994493391, and
+Eprop ranged .0000345187--.0007709605. Thus an exact-linear FP32 fixture
+must not assert bitwise zero Eprop at these small steps. These numbers
+verify arithmetic expectations only, not a Task7 model PASS.
