@@ -27,6 +27,7 @@ def rms(value):
 
 rows = []
 frozen = None
+baseline_encoded = None
 direction = array(ROOT / 'samples/bridge_0__seed_0__v0_alpha_00_plus/direction.npy')
 for name in IDS:
     sample = ROOT / 'samples' / ('bridge_0__seed_0__' + name)
@@ -52,5 +53,15 @@ for name in IDS:
     assert image.dtype == np.float32 and image.shape == (3, 256, 256), name
     assert image.min() >= 0 and image.max() <= 1, name
     assert encoded.dtype == np.float32 and encoded.size == mask.sum(), name
-    rows.append({'sample': name, 'input_rms': rms(delta[mask]), 'frame_sha256': record['artifact_sha256']['decoded_final_float32.npy'], 'native_encoder_sha256': record['artifact_sha256']['direct_condition_latent_float32.npy'], 'condition_shape': list(encoded.shape)})
-print(json.dumps({'status': 'PASS', 'samples': len(rows), 'source_roots': [str(ROOT), str(DEC)], 'z0_mask_sha256': frozen, 'v0_mask_rms': rms(direction[mask]), 'z0_mask_rms': rms(z0[mask]), 'rows': rows}, indent=2))
+    if baseline_encoded is None:
+        baseline_encoded = encoded.copy()
+    response = rms(np.subtract(encoded, baseline_encoded, dtype=np.float32))
+    rows.append({'sample': name, 'input_rms': rms(delta[mask]), 'historical_native_feedback_rms': response, 'frame_sha256': record['artifact_sha256']['decoded_final_float32.npy'], 'native_encoder_sha256': record['artifact_sha256']['direct_condition_latent_float32.npy'], 'condition_shape': list(encoded.shape)})
+fits = {}
+for sign in ('plus', 'minus'):
+    selected = [row for row in rows if row['sample'].endswith(sign)]
+    x = np.log([row['input_rms'] for row in selected])
+    y = np.log([row['historical_native_feedback_rms'] for row in selected])
+    slope, intercept = np.polyfit(x, y, 1)
+    fits[sign] = {'slope': float(slope), 'r2': float(1 - np.sum((y - slope*x - intercept)**2) / np.sum((y-y.mean())**2))}
+print(json.dumps({'status': 'PASS', 'samples': len(rows), 'source_roots': [str(ROOT), str(DEC)], 'z0_mask_sha256': frozen, 'v0_mask_rms': rms(direction[mask]), 'z0_mask_rms': rms(z0[mask]), 'historical_native_feedback_fits': fits, 'rows': rows}, indent=2))

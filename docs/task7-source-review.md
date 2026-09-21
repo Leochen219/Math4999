@@ -35,3 +35,5 @@ Main executed docs/audit_task7_sources.py via SSH stdin, read-only, existing int
 - original baseline native encoder hashes identical: 5f0c623a5528e0ed31de40161f36021b0fd7642a74ff11207007a7ff41baa4b9.
 
 These certify reusable historical sources, NOT new Task7 native parity or FP32 encoder results. Baseline direction.npy is zero; use v0 perturbation sample's frozen direction.
+
+Main separately recomputed historical FP32-D/native-E response fits from saved tensors using FP32 subtraction and FP64 RMS/log-regression: positive slope0.3289542934710816/R2 .9854004011650195; negative slope0.3078037944437673/R2 .9421924909399971. Repeat native feedback RMS floor0. These reproduce the previous feedback failure, without rerunning generation. Native responses at increasing alpha: positive [.003871857230272033,.005124663850646798,.008237886417794776], negative [.004070815021787626,.004892222082939002,.008231347672179710]. New FP32-E must be measured, not extrapolated from these values.
