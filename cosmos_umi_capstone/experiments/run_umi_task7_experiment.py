@@ -775,6 +775,99 @@ def _error_counts(error: BaseException) -> dict[str, int]:
         return _empty_counts()
 
 
+def _strict_operation_counts(value: Any, *, context: str) -> dict[str, int]:
+    """Validate an observed G/D/E mapping without filling in missing calls."""
+    try:
+        return _capture_counts({"operation_counts": value})
+    except (TypeError, ValueError) as error:
+        raise ResumeMismatch(f"{context} has invalid operation counts") from error
+
+
+def _failed_attempt_paths(store: Task7SampleStore, sample_id: str, *, include_active: bool) -> list[Path]:
+    paths: list[Path] = []
+    if include_active and store._path(sample_id).is_dir():
+        paths.append(store._path(sample_id))
+    paths.extend(sorted(store.root.glob(f"{sample_id}.attempt.*")))
+    paths.extend(sorted(store.root.glob(f"{sample_id}.failed-attempt.*")))
+    return [path for path in paths if path.is_dir()]
+
+
+def _validate_interrupted_attempts(stage: str, plan: list[dict[str, Any]],
+                                   failed_attempts: Any, store: Task7SampleStore,
+                                   *, include_active: bool) -> list[dict[str, Any]]:
+    """Validate preserved interruptions and bind their counts to failure artifacts."""
+    if failed_attempts is None:
+        failed_attempts = []
+    if not isinstance(failed_attempts, list):
+        raise ResumeMismatch("failed_attempts must be a list")
+    planned_ids = {spec["sample_id"] for spec in plan}
+    normalized: list[dict[str, Any]] = []
+    seen_entries: set[str] = set()
+    by_sample: dict[str, list[dict[str, Any]]] = {}
+    for index, entry in enumerate(failed_attempts):
+        if not isinstance(entry, Mapping):
+            raise ResumeMismatch(f"failed_attempts[{index}] is not a mapping")
+        sample_id = entry.get("sample_id")
+        if not isinstance(sample_id, str) or sample_id not in planned_ids:
+            raise ResumeMismatch("failed attempt is unbound to the stage plan")
+        if entry.get("interrupted") is not True or entry.get("type") not in {"KeyboardInterrupt", "InterruptedError"}:
+            raise ResumeMismatch("complete stage contains a non-interrupted failed attempt")
+        counts = _strict_operation_counts(entry.get("operation_counts"), context=f"failed_attempts[{index}]")
+        normalized_entry = dict(entry)
+        normalized_entry["operation_counts"] = counts
+        try:
+            identity = canonical_json(normalized_entry)
+        except (TypeError, ValueError) as error:
+            raise ResumeMismatch(f"failed_attempts[{index}] is not serializable") from error
+        if identity in seen_entries:
+            raise ResumeMismatch("duplicate failed attempt evidence")
+        seen_entries.add(identity)
+        normalized.append(normalized_entry)
+        by_sample.setdefault(sample_id, []).append(normalized_entry)
+
+    for sample_id, entries in by_sample.items():
+        available: list[dict[str, int]] = []
+        for path in _failed_attempt_paths(store, sample_id, include_active=include_active):
+            status_path = path / "status.json"
+            if not status_path.is_file():
+                raise ResumeMismatch(f"interrupted attempt lacks status evidence: {path}")
+            status = _load_json(status_path)
+            if not isinstance(status, Mapping) or status.get("status") != "failed":
+                raise ResumeMismatch(f"interrupted attempt status is not failed: {path}")
+            available.append(_strict_operation_counts(status.get("operation_counts"),
+                                                       context=f"interrupted attempt {path}"))
+        if len(available) != len(entries):
+            raise ResumeMismatch("interrupted attempt evidence count does not match status records")
+        for entry in entries:
+            expected = entry["operation_counts"]
+            try:
+                match = next(index for index, counts in enumerate(available) if counts == expected)
+            except StopIteration as error:
+                raise ResumeMismatch("failed attempt is not bound to preserved failure evidence") from error
+            available.pop(match)
+    for path in store.root.iterdir():
+        if not path.is_dir():
+            continue
+        name = path.name
+        sample_id = None
+        for marker in (".attempt.", ".failed-attempt."):
+            if marker in name:
+                sample_id = name.split(marker, 1)[0]
+                break
+        if sample_id is not None and (sample_id not in planned_ids or sample_id not in by_sample):
+            raise ResumeMismatch("orphaned interrupted-attempt evidence")
+    if include_active:
+        for sample_id in planned_ids:
+            active = store._path(sample_id)
+            if not active.is_dir() or sample_id in by_sample:
+                continue
+            status_path = active / "status.json"
+            active_status = _load_json(status_path) if status_path.is_file() else {}
+            if isinstance(active_status, Mapping) and active_status.get("status") == "failed":
+                raise ResumeMismatch("unbound active interrupted-attempt evidence")
+    return normalized
+
+
 def _validate_stage_payload(stage: str, payload: Mapping[str, Any]) -> None:
     """Reject resumable records that lack the approved scientific evidence."""
     stage = str(stage).upper()
@@ -870,7 +963,8 @@ def _reset_sample_peak_memory() -> None:
 def run_stage(stage: str, run_dir: str | Path, *, execute: Callable[[Mapping[str, Any]], Any],
               binding: Mapping[str, Any], resume: bool = False, monitor: Any | None = None,
               allowed_skips: bool = False, cleanup_sample: Callable[[], Mapping[str, Any]] | None = None,
-              reset_sample_peak: Callable[[], None] | None = None) -> dict[str, Any]:
+              reset_sample_peak: Callable[[], None] | None = None,
+              setup_evidence_ref: str | None = None) -> dict[str, Any]:
     """Run exactly one stage with a process lock and strict evidence resume."""
     stage = str(stage).upper()
     if stage not in {"A", "B", "C"}:
@@ -921,10 +1015,11 @@ def run_stage(stage: str, run_dir: str | Path, *, execute: Callable[[Mapping[str
                         or prior.get("formal_counts") != stage_counts(stage)
                         or completed_ids | skipped_ids != planned_ids or completed_ids & skipped_ids or prior.get("failed_samples")):
                     raise ResumeMismatch("complete status sample-id set is inconsistent")
+                failed_attempts = _validate_interrupted_attempts(stage, plan, prior.get("failed_attempts", []), store,
+                                                                 include_active=False)
                 recomputed_attempts, recomputed_completed = _empty_counts(), _empty_counts()
-                for entry in prior.get("failed_attempts", []):
-                    if isinstance(entry, Mapping):
-                        _add_counts(recomputed_attempts, entry.get("operation_counts", {}))
+                for entry in failed_attempts:
+                    _add_counts(recomputed_attempts, entry["operation_counts"])
                 for spec in plan:
                     path = store._path(spec["sample_id"]); store._verify(path)
                     record = _load_json(path / "record.json")
@@ -947,10 +1042,10 @@ def run_stage(stage: str, run_dir: str | Path, *, execute: Callable[[Mapping[str
                 # Rebuild attempted counts from the preserved failed-attempt
                 # evidence only; successful artifacts are counted exactly once
                 # when their planned rows reach ``prepare(...)=skip`` below.
-                failed_attempts = list(prior.get("failed_attempts", []))
+                failed_attempts = _validate_interrupted_attempts(stage, plan, prior.get("failed_attempts", []), store,
+                                                                 include_active=True)
                 for entry in failed_attempts:
-                    if isinstance(entry, Mapping):
-                        _add_counts(attempt_counts, entry.get("operation_counts", {}))
+                    _add_counts(attempt_counts, entry["operation_counts"])
 
         def write_status(state: str, **extra: Any) -> dict[str, Any]:
             payload = {"schema_version": "umi-task7-run-v2", "status": state, "stage": stage,
@@ -961,6 +1056,8 @@ def run_stage(stage: str, run_dir: str | Path, *, execute: Callable[[Mapping[str
                        "observed_counts": dict(attempt_counts), "completed_counts": dict(completed_counts),
                        "formal_counts": stage_counts(stage), "failed_attempts": list(failed_attempts),
                        "binding": config["binding"], "last_resources": getattr(monitor, "last_resources", {}) or {}, **extra}
+            if setup_evidence_ref is not None:
+                payload["setup_evidence_path"] = str(setup_evidence_ref)
             _atomic_json(status_path, payload)
             return payload
 
@@ -1657,11 +1754,16 @@ def _precheck_resume(root: Path, args: argparse.Namespace) -> int | None:
             raise ResumeMismatch("existing complete stage has an incomplete sample set")
         if (status.get("planned_samples") != len(plan_ids) or status.get("failed_count") != 0
                 or status.get("formal_counts") != stage_counts(args.stage)
-                or status.get("failed_samples") or status.get("failed_attempts")
+                or status.get("failed_samples")
                 or status.get("attempt_counts") != status.get("observed_counts")):
             raise ResumeMismatch("existing complete stage counters are incomplete")
         store = Task7SampleStore(stage_root / "samples")
+        failed_attempts = _validate_interrupted_attempts(str(args.stage).upper(), build_stage_plan(args.stage),
+                                                         status.get("failed_attempts", []), store,
+                                                         include_active=False)
         recomputed_attempts, recomputed_completed = _empty_counts(), _empty_counts()
+        for entry in failed_attempts:
+            _add_counts(recomputed_attempts, entry["operation_counts"])
         for sample_id in plan_ids:
             sample_path = store._path(sample_id)
             sample_status = store._verify(sample_path)
@@ -1694,6 +1796,7 @@ def _record_live_failure(root: Path, error: BaseException, *, generation_started
                          monitor: Any | None = None, cleanup_errors: list[BaseException] | None = None,
                          observed_counts: Mapping[str, Any] | None = None,
                          setup_evidence: Mapping[str, Any] | None = None,
+                         setup_evidence_path: str | Path | None = None,
                          stage_status: Mapping[str, Any] | None = None) -> None:
     error_counts = _error_counts(error)
     counts = _empty_counts()
@@ -1710,7 +1813,10 @@ def _record_live_failure(root: Path, error: BaseException, *, generation_started
         "source": {key: source[key] for key in ("source_tree_sha256", "task7_code_sha256", "z0", "mask", "v0") if key in (source or {})},
         "last_resources": getattr(monitor, "last_resources", {}) or {},
         "cleanup_errors": [repr(item) for item in (cleanup_errors or [])],
-        "setup_evidence": dict(setup_evidence or {}), "primary_error": repr(error)})
+        "setup_evidence": dict(setup_evidence or {}),
+        "setup_evidence_path": str(setup_evidence_path) if setup_evidence_path is not None else None,
+        "error_capture": dict(getattr(error, "capture", {})) if isinstance(getattr(error, "capture", None), Mapping) else None,
+        "primary_error": repr(error)})
 
 
 def _mark_stage_cleanup_failure(root: Path, stage: str, cleanup_errors: list[BaseException]) -> None:
@@ -1823,17 +1929,62 @@ def _strict_gpu_sampler(base_sampler: Callable[[], Mapping[str, Any]], gpu_index
     return sample
 
 
+def _snapshot_instance_slot(owner: Any, name: str) -> tuple[bool, Any]:
+    slots = getattr(owner, "__dict__", None)
+    if isinstance(slots, Mapping):
+        return name in slots, slots.get(name)
+    return hasattr(owner, name), getattr(owner, name, None)
+
+
+def _restore_instance_slot(owner: Any, name: str, snapshot: tuple[bool, Any]) -> None:
+    present, value = snapshot
+    slots = getattr(owner, "__dict__", None)
+    if isinstance(slots, Mapping):
+        if present:
+            setattr(owner, name, value)
+        elif name in slots:
+            delattr(owner, name)
+        return
+    if present:
+        setattr(owner, name, value)
+
+
+def _setup_evidence_path(root: Path, stage: str) -> Path:
+    setup_root = Path(root) / "setup"
+    stage_name = str(stage).lower()
+    base = setup_root / stage_name
+    if not base.exists():
+        return base / "setup_evidence.json"
+    index = 1
+    candidate = setup_root / f"{stage_name}-attempt-{index:03d}"
+    while candidate.exists():
+        index += 1
+        candidate = setup_root / f"{stage_name}-attempt-{index:03d}"
+    return candidate / "setup_evidence.json"
+
+
+def _persist_setup_evidence(root: Path, stage: str, evidence: Mapping[str, Any],
+                            *, path: Path | None = None) -> Path:
+    target = Path(path) if path is not None else _setup_evidence_path(Path(root), stage)
+    payload = dict(evidence)
+    payload.setdefault("stage", str(stage).upper())
+    _atomic_json(target, payload)
+    return target
+
+
 def _install_setup_encoder_observer(factory: Any) -> tuple[dict[str, Any], Callable[[], None]]:
     """Observe loader-owned tokenizer encodes during factory setup only."""
     evidence: dict[str, Any] = {"boundary": "factory.loader_payload_encoder.encode",
-                                "installed": False, "ownership_restored": False,
-                                "encode_calls": 0, "encode_failures": []}
+                                 "installed": False, "ownership_restored": False,
+                                 "encode_calls": 0, "encode_failures": []}
+    factory_loader_snapshot = _snapshot_instance_slot(factory, "loader")
     loader = getattr(factory, "loader", None)
     if not callable(loader):
         evidence["reason"] = "factory_loader_unavailable"
+        evidence["ownership_restored"] = True
         return evidence, lambda: None
     original_loader = loader
-    restore_owner: list[tuple[Any, Any]] = []
+    restore_owner: list[tuple[Any, tuple[bool, Any]]] = []
 
     def observed_loader(*args: Any, **kwargs: Any) -> Any:
         try:
@@ -1846,7 +1997,9 @@ def _install_setup_encoder_observer(factory: Any) -> tuple[dict[str, Any], Calla
         method = getattr(owner, "encode", None)
         if not callable(method):
             evidence["reason"] = "loader_encoder_encode_unavailable"
-            return payload
+            raise BlockedExecution("factory setup encoder observer target is unavailable")
+
+        owner_snapshot = _snapshot_instance_slot(owner, "encode")
 
         def observed_encode(*encode_args: Any, **encode_kwargs: Any) -> Any:
             evidence["encode_calls"] = int(evidence["encode_calls"]) + 1
@@ -1860,21 +2013,25 @@ def _install_setup_encoder_observer(factory: Any) -> tuple[dict[str, Any], Calla
             setattr(owner, "encode", observed_encode)
         except BaseException as error:
             evidence["installation_error"] = repr(error)
-        else:
-            restore_owner.append((owner, method))
-            evidence["installed"] = True
+            raise BlockedExecution("factory setup encoder observer installation failed") from error
+        restore_owner.append((owner, owner_snapshot))
+        evidence["installed"] = True
         return payload
 
     try:
         setattr(factory, "loader", observed_loader)
     except BaseException as error:
         evidence["installation_error"] = repr(error)
-        return evidence, lambda: None
+        raise BlockedExecution("factory loader observer installation failed") from error
 
     def restore() -> None:
-        for owner, method in restore_owner:
-            setattr(owner, "encode", method)
-        setattr(factory, "loader", original_loader)
+        try:
+            for owner, snapshot in reversed(restore_owner):
+                _restore_instance_slot(owner, "encode", snapshot)
+            _restore_instance_slot(factory, "loader", factory_loader_snapshot)
+        except BaseException as error:
+            evidence["restore_error"] = repr(error)
+            raise
         evidence["ownership_restored"] = True
 
     return evidence, restore
@@ -1897,6 +2054,8 @@ def _run_live(args: argparse.Namespace, root: Path, *, factory: Any | None, moni
     binding: dict[str, Any] = {}
     live_observed_counts = _empty_counts()
     setup_evidence: dict[str, Any] = {}
+    setup_evidence_path: Path | None = None
+    setup_evidence_ref: str | None = None
     setup_restore: Callable[[], None] | None = None
     stage_status: dict[str, Any] = {}
     try:
@@ -1935,14 +2094,28 @@ def _run_live(args: argparse.Namespace, root: Path, *, factory: Any | None, moni
         require_resource_snapshot(getattr(monitor, "last_resources", {}), phase="preload")
         if factory is None:
             factory = _default_factory(args, source)
-        setup_evidence, setup_restore = _install_setup_encoder_observer(factory)
+        setup_evidence_path = _setup_evidence_path(root, args.stage)
+        try:
+            setup_evidence, setup_restore = _install_setup_encoder_observer(factory)
+        except BaseException as error:
+            setup_evidence = dict(setup_evidence or {})
+            setup_evidence.setdefault("boundary", "factory.loader_payload_encoder.encode")
+            setup_evidence["installation_exception"] = repr(error)
+            setup_evidence_path = _persist_setup_evidence(root, args.stage, setup_evidence,
+                                                           path=setup_evidence_path)
+            setup_evidence_ref = str(setup_evidence_path.relative_to(root))
+            raise
         try:
             built = factory.build() if hasattr(factory, "build") else (factory(args, source) if callable(factory) else factory)
         finally:
-            if setup_restore is not None:
-                setup_restore()
+            try:
+                if setup_restore is not None:
+                    setup_restore()
+            finally:
                 setup_restore = None
-            _atomic_json(root / "setup_evidence.json", setup_evidence)
+                setup_evidence_path = _persist_setup_evidence(root, args.stage, setup_evidence,
+                                                               path=setup_evidence_path)
+                setup_evidence_ref = str(setup_evidence_path.relative_to(root))
         if not isinstance(built, (tuple, list)) or len(built) < 3:
             raise BlockedExecution("factory must return (Task6RuntimeAdapter, inputs, encoder)")
         adapter, inputs, encoder = built[0], built[1], built[2]
@@ -1998,7 +2171,11 @@ def _run_live(args: argparse.Namespace, root: Path, *, factory: Any | None, moni
                 record = feedback.step(feedback.extract_condition(consumed), 0)
                 live_observed_counts = _capture_counts(record)
             except BaseException as error:
-                error.capture = {"operation_counts": dict(live_observed_counts), "stage_boundary": "smoke_feedback"}
+                live_observed_counts = _error_counts(error)
+                capture = dict(getattr(error, "capture", {})) if isinstance(getattr(error, "capture", None), Mapping) else {}
+                capture.setdefault("operation_counts", dict(live_observed_counts))
+                capture["stage_boundary"] = "smoke_feedback"
+                error.capture = capture
                 raise
             try:
                 expected = _load_array(_source_sample_root(Path(source["raw_root"]), "baseline_pre") / "output_full.npy")
@@ -2033,6 +2210,7 @@ def _run_live(args: argparse.Namespace, root: Path, *, factory: Any | None, moni
             _atomic_json(root / "smoke" / "run_status.json", {"status": "SMOKE_COMPLETE", "engineering": True,
                 "formal_counts": _empty_counts(), "observed_counts": size, "resource_pre": pre, "resource_post": post,
                 "resource_cleanup": cleanup, "peak_snapshot": post_snapshot,
+                "setup_evidence_path": setup_evidence_ref,
                 "binding": {"source": source.get("source_tree_sha256"),
                             "task7_code_sha256": source.get("task7_code_sha256"),
                             "action": source.get("metadata", {}).get("action") if isinstance(source.get("metadata"), Mapping) else None,
@@ -2056,7 +2234,8 @@ def _run_live(args: argparse.Namespace, root: Path, *, factory: Any | None, moni
             executor = make_stage_executor(args.stage, source=source, feedback=feedback, run_dir=root)
             result = run_stage(args.stage, root / "stages" / args.stage, execute=executor, binding=binding,
                                resume=args.resume, monitor=monitor, allowed_skips=args.stage == "C",
-                               cleanup_sample=_release_sample_memory, reset_sample_peak=_reset_sample_peak_memory)
+                               cleanup_sample=_release_sample_memory, reset_sample_peak=_reset_sample_peak_memory,
+                               setup_evidence_ref=setup_evidence_ref)
             result_code = 0 if result.get("status") == "COMPLETE" else 1
             live_observed_counts = dict(result.get("attempt_counts") or _empty_counts())
             stage_status = dict(result)
@@ -2067,7 +2246,7 @@ def _run_live(args: argparse.Namespace, root: Path, *, factory: Any | None, moni
                                      generation_started=bool((result.get("attempt_counts") or {}).get("G", 0)),
                                      binding=binding, source=source, monitor=monitor,
                                      observed_counts=live_observed_counts, stage_status=stage_status,
-                                     setup_evidence=setup_evidence)
+                                     setup_evidence=setup_evidence, setup_evidence_path=setup_evidence_ref)
     except BaseException as error:
         primary = error
         if smoke_staged is not None:
@@ -2078,6 +2257,7 @@ def _run_live(args: argparse.Namespace, root: Path, *, factory: Any | None, moni
         _record_live_failure(root, error, generation_started=bool(_error_counts(error).get("G", 0)),
                              binding=binding, source=source, monitor=monitor,
                              observed_counts=live_observed_counts, setup_evidence=setup_evidence,
+                             setup_evidence_path=setup_evidence_ref,
                              stage_status=stage_status)
     finally:
         cleanup_errors: list[BaseException] = []
@@ -2102,7 +2282,8 @@ def _run_live(args: argparse.Namespace, root: Path, *, factory: Any | None, moni
                                                         or _error_counts(primary or cleanup).get("G", 0)),
                                  binding=binding, source=source, monitor=monitor,
                                  cleanup_errors=cleanup_errors, observed_counts=live_observed_counts,
-                                 setup_evidence=setup_evidence, stage_status=stage_status)
+                                 setup_evidence=setup_evidence, setup_evidence_path=setup_evidence_ref,
+                                 stage_status=stage_status)
             _mark_stage_cleanup_failure(root, args.stage, cleanup_errors)
             if primary is None: primary = cleanup
             else:

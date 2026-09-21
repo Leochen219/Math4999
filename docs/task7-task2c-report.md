@@ -88,11 +88,25 @@ resumes do not overwrite earlier evidence.
 Failure accounting retains returned G/D/E counts through smoke parity/peak
 gates, publication, factory unload, and monitor shutdown. Root `run_status.json`
 stores those live counts separately from `error_operation_counts`, preserves
-the formal `stage_status`, and records setup-boundary evidence in
-`setup_evidence.json` (including observed loader-tokenizer encode calls and
-failures at the `factory.loader_payload_encoder.encode` boundary, with method
-ownership restored in `finally`). A smoke completion is changed to a terminal cleanup failure if
-shutdown/unload fails, so it cannot be reused.
+the formal `stage_status`, and records the original smoke feedback exception
+capture (including partial diagnostics) without replacing it with zero counts.
+Setup-boundary evidence (including observed loader-tokenizer encode calls and
+failures at the `factory.loader_payload_encoder.encode` boundary) is persisted
+under stage/attempt-scoped paths such as `setup/smoke/setup_evidence.json` and
+`setup/a-attempt-001/setup_evidence.json`; smoke/stage/root status records
+reference the immutable path. The observer snapshots `__dict__` ownership for
+both the factory loader and tokenizer encode slot, removes temporary shadows
+when a class method was originally inherited, preserves instance overrides,
+and fails closed on installation/restoration errors. Setup observations remain
+separate from formal G/D/E counts. A smoke completion is changed to a terminal
+cleanup failure if shutdown/unload fails, so it cannot be reused.
+
+Complete-stage resume accepts preserved `KeyboardInterrupt`/`InterruptedError`
+attempts only when each entry is plan-bound, structurally valid, count-valid,
+duplicate-free, and matched to a preserved failed-attempt artifact. Genuine
+failed/resource-stop attempts, malformed or unbound entries, orphaned attempt
+evidence, and inconsistent totals remain terminal/rejected. A verified
+COMPLETE resume is read-only and performs no executor/factory calls.
 
 The C analyzer gate must contain these exact lineage fields in addition to the
 existing scientific/source/code fields:
@@ -117,13 +131,13 @@ Using the required bundled NumPy interpreter:
 ```text
 python -m py_compile run_umi_task7_experiment.py
 python -m unittest test_run_umi_task7_experiment
-Ran 38 tests in 2.768s; OK
+Ran 43 tests; OK
 python -m unittest test_run_umi_task7_experiment test_umi_task7_runtime \
     test_umi_task7_encoder test_umi_task7_official_deferred
-Ran 51 tests in 2.851s; OK (skipped=2)
+Ran 56 tests; OK (skipped=2)
 ```
 
-The dependency aggregate is 51 tests with 2 existing optional real-Torch skips
+The dependency aggregate is 56 tests with 2 existing optional real-Torch skips
 (`test_run_umi_task7_experiment test_umi_task7_runtime test_umi_task7_encoder
 test_umi_task7_official_deferred`). No model, GPU, download, environment
 installation, or remote mutation was performed. Focused runner tests cover
@@ -137,7 +151,10 @@ stage-scoped monitor paths, smoke cleanup failure status, and resume identity
 guards. Round3 adds weak-reference output release, live smoke/formal root
 counter preservation, setup encoder observation/restoration, no-resume smoke
 lockout, strict COMPLETE counter reconstruction/duplicate rejection, and
-foreign A/B gate lineage rejection.
+foreign A/B gate lineage rejection. Round4 adds original smoke exception-capture
+preservation, exact class-vs-instance observer restoration, non-overwriting
+setup evidence paths with status references, and verified interrupted-attempt
+COMPLETE resume/no-op behavior.
 
 The independent analyzer remains responsible for scientific A/B/C decisions;
 the runner only consumes an explicitly bound C gate.

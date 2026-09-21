@@ -204,6 +204,33 @@ class Task7RunnerTests(unittest.TestCase):
                 runner.main(args, factory=factory, monitor=monitor)
         self.assertEqual(factory.built, built)
 
+    def test_smoke_feedback_exception_preserves_partial_capture_and_counts(self):
+        class FailingFeedback:
+            def __init__(self, *args, **kwargs):
+                pass
+            def extract_condition(self, value):
+                return np.asarray(value).copy()
+            def step(self, condition, step):
+                error = RuntimeError("feedback failed after partial work")
+                error.capture = {"operation_counts": {"G": 1, "D": 1, "E": 0},
+                                 "diagnostic_marker": "partial-gd"}
+                raise error
+
+        root, factory, monitor, patches = self._main_fixture()
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(runner, "_code_digest", return_value="code"))
+            for patch in patches:
+                stack.enter_context(patch)
+            stack.enter_context(mock.patch("umi_task7_runtime.FeedbackRuntime", FailingFeedback))
+            with self.assertRaises(RuntimeError):
+                runner.main(["--stage", "smoke", "--run-dir", str(root), "--raw-root", str(root.parent / "source"),
+                             "--decoder-root", str(root.parent / "source"), "--launch-contract", str(root / "contract")],
+                            factory=factory, monitor=monitor)
+        status = json.loads((root / "run_status.json").read_text(encoding="utf-8"))
+        self.assertEqual(status["operation_counts"], {"G": 1, "D": 1, "E": 0})
+        self.assertEqual(status["error_operation_counts"], {"G": 1, "D": 1, "E": 0})
+        self.assertEqual(status["error_capture"]["diagnostic_marker"], "partial-gd")
+
     def test_formal_failure_root_preserves_stage_attempt_counts(self):
         root, factory, monitor, patches = self._main_fixture()
         (root / "contract").write_text("contract", encoding="utf-8")
@@ -243,6 +270,128 @@ class Task7RunnerTests(unittest.TestCase):
         self.assertIs(factory.loader, original_loader)
         self.assertTrue(evidence["ownership_restored"])
         self.assertEqual(raw.encode("ok2"), "ok2")
+
+    def test_setup_encoder_observer_restores_class_slots_and_instance_overrides(self):
+        class RawEncoder:
+            def encode(self, value):
+                if value == "bad":
+                    raise RuntimeError("class encode failed")
+                return value
+
+        class Factory:
+            def loader(self):
+                return {"encoder": type("Adapter", (), {"encoder": RawEncoder()})()}
+
+        factory = Factory()
+        evidence, restore = runner._install_setup_encoder_observer(factory)
+        payload = factory.loader()
+        self.assertEqual(payload["encoder"].encoder.encode("ok"), "ok")
+        with self.assertRaises(RuntimeError):
+            payload["encoder"].encoder.encode("bad")
+        self.assertEqual(evidence["encode_calls"], 2)
+        self.assertEqual(len(evidence["encode_failures"]), 1)
+        restore()
+        self.assertTrue(evidence["ownership_restored"])
+        self.assertNotIn("loader", factory.__dict__)
+        self.assertNotIn("encode", payload["encoder"].encoder.__dict__)
+
+        raw = RawEncoder()
+        original_encode = lambda value: "instance:" + value
+        raw.encode = original_encode
+        adapter = type("Adapter", (), {"encoder": raw})()
+        original_loader = lambda: {"encoder": adapter}
+        factory = type("Factory", (), {})()
+        factory.loader = original_loader
+        evidence, restore = runner._install_setup_encoder_observer(factory)
+        self.assertEqual(factory.loader()["encoder"].encoder.encode("ok"), "instance:ok")
+        restore()
+        self.assertIs(factory.__dict__["loader"], original_loader)
+        self.assertIs(raw.__dict__["encode"], original_encode)
+
+    def test_setup_evidence_is_stage_and_attempt_scoped(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            first = runner._persist_setup_evidence(root, "smoke", {"encode_calls": 1})
+            second = runner._persist_setup_evidence(root, "A", {"encode_calls": 2})
+            retry = runner._persist_setup_evidence(root, "A", {"encode_calls": 3})
+            self.assertNotEqual(first, second)
+            self.assertNotEqual(second, retry)
+            self.assertEqual(json.loads(first.read_text(encoding="utf-8"))["encode_calls"], 1)
+            self.assertEqual(json.loads(second.read_text(encoding="utf-8"))["encode_calls"], 2)
+            self.assertEqual(json.loads(retry.read_text(encoding="utf-8"))["encode_calls"], 3)
+
+    def test_complete_resume_accepts_verified_interrupted_attempt_and_is_noop(self):
+        with tempfile.TemporaryDirectory() as temp:
+            calls = []
+            first = True
+
+            def execute(spec):
+                calls.append(spec["sample_id"])
+                nonlocal first
+                if first:
+                    first = False
+                    error = KeyboardInterrupt("operator stop")
+                    error.capture = {"operation_counts": {"G": 1, "D": 0, "E": 0}}
+                    raise error
+                return _a_record()
+
+            stage = Path(temp) / "stage"
+            runner.run_stage("A", stage, execute=execute, binding=runner.test_binding("A"),
+                             monitor=runner.StaticMonitor(_safe_snapshot()))
+            resumed = runner.run_stage("A", stage, execute=execute, binding=runner.test_binding("A"),
+                                       monitor=runner.StaticMonitor(_safe_snapshot()), resume=True)
+            self.assertEqual(resumed["status"], "COMPLETE")
+            before = {path: path.read_bytes() for path in (stage / "run_status.json", stage / "samples" / "A_baseline_pre_native" / "status.json")}
+            calls_before = len(calls)
+            checked = runner.run_stage("A", stage, execute=lambda _spec: self.fail("complete resume executed"),
+                                       binding=runner.test_binding("A"), monitor=runner.StaticMonitor(_safe_snapshot()), resume=True)
+            self.assertEqual(checked["status"], "COMPLETE")
+            self.assertEqual(len(calls), calls_before)
+            self.assertEqual({path: path.read_bytes() for path in before}, before)
+
+            status = json.loads((stage / "run_status.json").read_text(encoding="utf-8"))
+            status["failed_attempts"].append(dict(status["failed_attempts"][0]))
+            (stage / "run_status.json").write_text(json.dumps(status), encoding="utf-8")
+            with self.assertRaises(runner.ResumeMismatch):
+                runner.run_stage("A", stage, execute=lambda _spec: _a_record(),
+                                 binding=runner.test_binding("A"), monitor=runner.StaticMonitor(_safe_snapshot()), resume=True)
+
+    def test_precheck_complete_resume_allows_verified_interrupted_attempts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            stage = root / "stages" / "A"
+            first = True
+
+            def execute(_spec):
+                nonlocal first
+                if first:
+                    first = False
+                    error = KeyboardInterrupt("operator stop")
+                    error.capture = {"operation_counts": {"G": 1, "D": 0, "E": 0}}
+                    raise error
+                return _a_record()
+
+            runner.run_stage("A", stage, execute=execute, binding=runner.test_binding("A"),
+                             monitor=runner.StaticMonitor(_safe_snapshot()))
+            runner.run_stage("A", stage, execute=execute, binding=runner.test_binding("A"),
+                             monitor=runner.StaticMonitor(_safe_snapshot()), resume=True)
+            contract = root / "contract.json"
+            contract.write_text(json.dumps({"code_bundle_sha256": "c" * 64}), encoding="utf-8")
+            status_path = stage / "run_status.json"
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            status["binding"] = {**status["binding"],
+                                  "config": {"stage": "A", "plan": runner.build_stage_plan("A")},
+                                  "launch_contract_sha256": runner.sha256_file(contract),
+                                  "model": "model", "vae": "vae", "framework": "framework"}
+            status_path.write_text(json.dumps(status), encoding="utf-8")
+            args = runner.parse_args(["--stage", "A", "--run-dir", str(root), "--resume",
+                                      "--raw-root", str(root / "raw"), "--decoder-root", str(root / "decoder"),
+                                      "--launch-contract", str(contract)])
+            with mock.patch.object(runner, "validate_task7_sources", return_value={"source_tree_sha256": "fixture-source"}), \
+                 mock.patch.object(runner, "_code_digest", return_value="fixture-task7-code"), \
+                 mock.patch.object(runner, "_load_contract", return_value={"checkpoint_identity": {"sha256": "model"},
+                     "vae_sha256": "vae", "framework_commit": "framework"}):
+                self.assertEqual(runner._precheck_resume(root, args), 0)
 
     def _complete_resume_fixture(self, temp):
         root = Path(temp); stage = root / "stages" / "A"
