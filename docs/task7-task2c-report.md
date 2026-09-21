@@ -70,42 +70,46 @@ available <300/RSS >160/swap >0 stops, cleanup-growth stops, and the strict
 1.3*measured-success-bytes*remaining + 5 GiB forecast before launching a
 sample. There is no deletion or retry path after an OOM or monitor failure.
 
+Live orchestration now takes a run-wide lock before preload, pins the launch to
+GPU 0 with `HF_HUB_OFFLINE=1`, and keeps factory unload plus monitor stop in a
+single cleanup path.  Formal samples persist synchronous `pre_call`,
+`post_call`, and `post_cleanup` monitor captures when the production monitor is
+used; accumulated allocated/reserved/NVML peaks are derived from monitor rows,
+and ambiguous post-load all-zero Torch allocation telemetry is a hard stop.
+Smoke requires historical first-G latent parity, a complete post-call resource
+gate, the 35/45 GiB accumulated peak limits, measured artifact publication,
+and final cleanup capture before `SMOKE_COMPLETE` is written.
+
 ## Verification
 
 Using the required bundled NumPy interpreter:
 
 ```text
 python -m py_compile run_umi_task7_experiment.py
+python -m unittest test_run_umi_task7_experiment
+Ran 21 tests in 0.606s; OK
 python -m unittest test_run_umi_task7_experiment test_umi_task7_runtime \
-    test_umi_task7_encoder test_umi_task7_official_deferred -v
-Ran 20 tests in 0.315s
-OK (skipped=2)
+    test_umi_task7_encoder test_umi_task7_official_deferred
+Ran 34 tests in 0.652s; OK (skipped=2)
 ```
 
-The two skips are the existing optional real-Torch fixtures; no model, GPU,
-download, environment installation, or remote mutation was performed. Focused
-runner tests cover CLI bindings, exact stage plans/counts, strict resource
-failures, root containment, atomic failed-attempt preservation, observed
-failed invocation counts, and generation-free preflight.
+The dependency aggregate is 34 tests with 2 existing optional real-Torch skips
+(`test_run_umi_task7_experiment test_umi_task7_runtime test_umi_task7_encoder
+test_umi_task7_official_deferred`). No model, GPU, download, environment
+installation, or remote mutation was performed. Focused runner tests cover
+CLI bindings, exact plans/counts, strict resource failures, protected-root
+containment, source-contract historical action hashing, atomic artifact
+references, interrupted resume accounting, all-16 A orchestration, B own-step
+resume, and all-38 C ray/probe inputs.
 
 The independent analyzer remains responsible for scientific A/B/C decisions;
 the runner only consumes an explicitly bound C gate.
 
-## Current concerns / release boundary
+## Release boundary
 
 This worker did not perform a model, GPU, remote, or live-framework call. The
-default `main` path now constructs the real Task 6 `OfficialRuntimeFactory`,
-performs the strict preload check, wraps its returned tokenizer with
-`FeedbackEncoder`, and binds the underlying official runtime; that wiring is
-not empirically validated here because the approved runtime/model environment
-is intentionally out of scope for this CPU worker. The seven runner tests use
-an injected CPU monitor and executor, so they do not claim that a live factory
-build, NVML/cgroup sampler, smoke first-G parity, or CUDA cleanup succeeds.
-The smoke path still needs main’s live review to confirm the recorded first-G
-latent is checked against the historical baseline before acceptance.
-
-The immutable-source validator has strict checks for the reviewed Task 6 plan,
-raw/decoder hashes, z0/mask/v0 geometry, and perturbation reconstruction, but
-was not run against the remote historical source tree in this worker. Main
-should independently run preflight/smoke with the released source/contract,
-review actual resource and operation evidence, and only then release A/B/C.
+CPU integration tests use injected factory/monitor seams and therefore do not
+claim that the installed CUDA runtime, NVML sampler, or historical source tree
+has passed a release smoke. Main must independently run the immutable-source
+preflight and the real smoke with the released contract, review actual
+operation/resource evidence, and only then release formal A/B/C stages.

@@ -1,6 +1,8 @@
 import json
 import tempfile
 import unittest
+from unittest import mock
+from contextlib import ExitStack
 from pathlib import Path
 
 import numpy as np
@@ -15,6 +17,20 @@ def _safe_snapshot():
             "disk_free_gib": 100.0, "cgroup_memory_limited": False,
             "cgroup_memory_limit_gib": None, "cgroup_memory_current_gib": None,
             "cgroup_memory_free_gib": None}
+
+
+class StaticTestMonitor:
+    def __init__(self):
+        self.last_resources = _safe_snapshot()
+        self.captures = []
+        self.stopped = False
+    def check(self, **kwargs):
+        return {"status": "OK", "snapshot": dict(self.last_resources)}
+    def capture_sample(self, *args, **kwargs):
+        self.captures.append(kwargs.get("phase", args[1] if len(args) > 1 else ""))
+        return {"decision_status": "OK"}
+    def stop(self):
+        self.stopped = True
 
 
 class Task7RunnerTests(unittest.TestCase):
@@ -87,6 +103,49 @@ class Task7RunnerTests(unittest.TestCase):
             self.assertEqual(result["completed_count"], 0)
             self.assertTrue((Path(temp) / "samples" / "A_baseline_pre_native.attempt.001" / "status.json").is_file())
 
+    def test_interrupted_run_resumes_and_accumulates_attempt_counts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            first = True
+            def execute(spec):
+                nonlocal first
+                if first:
+                    first = False
+                    error = KeyboardInterrupt("operator stop")
+                    error.capture = {"operation_counts": {"G": 1, "D": 0, "E": 0}}
+                    raise error
+                return {"evidence": {"operation_counts": {"G": 0, "D": 0, "E": 1}}}
+            interrupted = runner.run_stage("A", temp, execute=execute,
+                                           binding=runner.test_binding("A"),
+                                           monitor=runner.StaticMonitor(_safe_snapshot()))
+            self.assertEqual(interrupted["status"], "RUNNING")
+            self.assertEqual(interrupted["attempt_counts"], {"G": 1, "D": 0, "E": 0})
+            resumed = runner.run_stage("A", temp, execute=execute,
+                                       binding=runner.test_binding("A"), resume=True,
+                                       monitor=runner.StaticMonitor(_safe_snapshot()))
+            self.assertEqual(resumed["status"], "COMPLETE")
+            self.assertEqual(resumed["completed_count"], 16)
+            self.assertEqual(resumed["attempt_counts"], {"G": 1, "D": 0, "E": 16})
+            checked = runner.run_stage("A", temp, execute=execute,
+                                       binding=runner.test_binding("A"), resume=True,
+                                       monitor=runner.StaticMonitor(_safe_snapshot()))
+            self.assertEqual(checked["attempt_counts"], resumed["attempt_counts"])
+
+    def test_formal_post_capture_stop_preserves_attempted_counts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            class Monitor(StaticTestMonitor):
+                def capture_sample(self, *args, **kwargs):
+                    phase = kwargs.get("phase", "")
+                    self.captures.append(phase)
+                    if phase == "post_call":
+                        return {"decision_status": "HARD_STOP", "reason_code": "POST_GATE"}
+                    return {"decision_status": "OK"}
+            result = runner.run_stage("A", temp,
+                execute=lambda spec: {"evidence": {"operation_counts": {"G": 0, "D": 0, "E": 1}}},
+                binding=runner.test_binding("A"), monitor=Monitor())
+            self.assertEqual(result["status"], "RESOURCE_STOP")
+            self.assertEqual(result["attempt_counts"], {"G": 0, "D": 0, "E": 1})
+            self.assertEqual(result["completed_count"], 0)
+
     def test_run_directory_must_not_be_inside_read_only_source(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -99,14 +158,257 @@ class Task7RunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             run = Path(temp) / "run"
             called = []
-            result = runner.main([
-                "--stage", "preflight", "--run-dir", str(run),
-            ], factory=lambda *_a, **_k: called.append(True))
-            self.assertEqual(result, 0)
+            with self.assertRaises(runner.BlockedExecution):
+                runner.main(["--stage", "preflight", "--run-dir", str(run)], factory=lambda *_a, **_k: called.append(True))
             self.assertEqual(called, [])
-            status = json.loads((run / "run_status.json").read_text(encoding="utf-8"))
-            self.assertEqual(status["status"], "PREFLIGHT_COMPLETE")
-            self.assertFalse(status["generation_started"])
+
+    def _main_fixture(self, *, record_full=None, monitor=None):
+        base = Path(tempfile.mkdtemp()); root = base / "run"; root.mkdir(); source_root = base / "source"; source_root.mkdir()
+        z0 = np.zeros((1, 1, 1, 1, 4), dtype=np.float32)
+        mask = np.zeros_like(z0, dtype=bool); mask[..., :2] = True
+        v0 = np.zeros_like(z0); v0[..., 0] = 1.0
+        consumed = z0.copy(); expected = np.ones_like(z0)
+        source = {"raw_root": str(source_root), "decoder_root": str(source_root), "source_tree_sha256": "source",
+                  "task7_code_sha256": "code", "z0_sha256": runner._array_hash(z0),
+                  "mask_sha256": runner._array_hash(mask), "v0_sha256": runner._array_hash(v0)}
+        contract = {"checkpoint_identity": {"sha256": "model"}, "vae_sha256": "vae",
+                    "framework_commit": "framework", "code_bundle_sha256": "c" * 64}
+
+        Geometry = type("Geometry", (), {"mask": mask, "condition_indexes": (0,)})
+        Inputs = type("Inputs", (), {"z0": z0, "geometry": Geometry(), "directions": {"v0": v0}})
+
+        class Adapter:
+            runtime = object()
+
+        class FakeFeedback:
+            def __init__(self, *args, **kwargs): self.mask = mask; self.encoder = FakeEncoder()
+            def extract_condition(self, value): return np.asarray(value).copy()
+            def step(self, condition, step):
+                full = expected.copy() if record_full is None else np.asarray(record_full).copy()
+                return {"full_latent": full, "encoded_condition": np.zeros((1, 1, 1, 1, 4), np.float32),
+                        "evidence": {"operation_counts": {"G": 1, "D": 1, "E": 1}}}
+
+        class FakeEncoder:
+            def __init__(self, *args, **kwargs): pass
+            def encode(self, frame, precision="native"):
+                return {"arrays": {"actual_output": expected.copy()},
+                        "evidence": {"actual_encoder_input_dtype": "float32", "actual_output_dtype": "float32",
+                                     "operation_count": 1, "dispatch_observed": True}}
+
+        class Factory:
+            def __init__(self): self.built = 0; self.unloaded = 0
+            def build(self): self.built += 1; return (Adapter(), Inputs(), object())
+            def unload(self): self.unloaded += 1
+
+        fake_monitor = monitor or StaticTestMonitor()
+        patches = [mock.patch.object(runner, "validate_task7_sources", return_value=source),
+                   mock.patch.object(runner, "_load_contract", return_value=contract),
+                   mock.patch.object(runner, "_source_condition", return_value=(z0, consumed)),
+                   mock.patch.object(runner, "_source_sample_root", return_value=source_root),
+                   mock.patch.object(runner, "_load_array", side_effect=lambda path: expected.copy() if ("output_full" in str(path) or "direct_condition" in str(path)) else (mask.copy() if "mask" in str(path) else v0.copy())),
+                   mock.patch("umi_task7_runtime.FeedbackRuntime", FakeFeedback),
+                   mock.patch("umi_task7_encoder.FeedbackEncoder", FakeEncoder)]
+        return root, Factory(), fake_monitor, patches
+
+    def test_main_preload_hardstop_does_not_build_factory(self):
+        class Monitor(StaticTestMonitor):
+            def check(self, **kwargs): raise runner.ResourceStop("preload")
+        root, factory, monitor, patches = self._main_fixture(monitor=Monitor())
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(runner, "_code_digest", return_value="code"))
+            for patch in patches: stack.enter_context(patch)
+            with self.assertRaises(runner.ResourceStop):
+                runner.main(["--stage", "smoke", "--run-dir", str(root), "--raw-root", str(root.parent / "source"), "--decoder-root", str(root.parent / "source"), "--launch-contract", str(root / "contract")], factory=factory, monitor=monitor)
+        self.assertEqual(factory.built, 0)
+
+    def test_main_stage_a_executes_all_sixteen_cpu_fixture_samples(self):
+        root, factory, monitor, patches = self._main_fixture()
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(runner, "_code_digest", return_value="code"))
+            stack.enter_context(mock.patch.object(runner, "_source_frame", return_value=np.zeros((3, 1, 1, 1), dtype=np.float32)))
+            stack.enter_context(mock.patch.object(runner, "_decoder_sample_root", return_value=root.parent / "source"))
+            for patch in patches: stack.enter_context(patch)
+            result = runner.main(["--stage", "A", "--run-dir", str(root), "--raw-root", str(root.parent / "source"),
+                                  "--decoder-root", str(root.parent / "source"), "--launch-contract", str(root / "contract")],
+                                 factory=factory, monitor=monitor)
+            self.assertEqual(result, 0, json.loads((root / "stages" / "A" / "run_status.json").read_text(encoding="utf-8")))
+        status = json.loads((root / "stages" / "A" / "run_status.json").read_text(encoding="utf-8"))
+        self.assertEqual(status["status"], "COMPLETE")
+        self.assertEqual(status["completed_count"], 16)
+        self.assertEqual(factory.unloaded, 1)
+
+    def test_main_smoke_rejects_historical_g_mismatch_and_unloads(self):
+        root, factory, monitor, patches = self._main_fixture(record_full=np.zeros((1, 1, 1, 1, 4), np.float32))
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(runner, "_code_digest", return_value="code"))
+            for patch in patches: stack.enter_context(patch)
+            with self.assertRaises(runner.ResumeMismatch):
+                runner.main(["--stage", "smoke", "--run-dir", str(root), "--raw-root", str(root.parent / "source"), "--decoder-root", str(root.parent / "source"), "--launch-contract", str(root / "contract")], factory=factory, monitor=monitor)
+        self.assertEqual(factory.unloaded, 1)
+        self.assertTrue((root / "run_status.json").is_file())
+
+    def test_main_smoke_post_capture_peak_violation_is_rejected(self):
+        class Monitor(StaticTestMonitor):
+            def capture_sample(self, *args, **kwargs):
+                self.captures.append(kwargs.get("phase", args[1] if len(args) > 1 else ""))
+                if self.captures[-1] == "post_call":
+                    return {"decision_status": "HARD_STOP", "reason_code": "GPU_SMOKE_PEAK_ALLOCATED_HIGH"}
+                return {"decision_status": "OK"}
+        root, factory, monitor, patches = self._main_fixture(monitor=Monitor())
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(runner, "_code_digest", return_value="code"))
+            for patch in patches: stack.enter_context(patch)
+            with self.assertRaises(runner.ResourceStop):
+                runner.main(["--stage", "smoke", "--run-dir", str(root), "--raw-root", str(root.parent / "source"), "--decoder-root", str(root.parent / "source"), "--launch-contract", str(root / "contract")], factory=factory, monitor=monitor)
+        self.assertIn("post_call", monitor.captures)
+
+    def test_preflight_without_production_bindings_is_not_complete(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaises(runner.BlockedExecution):
+                runner.main(["--stage", "preflight", "--run-dir", temp])
+
+    def test_main_never_writes_failure_status_into_protected_source_root(self):
+        with tempfile.TemporaryDirectory() as temp:
+            raw = Path(temp) / "raw"; raw.mkdir()
+            sentinel = raw / "run_status.json"; sentinel.write_text("sentinel", encoding="utf-8")
+            with self.assertRaises(runner.ResumeMismatch):
+                runner.main(["--stage", "preflight", "--run-dir", str(raw),
+                             "--raw-root", str(raw), "--decoder-root", str(raw)])
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "sentinel")
+
+    def test_c_probe_uses_mask_rms_and_normalized_ray(self):
+        z1 = np.zeros((1, 1, 1, 1, 4), dtype=np.float32)
+        mask = np.zeros_like(z1, dtype=bool); mask[..., :2] = True
+        direction = np.zeros_like(z1); direction[..., :2] = (3.0, 4.0)
+        seen = []
+        class Feedback:
+            def __init__(self): self.mask = mask
+            def extract_condition(self, full): return full.copy()
+            def step(self, condition, step): seen.append(condition.copy()); return {"evidence": {"operation_counts": {"G": 1, "D": 1, "E": 1}}}
+        source = {"analysis_gate": {"a_scientific_pass": True, "b_engineering_pass": True, "b_repeatability_pass": True, "source_sha256": "s", "code_sha256": "c"},
+                  "source_tree_sha256": "s", "task7_code_sha256": "c", "z1": z1, "delta1_directions": {"delta1_00": direction}}
+        executor = runner.make_stage_executor("C", source=source, feedback=Feedback())
+        spec = next(item for item in runner.build_stage_plan("C") if item.get("direction_id") == "delta1_00" and item.get("beta") == .1 and item.get("sign") == 1)
+        executor(spec)
+        np.testing.assert_array_equal(seen[0][..., :2], np.asarray([[[[[.3, .4]]]]], dtype=np.float32))
+
+    def test_c_executor_runs_all_38_actual_ray_probes_and_gate(self):
+        z1 = np.zeros((1, 1, 1, 1, 2), dtype=np.float32)
+        mask = np.ones_like(z1, dtype=bool)
+        directions = {f"delta1_{index:02d}": np.full_like(z1, index + 1, dtype=np.float32) for index in range(6)}
+        seen = []
+        class Feedback:
+            def __init__(self): self.mask = mask
+            def extract_condition(self, value): return np.asarray(value).copy()
+            def step(self, condition, step):
+                seen.append(np.array(condition, copy=True))
+                return {"evidence": {"operation_counts": {"G": 1, "D": 1, "E": 1}}}
+        source = {"analysis_gate": {"a_scientific_pass": True, "b_engineering_pass": True, "b_repeatability_pass": True,
+                                     "source_sha256": "s", "code_sha256": "c"},
+                  "source_tree_sha256": "s", "task7_code_sha256": "c", "z1": z1,
+                  "delta1_directions": directions}
+        executor = runner.make_stage_executor("C", source=source, feedback=Feedback())
+        plan = runner.build_stage_plan("C")
+        for spec in plan:
+            executor(spec)
+        self.assertEqual(len(seen), 38)
+        self.assertTrue(np.array_equal(seen[0], z1))
+        self.assertTrue(np.array_equal(seen[-1], z1))
+        index = 0
+        for spec in plan[1:-1]:
+            direction = directions[spec["direction_id"]]
+            expected = np.float32(spec["sign"] * spec["beta"]) * direction
+            np.testing.assert_array_equal(seen[index + 1], expected)
+            index += 1
+
+    def test_b_step1_resume_loads_only_verified_step0_condition(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source_root = root / "source"; source_root.mkdir()
+            condition0 = np.zeros((1, 1, 1, 1, 2), dtype=np.float32)
+            condition1 = np.full_like(condition0, 2.0)
+            full = np.zeros((1, 1, 1, 1, 2), dtype=np.float32)
+            mask = np.ones_like(full, dtype=bool)
+            source = {"raw_root": str(source_root), "decoder_root": str(source_root)}
+            class Feedback:
+                def __init__(self): self.seen = []
+                def extract_condition(self, value): return np.asarray(value).copy()
+                def step(self, condition, step):
+                    condition = np.asarray(condition).copy(); self.seen.append(condition)
+                    encoded = condition1.copy()
+                    return {"full_latent": full.copy(), "encoded_condition": encoded,
+                            "next_condition_fp32": encoded.copy(),
+                            "actual": {key: condition.copy() for key in ("prepared_condition", "initial_condition", "reference_condition", "first_condition", "last_condition")}
+                                      | {"condition_steps": np.repeat(condition[None], 30, axis=0)},
+                            "evidence": {"operation_counts": {"G": 1, "D": 1, "E": 1},
+                                         "prediction_noise_hash": f"noise-{step}"}}
+            feedback = Feedback()
+            spec0 = next(item for item in runner.build_stage_plan("B") if item["sample_id"] == "B_baseline_pre_step_0")
+            spec1 = next(item for item in runner.build_stage_plan("B") if item["sample_id"] == "B_baseline_pre_step_1")
+            real_load_array = runner._load_array
+            def load_array(path, **kwargs):
+                return full.copy() if Path(path).parent == source_root else real_load_array(path, **kwargs)
+            with mock.patch.object(runner, "_source_condition", return_value=(condition0.copy(), condition0.copy())), \
+                 mock.patch.object(runner, "_source_sample_root", return_value=source_root), \
+                 mock.patch.object(runner, "_load_array", side_effect=load_array):
+                executor = runner.make_stage_executor("B", source=source, feedback=feedback, run_dir=root)
+                record0 = executor(spec0)
+                store = runner.Task7SampleStore(root / "stages" / "B" / "samples")
+                store.write_success(spec0["sample_id"], {"spec": spec0, "record": record0},
+                                    operation_counts={"G": 1, "D": 1, "E": 1})
+                # A fresh executor models a process restart.  It must reload
+                # the verified condition instead of relying on its old map.
+                resumed = runner.make_stage_executor("B", source=source, feedback=feedback, run_dir=root)
+                resumed(spec1)
+            np.testing.assert_array_equal(feedback.seen[-1], condition1)
+
+    def test_c_source_uses_b_step0_condition_and_b_step1_baseline(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); samples = root / "stages" / "B" / "samples"
+            store = runner.Task7SampleStore(samples)
+            shape = (1, 1, 1, 1, 2); z1 = np.zeros(shape, dtype=np.float32)
+            z2 = np.ones(shape, dtype=np.float32)
+            for name in ("baseline_pre", "v0_alpha_00_plus", "v0_alpha_00_minus", "v0_alpha_01_plus",
+                         "v0_alpha_01_minus", "v0_alpha_02_plus", "v0_alpha_02_minus"):
+                encoded = z1.copy() if name == "baseline_pre" else np.full(shape, len(name), dtype=np.float32)
+                spec0 = next(item for item in runner.build_stage_plan("B") if item["sample_id"] == f"B_{name}_step_0")
+                record0 = {"encoded_condition": encoded, "evidence": {"operation_counts": {"G": 1, "D": 1, "E": 1}}}
+                store.write_success(spec0["sample_id"], {"spec": spec0, "record": record0}, operation_counts={"G": 1, "D": 1, "E": 1})
+            spec1 = next(item for item in runner.build_stage_plan("B") if item["sample_id"] == "B_baseline_pre_step_1")
+            store.write_success(spec1["sample_id"], {"spec": spec1, "record": {"full_latent": z2,
+                "evidence": {"prediction_noise_hash": "seed1"}}}, operation_counts={"G": 1, "D": 1, "E": 1})
+            (root / "analysis_gate.json").write_text(json.dumps({"a_scientific_pass": True, "b_engineering_pass": True,
+                "b_repeatability_pass": True, "source_sha256": "source", "code_sha256": "code"}), encoding="utf-8")
+            source = {"source_tree_sha256": "source", "task7_code_sha256": "code"}
+            runner._prepare_c_source(source, root)
+            np.testing.assert_array_equal(source["z1"], z1)
+            np.testing.assert_array_equal(source["b_z2"], z2)
+            np.testing.assert_array_equal(source["delta1_directions"]["delta1_00"], np.full(shape, len("v0_alpha_00_plus"), dtype=np.float32))
+
+    def test_success_record_references_must_be_manifest_bound(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = runner.Task7SampleStore(Path(temp))
+            path = store.write_success("sample", {"array": np.ones((2,), dtype=np.float32)})
+            record = json.loads((path / "record.json").read_text(encoding="utf-8"))
+            record["tampered"] = {"artifact": "missing.npy", "dtype": "float32", "shape": [1]}
+            (path / "record.json").write_text(json.dumps(record), encoding="utf-8")
+            status = json.loads((path / "status.json").read_text(encoding="utf-8"))
+            status["artifact_sha256"]["record.json"] = runner.sha256_file(path / "record.json")
+            (path / "status.json").write_text(json.dumps(status), encoding="utf-8")
+            with self.assertRaises(runner.ResumeMismatch):
+                store.prepare("sample", resume=True)
+
+    def test_source_contract_uses_historical_task6_action_hash(self):
+        with tempfile.TemporaryDirectory() as temp:
+            action = np.arange(160, dtype=np.float32).reshape(16, 10)
+            action_path = Path(temp) / "action.json"
+            action_path.write_text(json.dumps(action.tolist()), encoding="utf-8")
+            source = {"metadata": {"action": runner._task6_array_hash(action), "prompt": "Put the pot to the left of the purple item.",
+                                     "state": "bridge_0", "seed": 0}}
+            contract = {"prompt": source["metadata"]["prompt"], "group": {"state": "bridge_0", "seed": 0},
+                        "action": action.tolist()}
+            observed = runner._validate_source_contract(source, contract, action_path)
+            np.testing.assert_array_equal(observed, action)
 
 
 if __name__ == "__main__":
