@@ -15,3 +15,7 @@ Base 439e845. New native worktree tool cannot address nested Math4999 repo (inva
 
 Task1 pending implementation. Task2/3/4 pending. User plan is authoritative spec.
 Review roles: explicit user requests main as independent reviewer; main performs task-scoped and final review (not additional unsolicited reviewer seats).
+
+Task1 implementer /root/luna_task7_encoder (Luna xhigh). Main authorized ONLY small-code CPU-test upload to fresh task7-cpu-check directory with CUDA_VISIBLE_DEVICES empty, no model loading. GPU experiments not released.
+Preliminary review while tests developed: guard torch=None class definitions; repair invalid test RGB >1 and missing fixture train state; snapshot actual parameter/buffer collection slots because Module.to replaces buffers; inspect converted slot not old reference; control cuda.matmul.allow_tf32; never silently swallow restore failures. Implementer notified; final review pending.
+Read-only environment: CUDA torch2.10.0+cu130, GPUused0, cgroup110GiB, disk12.1GiB. Data source8 frames and raw hash confirmed. docs/task7-source-review.md and task7-mathematical-interpretation.md completed by main; docs/task7-task2-brief.md prepared but not dispatched.
