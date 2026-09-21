@@ -123,7 +123,11 @@ class PrecisionCompatibilityError(EvidenceError):
     """Observed compute cannot satisfy requested precision; allow module gate."""
 
 
-def validate_capture(record, spec, inputs, scope, *, paired_noise=None):
+def validate_capture(record, spec, inputs, scope, *, paired_noise=None, require_decoded=True):
+    if not isinstance(require_decoded, bool):
+        raise ValueError("require_decoded must be a boolean")
+    if not require_decoded and scope != "full":
+        raise ValueError("deferred decode validation is only valid for full generation scope")
     mask = inputs.geometry.mask
     expected_seed_raw = spec.get("model_seed", spec.get("seed", 0))
     if isinstance(expected_seed_raw, bool) or not isinstance(expected_seed_raw, numbers.Integral):
@@ -202,9 +206,15 @@ def validate_capture(record, spec, inputs, scope, *, paired_noise=None):
         raise EvidenceError("initial sampler condition differs from interface")
     selected, slicing = slice_predicted_output(record["output_full"], inputs.geometry)
     if scope == "full":
-        frame = projection(record["decoded_final"])
-        if frame.ndim != 3 or frame.shape[0] != 3:
-            raise EvidenceError("decoded final float frame must be [3,H,W]")
+        if require_decoded:
+            frame = projection(record["decoded_final"])
+            if frame.ndim != 3 or frame.shape[0] != 3:
+                raise EvidenceError("decoded final float frame must be [3,H,W]")
+        else:
+            if record.get("decode_policy") != "deferred":
+                raise EvidenceError("deferred capture must identify decode_policy=deferred")
+            if "decoded_final" in record:
+                raise EvidenceError("deferred capture must not contain a decoded frame")
     elif "decoded_final" in record:
         raise EvidenceError("module fallback must never decode")
     direction = inputs.direction_for_spec(spec) if hasattr(inputs, "direction_for_spec") else inputs.direction

@@ -284,7 +284,11 @@ class OfficialPrecisionRuntime:
         prepared[5][0] = self.ops.from_array(reference.reshape(projection(prepared[5][0]).shape), prepared[5][0])
         return tuple(prepared)
 
-    def execute(self, spec, inputs, *, scope):
+    def execute(self, spec, inputs, *, scope, decode_policy="native"):
+        if decode_policy not in {"native", "deferred"}:
+            raise ValueError("decode_policy must be native or deferred")
+        if decode_policy == "deferred" and scope != "full":
+            raise ValueError("deferred decode is only valid for full generation scope")
         if scope not in ("full", "module") or inputs.identity() != self.inputs.identity():
             raise ValueError("runtime scope/input identity mismatch")
         spec_seed = spec.get("model_seed", self.model_seed)
@@ -294,7 +298,7 @@ class OfficialPrecisionRuntime:
         target = inputs.for_spec(spec) if hasattr(inputs, "for_spec") else inputs.for_call(spec["group"], spec["alpha"], spec["sign"])
         dtype = "bfloat16" if spec["group"] == "A" else "float32"
         evidence = TensorEvidence()
-        record = {"scope": scope, "tensor_evidence": evidence.rows, "steps": [], "condition_steps_fp32": [],
+        record = {"scope": scope, "decode_policy": decode_policy, "tensor_evidence": evidence.rows, "steps": [], "condition_steps_fp32": [],
                   "expected_steps": self.settings["num_steps"] if scope == "full" else 1,
                   "execution": {"casts": [], "operation_count": 0}, "decode_id": self.provenance["decode"],
                   "sampler_instances": [], "telemetry": {}}
@@ -496,19 +500,24 @@ class OfficialPrecisionRuntime:
                         raise EvidenceError("module denoiser boundary was never reached")
                     latent = result["vision"][0]
                     record["output_full"] = projection(latent)
-                    # Decode is always the same tokenizer and FP32 latent input,
-                    # with original model settings; tokenizer weights never change.
-                    model.tensor_kwargs = dict(self.original_tensor_kwargs)
-                    model.precision = self.original_precision
-                    decoded = projection(model.decode(ops.cast(latent, "float32")))
-                    decoded = np.clip((1. + decoded) / 2., 0., 1.)
-                    if decoded.ndim == 5 and decoded.shape[0] == 1:
-                        decoded = decoded[0]
-                    if decoded.ndim != 4 or decoded.shape[0] != 3:
-                        raise EvidenceError("decoded image layout is not [3,T,H,W]")
-                    record["decoded_final"] = decoded[:, -1].copy()
-                    record["image_slicing"] = {"axis": 1, "frame_index": decoded.shape[1]-1,
-                                                "source_shape": list(decoded.shape)}
+                    if decode_policy == "native":
+                        # Decode is always the same tokenizer and FP32 latent
+                        # input, with original model settings; tokenizer
+                        # weights never change.
+                        model.tensor_kwargs = dict(self.original_tensor_kwargs)
+                        model.precision = self.original_precision
+                        decoded = projection(model.decode(ops.cast(latent, "float32")))
+                        decoded = np.clip((1. + decoded) / 2., 0., 1.)
+                        if decoded.ndim == 5 and decoded.shape[0] == 1:
+                            decoded = decoded[0]
+                        if decoded.ndim != 4 or decoded.shape[0] != 3:
+                            raise EvidenceError("decoded image layout is not [3,T,H,W]")
+                        record["decoded_final"] = decoded[:, -1].copy()
+                        record["image_slicing"] = {"axis": 1, "frame_index": decoded.shape[1]-1,
+                                                    "source_shape": list(decoded.shape)}
+                    # The deferred path intentionally holds no decoded frame
+                    # or decoder closure.  The request net is restored below
+                    # before a separate Task7 FP32 VAE phase can begin.
                 except _StepZeroDone:
                     pass
             record["telemetry"] = ops.telemetry()
@@ -533,5 +542,6 @@ class OfficialPrecisionRuntime:
         # observed capture is still in memory; no invalid record can reach a
         # successful sample publication.
         self._paired_noise_hash = validate_capture(record, spec, inputs, scope,
-                                                    paired_noise=self._paired_noise_hash)
+                                                    paired_noise=self._paired_noise_hash,
+                                                    require_decoded=(decode_policy == "native"))
         return record
