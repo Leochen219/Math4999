@@ -853,6 +853,10 @@ def load_task7_stage(run_dir: str | Path, stage: str) -> dict[str, Any]:
         raise EngineeringDataError(f"unable to load Task7 stage {stage_name}: {error}") from error
     if not isinstance(status, Mapping) or status.get("status") != "COMPLETE":
         raise EngineeringDataError(f"Task7 stage {stage_name} is not COMPLETE (engineering status={status.get('status') if isinstance(status, Mapping) else None})")
+    if (not isinstance(config, Mapping) or config.get("schema_version") != "umi-task7-stage-v2"
+            or config.get("stage") != stage_name or _canonical(config.get("plan")) != _canonical(plan)
+            or config.get("plan_sha256") != hashlib.sha256(_canonical(plan).encode("utf-8")).hexdigest()):
+        raise EngineeringDataError(f"Task7 stage {stage_name} config/plan binding is inconsistent")
     expected = [str(spec["sample_id"]) for spec in plan]
     completed, skipped, failed = status.get("completed_samples"), status.get("skipped_samples"), status.get("failed_samples")
     if not isinstance(completed, list) or not isinstance(skipped, list) or not isinstance(failed, list):
@@ -913,6 +917,37 @@ def _binding(stage_data: Mapping[str, Any]) -> Mapping[str, Any]:
     return config["binding"]
 
 
+def _validate_stage_binding(stage_data: Mapping[str, Any], source: Mapping[str, Any]) -> list[str]:
+    """Bind stage config/status identities to the independently validated source."""
+    reasons: list[str] = []
+    config = stage_data.get("config")
+    status = stage_data.get("status")
+    binding = _binding(stage_data)
+    status_binding = status.get("binding") if isinstance(status, Mapping) else None
+    if not isinstance(status_binding, Mapping) or _canonical(status_binding) != _canonical(binding):
+        reasons.append("stage run_status.binding differs from stage_config.binding")
+    for key, expected in (("source", source.get("source_tree_sha256")),
+                          ("mask", source.get("mask_sha256")),
+                          ("z0", source.get("z0_sha256")),
+                          ("v0", source.get("v0_sha256"))):
+        if not isinstance(expected, str) or not expected or binding.get(key) != expected:
+            reasons.append(f"stage binding.{key} does not match validated source identity")
+    if not isinstance(binding.get("task7_code_sha256"), str) or not binding.get("task7_code_sha256"):
+        reasons.append("stage binding.task7_code_sha256 is missing")
+    config_sha = binding.get("config_sha256")
+    if config_sha is None and isinstance(config, Mapping):
+        config_sha = config.get("config_sha256")
+    if config_sha is not None:
+        config_payload = binding.get("config")
+        if not isinstance(config_payload, Mapping) or not isinstance(config_sha, str):
+            reasons.append("stage config_sha256 binding is malformed")
+        else:
+            observed = hashlib.sha256(_canonical(config_payload).encode("utf-8")).hexdigest()
+            if observed != config_sha:
+                reasons.append("stage config_sha256 does not match binding.config")
+    return reasons
+
+
 def _check_condition_chain(record: Mapping[str, Any], condition: np.ndarray, *, name: str,
                            full_mask: np.ndarray | None = None) -> list[str]:
     """Verify chain evidence at condition coordinates, returning diagnostics."""
@@ -970,10 +1005,118 @@ def _check_condition_chain(record: Mapping[str, Any], condition: np.ndarray, *, 
     return reasons
 
 
+def _encoder_frame(row: Mapping[str, Any], *, name: str) -> np.ndarray:
+    """Load one saved Task6 FP32-D frame without retaining a frame corpus."""
+    frame = row.get("frame")
+    if isinstance(frame, np.ndarray):
+        value = np.ascontiguousarray(frame)
+        if value.dtype != np.dtype(np.float32):
+            raise EngineeringDataError(f"{name} saved frame must have dtype float32")
+        return value
+    decoder = row.get("decoder")
+    if not isinstance(decoder, Path):
+        decoder = Path(str(decoder))
+    return _load_runner_array(decoder / "decoded_final_float32.npy", name=f"{name} decoded frame")
+
+
+def _validate_encoder_evidence(record: Mapping[str, Any], source_row: Mapping[str, Any], *,
+                               precision: str, encoded: np.ndarray, name: str) -> list[str]:
+    """Validate the actual FeedbackEncoder evidence before A science.
+
+    This deliberately checks the saved evidence contract rather than trusting
+    the runner's summary flag. Native keeps its observed dtype path; the
+    temporary FP32 path additionally requires all floating computation/state
+    evidence to be float32 and its backend/cache guards to have been observed.
+    """
+    reasons: list[str] = []
+    encoder = record.get("encoder")
+    if not isinstance(encoder, Mapping):
+        return [f"A {name} encoder evidence is missing"]
+    evidence = encoder.get("evidence")
+    arrays = encoder.get("arrays")
+    if not isinstance(evidence, Mapping) or not isinstance(arrays, Mapping):
+        return [f"A {name} encoder evidence/arrays mapping is missing"]
+    required_evidence = (
+        "precision_path", "input_dtype", "input_shape", "encoder_input_shape",
+        "encoder_input_dtype", "operation_count", "operation_dtypes", "encoder_identity",
+        "output_dtype", "inner_input_dtype", "inner_output_dtype", "state_dtypes",
+        "actual_encoder_input_dtype", "scaled_latent_dtype", "actual_output_dtype",
+        "dispatch_observed", "autocast_disabled", "tf32_disabled",
+        "cache_cleared_before", "cache_cleared_after",
+    )
+    for key in required_evidence:
+        if key not in evidence:
+            reasons.append(f"A {name} encoder evidence missing {key}")
+    if evidence.get("precision_path") != precision:
+        reasons.append(f"A {name} precision_path is not {precision}")
+    try:
+        frame = _encoder_frame(source_row, name=name)
+    except EngineeringDataError as error:
+        reasons.append(str(error)); frame = None
+    if frame is not None:
+        input_rgb = arrays.get("input_rgb")
+        if not isinstance(input_rgb, np.ndarray) or not byte_equal(input_rgb, frame):
+            reasons.append(f"A {name} encoder input_rgb differs from saved Task6 decoded frame")
+        if tuple(frame.shape) != tuple(evidence.get("input_shape", ())):
+            reasons.append(f"A {name} encoder input_shape differs from saved frame")
+        encoder_input = arrays.get("encoder_input")
+        expected_shape = (1, 3, 1, frame.shape[1], frame.shape[2]) if frame.ndim == 3 and frame.shape[0] == 3 else None
+        if not isinstance(encoder_input, np.ndarray):
+            reasons.append(f"A {name} encoder_input array is missing")
+        else:
+            if expected_shape is None or tuple(encoder_input.shape) != expected_shape:
+                reasons.append(f"A {name} encoder_input layout is not [1,3,1,H,W]")
+            else:
+                expected_input = np.subtract(np.multiply(frame, np.float32(2.0), dtype=np.float32),
+                                             np.float32(1.0), dtype=np.float32)[None, :, None, :, :]
+                if not byte_equal(encoder_input, expected_input):
+                    reasons.append(f"A {name} encoder_input is not the FP32 [-1,1] conversion")
+    actual_output = arrays.get("actual_output")
+    if not isinstance(actual_output, np.ndarray) or not byte_equal(actual_output, encoded):
+        reasons.append(f"A {name} actual_output differs bytewise from encoded_condition")
+    for key in ("actual_encoder_input", "actual_output"):
+        value = arrays.get(key)
+        if not isinstance(value, np.ndarray):
+            reasons.append(f"A {name} arrays.{key} is missing")
+    state = evidence.get("state_dtypes")
+    if not isinstance(state, Mapping) or any(not isinstance(state.get(bucket), Mapping) or not state[bucket]
+                                             for bucket in ("parameters", "buffers", "constants")):
+        reasons.append(f"A {name} state_dtypes is incomplete")
+    else:
+        for bucket in ("parameters", "buffers", "constants"):
+            if any(not isinstance(dtype, str) for dtype in state[bucket].values()):
+                reasons.append(f"A {name} state_dtypes contains an invalid dtype")
+    operation_dtypes = evidence.get("operation_dtypes")
+    if not isinstance(operation_dtypes, Mapping) or not operation_dtypes:
+        reasons.append(f"A {name} operation_dtypes is incomplete")
+    if not isinstance(evidence.get("operation_count"), (int, np.integer)) or int(evidence.get("operation_count", 0)) <= 0:
+        reasons.append(f"A {name} operation_count is not positive")
+    # All precision paths require the actual observed state; only FP32 mode
+    # imposes the all-float32 values and backend/cache guards.
+    dtype_fields = ("actual_encoder_input_dtype", "actual_output_dtype", "inner_input_dtype", "inner_output_dtype")
+    if precision == "temporary_fp32":
+        if evidence.get("dispatch_observed") is not True or evidence.get("operation_count", 0) <= 0:
+            reasons.append(f"A {name} FP32 dispatch evidence is incomplete")
+        if any(value != "float32" for value in evidence.get("operation_dtypes", {})):
+            reasons.append(f"A {name} FP32 operation_dtypes contains a non-float32 dtype")
+        if any(value != "float32" for bucket in ("parameters", "buffers", "constants")
+               for value in (state.get(bucket, {}).values() if isinstance(state, Mapping) and isinstance(state.get(bucket), Mapping) else ())):
+            reasons.append(f"A {name} FP32 state_dtypes contains a non-float32 dtype")
+        if any(evidence.get(key) != "float32" for key in dtype_fields):
+            reasons.append(f"A {name} FP32 inner/output dtype evidence is not float32")
+        for key in ("autocast_disabled", "tf32_disabled", "cache_cleared_before", "cache_cleared_after"):
+            if evidence.get(key) is not True:
+                reasons.append(f"A {name} FP32 {key} evidence is not true")
+    else:
+        if any(not isinstance(evidence.get(key), str) or not evidence.get(key) for key in dtype_fields):
+            reasons.append(f"A {name} native dtype evidence is incomplete")
+    return reasons
+
+
 def _a_stage_analysis(stage_data: Mapping[str, Any], source: Mapping[str, Any], *, tensors: dict[str, np.ndarray]) -> dict[str, Any]:
     records = _record_map(stage_data)
     rows = source["rows"]
-    engineering_reasons: list[str] = []
+    engineering_reasons: list[str] = _validate_stage_binding(stage_data, source)
     precision_results: dict[str, Any] = {}
     for precision in ("native", "temporary_fp32"):
         outputs: dict[str, np.ndarray] = {}
@@ -999,6 +1142,8 @@ def _a_stage_analysis(stage_data: Mapping[str, Any], source: Mapping[str, Any], 
             expected_shape = rows[name]["direct"].shape
             if tuple(output.shape) != tuple(expected_shape):
                 engineering_reasons.append(f"A output shape differs from source direct condition: {name}")
+            engineering_reasons.extend(_validate_encoder_evidence(
+                record, rows[name], precision=precision, encoded=output, name=f"{name}/{precision}"))
         if len(outputs) != 8:
             continue
         baseline = outputs["baseline_pre"]
@@ -1034,11 +1179,18 @@ def _a_stage_analysis(stage_data: Mapping[str, Any], source: Mapping[str, Any], 
                 name = f"a_{precision}_{ordinal}_{sign}_response"
                 base_name = f"v0_alpha_{ordinal:02d}_{sign}"
                 tensors[name] = fp32_difference(outputs[base_name], baseline)
-    scientific_pass = (len(precision_results) == 2 and not engineering_reasons
-                       and all(item["status"] == "PASS" for item in precision_results.values()))
+    # Native is a diagnostic comparison. The Task7 scientific release gate is
+    # the saved temporary-FP32 path; a native scientific FAIL is descriptive
+    # and must not block an otherwise valid FP32 result.
+    fp32_result = precision_results.get("temporary_fp32")
+    scientific_pass = bool(fp32_result is not None and not engineering_reasons
+                           and fp32_result["status"] == "PASS")
     return {"engineering_pass": not engineering_reasons, "engineering_reasons": engineering_reasons,
             "scientific_pass": scientific_pass, "scientific_status": "PASS" if scientific_pass else "FAIL",
-            "precision": precision_results, "a_scientific_pass": scientific_pass,
+            "precision": precision_results,
+            "native_scientific_status": precision_results.get("native", {}).get("status", "NOT_RUN"),
+            "fp32_scientific_status": fp32_result["status"] if fp32_result is not None else "NOT_RUN",
+            "a_scientific_pass": scientific_pass,
             "a_engineering_pass": not engineering_reasons}
 
 
@@ -1046,7 +1198,7 @@ def _b_stage_analysis(stage_data: Mapping[str, Any], source: Mapping[str, Any], 
                       *, tensors: dict[str, np.ndarray]) -> dict[str, Any]:
     records = _record_map(stage_data)
     source_rows = source["rows"]
-    engineering_reasons: list[str] = []
+    engineering_reasons: list[str] = _validate_stage_binding(stage_data, source)
     noise_by_seed: dict[int, str] = {}
     trajectory_metrics: dict[str, Any] = {}
     condition_mask = source["condition_mask"]
@@ -1180,7 +1332,7 @@ def _b_stage_analysis(stage_data: Mapping[str, Any], source: Mapping[str, Any], 
 def _c_stage_analysis(stage_data: Mapping[str, Any], source: Mapping[str, Any], b_result: Mapping[str, Any],
                       *, tensors: dict[str, np.ndarray]) -> dict[str, Any]:
     records = _record_map(stage_data)
-    reasons: list[str] = []
+    reasons: list[str] = _validate_stage_binding(stage_data, source)
     condition_mask = source["condition_mask"]
     baseline_pre = records.get("C_baseline_pre")
     baseline_post = records.get("C_baseline_post")

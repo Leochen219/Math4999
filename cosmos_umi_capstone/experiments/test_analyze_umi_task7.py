@@ -319,6 +319,7 @@ class Task7SavedEvidenceAOnlyTests(unittest.TestCase):
                  "v0_alpha_02_minus", "baseline_post")
         direction = np.array([np.sqrt(2.0), 0.0], dtype=np.float32)
         baseline = np.array([1.0, -1.0], dtype=np.float32)
+        frame = np.zeros((3, 2, 1), dtype=np.float32)
         rows = {}
         for name in names:
             is_baseline = name.startswith("baseline")
@@ -328,7 +329,7 @@ class Task7SavedEvidenceAOnlyTests(unittest.TestCase):
             rows[name] = {"name": name, "direct": baseline.copy(), "delta_condition": delta,
                           "consumed_condition": (baseline + delta).astype(np.float32),
                           "z0_condition": baseline.copy(), "condition_mask": np.ones(2, bool),
-                          "mask": np.ones(2, bool), "raw": Path("raw"), "decoder": Path("decoder")}
+                          "mask": np.ones(2, bool), "raw": Path("raw"), "decoder": Path("decoder"), "frame": frame}
         rows["baseline_post"]["direct"] = (baseline + np.float32(1e-7)).astype(np.float32)
         return {"raw_root": "raw", "decoder_root": "decoder", "source_tree_sha256": "fixture-source",
                 "z0_sha256": "z0", "mask_sha256": "mask", "v0_sha256": "v0", "rows": rows,
@@ -336,7 +337,8 @@ class Task7SavedEvidenceAOnlyTests(unittest.TestCase):
                 "condition_mask": np.ones(2, bool), "mask": np.ones(2, bool)}
 
     @staticmethod
-    def _write_a_stage(run: Path, source, *, native_parity=True):
+    def _write_a_stage(run: Path, source, *, native_parity=True, native_science_fail=False,
+                       bad_fp32_evidence=False):
         stage = run / "stages" / "A"; store = runner.Task7SampleStore(stage / "samples")
         plan = runner.build_stage_plan("A")
         baseline = np.array([1.0, -1.0], dtype=np.float32)
@@ -348,24 +350,46 @@ class Task7SavedEvidenceAOnlyTests(unittest.TestCase):
             elif name.startswith("baseline"):
                 output = baseline.copy()
             else:
-                output = (baseline + np.float32(2.0) * row["delta_condition"]).astype(np.float32)
-            if native_parity or name != "v0_alpha_00_plus":
+                if native_science_fail and precision == "native":
+                    output = (baseline + row["delta_condition"] * row["delta_condition"] * np.float32(1000.0)).astype(np.float32)
+                else:
+                    output = (baseline + np.float32(2.0) * row["delta_condition"]).astype(np.float32)
+            if precision == "native" and (native_parity or name != "v0_alpha_00_plus"):
                 row["direct"] = output.copy()
             if precision == "native" and not native_parity and name == "v0_alpha_00_plus":
                 row["direct"] = (output + np.array([1e-4, 0], np.float32)).astype(np.float32)
+            frame = row["frame"]
+            encoder_input = np.subtract(np.multiply(frame, np.float32(2.0), dtype=np.float32),
+                                        np.float32(1.0), dtype=np.float32)[None, :, None, :, :]
+            encoder_evidence = {
+                "precision_path": precision, "input_dtype": "float32", "input_shape": list(frame.shape),
+                "encoder_input_shape": list(encoder_input.shape), "encoder_input_dtype": "float32",
+                "operation_count": 1, "operation_dtypes": {"float32": 1}, "encoder_identity": {"fixture": True},
+                "output_dtype": "float32", "inner_input_dtype": "float32", "inner_output_dtype": "float32",
+                "state_dtypes": {"parameters": {"p": "float32"}, "buffers": {"b": "float32"}, "constants": {"c": "float32"}},
+                "actual_encoder_input_dtype": "float32", "scaled_latent_dtype": "float32", "actual_output_dtype": "float32",
+                "dispatch_observed": True, "autocast_disabled": True, "tf32_disabled": True,
+                "cache_cleared_before": True, "cache_cleared_after": True,
+            }
+            if bad_fp32_evidence and precision == "temporary_fp32":
+                encoder_evidence["operation_dtypes"] = {"bfloat16": 1}
             store.write_success(spec["sample_id"], {"spec": spec, "record": {
                 "source_name": name, "precision": precision, "encoded_condition": output,
-                "encoder": {"schema_version": "fixture"},
+                "encoder": {"evidence": encoder_evidence, "arrays": {
+                    "input_rgb": frame, "encoder_input": encoder_input,
+                    "actual_encoder_input": encoder_input, "actual_output": output}},
                 "evidence": {"operation_counts": {"G": 0, "D": 0, "E": 1}}}},
                 operation_counts={"G": 0, "D": 0, "E": 1})
         binding = {"source": "fixture-source", "task7_code_sha256": "fixture-code", "config": "fixture",
                    "model": "fixture", "vae": "fixture", "framework": "fixture", "mask": "mask",
                    "z0": "z0", "v0": "v0", "noise_policy": "fixed-seed-paired"}
-        (stage / "stage_config.json").write_text(json.dumps({"stage": "A", "plan": plan, "binding": binding}), encoding="utf-8")
+        plan_sha256 = __import__("hashlib").sha256(runner.canonical_json(plan).encode("utf-8")).hexdigest()
+        (stage / "stage_config.json").write_text(json.dumps({"schema_version": "umi-task7-stage-v2", "stage": "A", "plan": plan,
+            "plan_sha256": plan_sha256, "binding": binding}), encoding="utf-8")
         (stage / "run_status.json").write_text(json.dumps({"schema_version": "umi-task7-run-v2", "status": "COMPLETE",
             "stage": "A", "planned_samples": 16, "completed_samples": [item["sample_id"] for item in plan],
             "failed_samples": [], "skipped_samples": [], "completed_count": 16, "failed_count": 0,
-            "skipped_count": 0, "formal_counts": {"G": 0, "D": 0, "E": 16}}), encoding="utf-8")
+            "skipped_count": 0, "formal_counts": {"G": 0, "D": 0, "E": 16}, "binding": binding}), encoding="utf-8")
 
     def test_a_only_complete_flow_uses_nonzero_saved_floor_and_writes_artifacts(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -387,6 +411,41 @@ class Task7SavedEvidenceAOnlyTests(unittest.TestCase):
                                                output_dir=Path(temp) / "analysis")
             self.assertFalse(result["A"]["a_engineering_pass"])
             self.assertIn("native output differs", " ".join(result["A"]["engineering_reasons"]))
+
+    def test_native_scientific_fail_does_not_block_fp32_scientific_pass(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "run"; root.mkdir(); source = self._source_fixture()
+            self._write_a_stage(root, source, native_science_fail=True)
+            with mock.patch.object(api, "_load_source_evidence", return_value=source):
+                result = api.analyze_task7_run(root, stage="A", raw_root="raw", decoder_root="decoder",
+                                               output_dir=Path(temp) / "analysis")
+            self.assertTrue(result["A"]["a_engineering_pass"])
+            self.assertEqual(result["A"]["native_scientific_status"], "FAIL")
+            self.assertEqual(result["A"]["fp32_scientific_status"], "PASS")
+            self.assertTrue(result["A"]["a_scientific_pass"])
+
+    def test_missing_fp32_precision_evidence_is_engineering_failure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "run"; root.mkdir(); source = self._source_fixture()
+            self._write_a_stage(root, source, bad_fp32_evidence=True)
+            with mock.patch.object(api, "_load_source_evidence", return_value=source):
+                result = api.analyze_task7_run(root, stage="A", raw_root="raw", decoder_root="decoder",
+                                               output_dir=Path(temp) / "analysis")
+            self.assertFalse(result["A"]["a_engineering_pass"])
+            self.assertTrue(any("operation_dtypes" in reason for reason in result["A"]["engineering_reasons"]))
+
+    def test_foreign_stage_binding_fails_before_a_science(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "run"; root.mkdir(); source = self._source_fixture(); self._write_a_stage(root, source)
+            config_path = root / "stages" / "A" / "stage_config.json"
+            config = json.loads(config_path.read_text(encoding="utf-8")); config["binding"]["source"] = "foreign-source"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            with mock.patch.object(api, "_load_source_evidence", return_value=source):
+                result = api.analyze_task7_run(root, stage="A", raw_root="raw", decoder_root="decoder",
+                                               output_dir=Path(temp) / "analysis")
+            self.assertFalse(result["A"]["a_engineering_pass"])
+            self.assertTrue(any("binding.source" in reason or "run_status.binding" in reason
+                                for reason in result["A"]["engineering_reasons"]))
 
     def test_a_tampered_artifact_fails_before_science(self):
         with tempfile.TemporaryDirectory() as temp:

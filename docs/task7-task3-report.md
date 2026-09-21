@@ -33,6 +33,17 @@ historical step-0 full-latent parity, A temporary-FP32 encoder parity, and
 byte-exact baseline-pre/post replay. C additionally binds the analyzer gate to
 the current A/B run-status and sample-manifest digests.
 
+For A, both native and temporary-FP32 records must carry the complete
+`FeedbackEncoder` evidence contract. The analyzer checks precision path,
+operation counts/dtypes, observed state dtypes, actual input/output dtypes,
+dispatch/backend/cache flags, exact `input_rgb` parity with the saved decoded
+frame, exact `actual_output` parity with `encoded_condition`, and the
+`[1,3,1,H,W]` FP32 `[-1,1]` encoder-input conversion. Native dtype values are
+reported as observed; the all-float32/state/dispatch/backend/cache conditions
+apply to the temporary-FP32 path. Native scientific failure is a diagnostic;
+the A scientific release decision uses the temporary-FP32 window, provided
+engineering evidence is valid.
+
 Neural G/D/E computation is reported as FP32. Approved P range normalization
 may use a float64 intermediate followed by FP32 storage; this is not relabeled
 as an all-FP32 scalar path. Tensor differences use explicit FP32 subtraction;
