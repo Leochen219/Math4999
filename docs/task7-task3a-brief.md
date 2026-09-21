@@ -13,3 +13,5 @@ Propagation: delta0/1/2 are FP32 differences at the same masked condition interf
 Tests: hand-computable two-coordinate linear oracle with changed second-step ray, explicit FP32 tolerances; a nonlinear failed window; zero responses/denominators; exact-zero/nonzero/high floor; rounding disappearance; asymmetric actual input lengths; wrong mask/shape/dtype/nonfinite; signed-zero byte equality; current-q denominator; no dropping failing smallest amplitude; fixed beta estimate vs tempting better beta; all six output rows retained. Pure tests require only existing NumPy. Use bundled local Python from task3 full brief (same path as prior tasks), no dependency installs.
 
 Write docs/task7-task3a-report.md containing API signatures/data shapes, exact tests/results and commit. Commit only these scoped files; report short DONE/concerns. Main review then Task3b.
+
+Local interpreter: C:/Users/hongy/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/python.exe. Run from cosmos_umi_capstone/experiments.
