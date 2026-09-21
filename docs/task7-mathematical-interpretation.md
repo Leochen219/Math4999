@@ -72,6 +72,16 @@ C and M3 are not established by this experiment. Clamp and finite dtype
 operations can violate smoothness; the conditional estimate is not a
 universal theorem about this implementation.
 
+For asymmetric but collinear exact endpoints, Taylor expansion instead gives
+q_actual = J1*w + (h+ - h-)*D2F1[w,w]/2 + O(max(h+,h-)^2),
+before adding endpoint-evaluation error. Dividing by the measured total step
+does not cancel this asymmetric second-order term. If endpoint directions
+also differ from +/-w, the linear term itself is the Jacobian applied to
+their length-weighted direction. The stored actual direction cosines and
+positive/negative step lengths therefore matter independently of the output
+secant-consistency gate. We do not claim pure O(h^2) convergence without
+the symmetry and smoothness assumptions above.
+
 Repeated baselines measure nondeterministic/repeatability differences in
 the same space and phase. Exact zero floor does not rule out deterministic
 quantization error. Native-vs-FP32 path differences are not this noise floor.
