@@ -46,11 +46,17 @@ not a scientific `FAIL`.
   forms the actual-step quotient from the supplied beta=.1 pair, and predicts
   `delta2_hat=q * RMS(delta1)`.  `Eprop` is descriptive when unreliable;
   `PASS` requires both explicit reliability flags and the `Eprop <= .10` gate.
-  The actual `delta1` ray is used directly; no projection onto `v0` occurs.
+  The returned `reliable` field reports local geometry/noise/evaluation
+  reliability independently of prediction status: an above-threshold Eprop
+  is a reliable scientific `FAIL`, while an undefined zero evaluation
+  denominator is `N/A` and unreliable.  The actual `delta1` ray is used
+  directly; no projection onto `v0` occurs.
 * `evaluate_fixed_beta_predictions(rays, *, q_by_ray, mask,
   local_window_pass=None, response_reliable=None, output_mask=None) -> list`
   requires six independent ray records and returns all six rows.  Flags may be
-  per-record or six-element sequences, so one failed ray cannot hide another.
+  per-record or six-element sequences, and only bool/`numpy.bool_`/`None` are
+  accepted, so one failed ray cannot hide another.  A zero ray or zero
+  evaluation denominator is explicitly unreliable with a reason.
 
 Natural aliases are exported for Task3b (`analyze_one_direction_window`,
 `compute_propagation`, `predict_fixed_beta`, and `fit_loglog`).
@@ -63,19 +69,21 @@ The focused command, run from `cosmos_umi_capstone/experiments`, was:
 C:\Users\hongy\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe -m unittest test_analyze_umi_task7 -v
 ```
 
-Final result: **13 tests, 13 passed, 0 failures**.  Coverage includes the
+Final result: **16 tests, 16 passed, 0 failures**.  Coverage includes the
 two-coordinate affine oracle with a changed second-step ray, FP32 tolerance
 and FP64 reductions, multidimensional cosine, byte-level signed-zero identity,
 actual asymmetric input lengths, current-q denominator, nonlinear failed
 window with no dropped endpoint, zero/high floors, rounding disappearance,
 zero propagation denominators, wrong mask/shape/dtype/nonfinite engineering
 inputs, fixed-beta rejection of a tempting beta=.2, explicit reliability
-flags, and retention of all six prediction rows.
+flags, retention of all six prediction rows, explicit zero evaluation
+denominator reasons, zero-ray reliability, strict per-ray flag typing, and
+separation of reliability from Eprop PASS/FAIL.
 
 The first RED run was genuine: before implementation, importing the focused
 test failed with `ModuleNotFoundError: No module named 'analyze_umi_task7'`.
 After the implementation and fixture correction (the oracle has
-`M1 @ (2,1) = (1,5)`), the focused suite produced `Ran 13 tests ... OK`.
+`M1 @ (2,1) = (1,5)`), the focused suite produced `Ran 16 tests ... OK`.
 The bundled interpreter also completed:
 
 ```text

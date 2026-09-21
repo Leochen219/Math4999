@@ -441,6 +441,8 @@ def fixed_beta_prediction(
         predicted, error = None, None
     else:
         predicted, error = _prediction_from_q(q, delta1_rms, observed_delta2, selected_output_mask)
+    if error is None:
+        reasons.append("zero evaluation denominator")
     if local_window_pass is not True:
         reasons.append("local window reliability flag was not true")
     if response_reliable is not True:
@@ -459,6 +461,19 @@ def fixed_beta_prediction(
         reasons.append("local window reliability did not pass")
     if response_reliable is False:
         reasons.append("measured response reliability did not pass")
+    geometry_reliable = (
+        delta1_rms > 0.0
+        and denominator > 0.0
+        and geometry["plus_input_cosine"] is not None
+        and geometry["plus_input_cosine"] >= 0.99
+        and geometry["minus_input_cosine"] is not None
+        and geometry["minus_input_cosine"] >= 0.99
+        and geometry["opposite_cosine"] is not None
+        and geometry["opposite_cosine"] <= -0.99
+        and geometry["plus_outside_exact"]
+        and geometry["minus_outside_exact"]
+    )
+    reliability = bool(geometry_reliable and local_window_pass is True and response_reliable is True and error is not None)
     if error is None:
         status = "N/A"
     elif reasons:
@@ -478,7 +493,10 @@ def fixed_beta_prediction(
         "h_plus": geometry["h_plus"],
         "h_minus": geometry["h_minus"],
         "reasons": reasons,
-        "reliable": status == "PASS",
+        # Reliability means the local geometry/noise/evaluation gates were
+        # defined and met; an Eprop above .10 is a reliable scientific FAIL,
+        # not an UNRELIABLE measurement.
+        "reliable": reliability,
     }
 
 
@@ -502,24 +520,37 @@ def evaluate_fixed_beta_predictions(
     selected_output_mask = input_mask if output_mask is None else output_mask
     rows: list[dict[str, Any]] = []
     def flag(global_value: bool | Sequence[bool] | None, record: Mapping[str, Any], key: str, index: int) -> bool | None:
+        def strict(value: Any) -> bool | None:
+            if value is None:
+                return None
+            if not isinstance(value, (bool, np.bool_)):
+                raise EngineeringDataError(f"{key} must be bool or None")
+            return bool(value)
+
         if key in record:
-            value = record[key]
-            return None if value is None else bool(value)
+            return strict(record[key])
         if isinstance(global_value, (list, tuple, np.ndarray)):
-            if len(global_value) != 6:
+            try:
+                count = len(global_value)
+            except TypeError as exc:
+                raise EngineeringDataError(f"{key} must be bool, None, or six values") from exc
+            if count != 6:
                 raise EngineeringDataError(f"{key} must contain one value per ray")
-            value = global_value[index]
-            return None if value is None else bool(value)
-        return global_value
+            return strict(global_value[index])
+        return strict(global_value)
 
     for index, (record, q_value) in enumerate(zip(rays, q_by_ray)):
         ray = _float32(record["ray"], f"ray {index}", shape=first_ray.shape)
         actual = _float32(record["actual_delta2"], f"actual delta2 ray {index}")
         q = _float32(q_value, f"q ray {index}", shape=actual.shape)
         d1_rms = rms64(ray, input_mask)
-        pred, error = _prediction_from_q(q, d1_rms, actual,
-                                         _mask(selected_output_mask, actual.shape, name="output mask"))
+        ray_output_mask = _mask(selected_output_mask, actual.shape, name="output mask")
+        pred, error = _prediction_from_q(q, d1_rms, actual, ray_output_mask)
         reasons: list[str] = []
+        if d1_rms == 0.0:
+            reasons.append("zero ray denominator")
+        if error is None:
+            reasons.append("zero evaluation denominator")
         ray_local_pass = flag(local_window_pass, record, "local_window_pass", index)
         ray_response_reliable = flag(response_reliable, record, "response_reliable", index)
         if error is None:
@@ -532,9 +563,11 @@ def evaluate_fixed_beta_predictions(
             for reason in record.get("reasons", ()):
                 reasons.append(str(reason))
             status = "UNRELIABLE" if reasons else ("PASS" if error <= 0.10 else "FAIL")
+        reliable = bool(d1_rms > 0.0 and error is not None and
+                        ray_local_pass is True and ray_response_reliable is True and not reasons)
         rows.append({"ray_index": index, "status": status, "Eprop": error,
                      "delta1_rms": d1_rms, "predicted_delta2": pred,
-                     "reasons": reasons})
+                     "reasons": reasons, "reliable": reliable})
     return rows
 
 

@@ -207,6 +207,23 @@ class Task7NumericalTests(unittest.TestCase):
         result = api.fixed_beta_prediction(**kwargs)
         self.assertEqual(result["status"], "UNRELIABLE")
 
+    def test_fixed_beta_zero_evaluation_denominator_is_explicitly_unreliable(self):
+        result = api.fixed_beta_prediction(
+            actual_delta1=np.array([2.0, 1.0], dtype=np.float32),
+            beta_plus_input=np.array([0.2, 0.1], dtype=np.float32),
+            beta_minus_input=np.array([-0.2, -0.1], dtype=np.float32),
+            beta_plus_output=np.array([1.0, 1.0], dtype=np.float32),
+            beta_minus_output=np.array([-1.0, -1.0], dtype=np.float32),
+            baseline_output=np.zeros(2, dtype=np.float32),
+            actual_delta2=np.zeros(2, dtype=np.float32),
+            mask=np.array([True, True]),
+            local_window_pass=True,
+            response_reliable=True,
+        )
+        self.assertIsNone(result["Eprop"])
+        self.assertFalse(result["reliable"])
+        self.assertTrue(any("zero evaluation denominator" in reason for reason in result["reasons"]))
+
     def test_six_prediction_rows_are_retained(self):
         rows = api.evaluate_fixed_beta_predictions(
             [
@@ -234,6 +251,47 @@ class Task7NumericalTests(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "PASS")
         self.assertEqual(rows[1]["status"], "UNRELIABLE")
         self.assertEqual(rows[3]["status"], "UNRELIABLE")
+
+    def test_six_ray_zero_ray_or_zero_evaluation_is_not_reliable_and_flags_are_boolean(self):
+        rays = [
+            {"ray": np.array([1.0, 0.0], np.float32), "actual_delta2": np.array([1.0, 0.0], np.float32)},
+            {"ray": np.array([0.0, 1.0], np.float32), "actual_delta2": np.array([0.0, 1.0], np.float32)},
+            {"ray": np.array([1.0, 1.0], np.float32), "actual_delta2": np.array([1.0, 1.0], np.float32)},
+            {"ray": np.array([1.0, -1.0], np.float32), "actual_delta2": np.array([1.0, -1.0], np.float32)},
+            {"ray": np.array([2.0, 1.0], np.float32), "actual_delta2": np.array([2.0, 1.0], np.float32)},
+            {"ray": np.zeros(2, np.float32), "actual_delta2": np.zeros(2, np.float32)},
+        ]
+        q_values = [np.ones(2, np.float32) for _ in rays]
+        with self.assertRaises(api.EngineeringDataError):
+            api.evaluate_fixed_beta_predictions(
+                rays, q_by_ray=q_values, mask=np.array([True, True]),
+                local_window_pass=[True, True, True, True, True, "false"],
+                response_reliable=True,
+            )
+        rays[5]["local_window_pass"] = False
+        rows = api.evaluate_fixed_beta_predictions(
+            rays, q_by_ray=q_values, mask=np.array([True, True]),
+            local_window_pass=True, response_reliable=True,
+        )
+        self.assertFalse(rows[5]["reliable"])
+        self.assertTrue(any("zero ray" in reason for reason in rows[5]["reasons"]))
+        self.assertTrue(any("zero evaluation denominator" in reason for reason in rows[5]["reasons"]))
+
+    def test_reliable_is_separate_from_eprop_pass_fail(self):
+        result = api.fixed_beta_prediction(
+            actual_delta1=np.array([2.0, 1.0], dtype=np.float32),
+            beta_plus_input=np.array([0.2, 0.1], dtype=np.float32),
+            beta_minus_input=np.array([-0.2, -0.1], dtype=np.float32),
+            beta_plus_output=np.array([2.0, 2.0], dtype=np.float32),
+            beta_minus_output=np.array([-2.0, -2.0], dtype=np.float32),
+            baseline_output=np.zeros(2, dtype=np.float32),
+            actual_delta2=np.array([1.0, 5.0], dtype=np.float32),
+            mask=np.array([True, True]),
+            local_window_pass=True,
+            response_reliable=True,
+        )
+        self.assertEqual(result["status"], "FAIL")
+        self.assertTrue(result["reliable"])
 
     def test_invalid_shape_dtype_nonfinite_and_mask_are_engineering_errors(self):
         with self.assertRaises(api.EngineeringDataError):
