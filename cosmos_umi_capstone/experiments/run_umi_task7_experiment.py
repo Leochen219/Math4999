@@ -1010,6 +1010,7 @@ def run_stage(stage: str, run_dir: str | Path, *, execute: Callable[[Mapping[str
                 else:
                     _add_counts(completed_counts, counts)
                     completed.append(spec["sample_id"])
+                del prior_record
                 continue
             resource_pre: dict[str, Any] = {}
             resource_post: dict[str, Any] = {}
@@ -1052,6 +1053,7 @@ def run_stage(stage: str, run_dir: str | Path, *, execute: Callable[[Mapping[str
                 # the live record and all callback-local references before
                 # collecting caches and taking the cleanup sample.
                 del value
+                del payload
                 release_sample()
                 resource_cleanup = capture_sample(spec["sample_id"], "post_cleanup", len(plan) - ordinal - 1)
                 store.finalize_staged(staged, record_updates={"resource_cleanup": resource_cleanup})
@@ -1122,6 +1124,31 @@ def _source_frame(source: Mapping[str, Any], name: str) -> np.ndarray:
     return _load_array(root / "decoded_final_float32.npy").astype(np.float32, copy=False)
 
 
+def _stage_completion_digests(run_root: Path, stage: str) -> dict[str, str]:
+    """Digest a completed stage status and its immutable sample manifests."""
+    stage_root = Path(run_root) / "stages" / str(stage).upper()
+    status_path = stage_root / "run_status.json"
+    status = _load_json(status_path)
+    if status.get("status") != "COMPLETE":
+        raise ResumeMismatch(f"Stage {stage} is not COMPLETE for C gate lineage")
+    completed = status.get("completed_samples", [])
+    skipped = status.get("skipped_samples", [])
+    if (not isinstance(completed, list) or not isinstance(skipped, list)
+            or len(completed) != len(set(completed)) or len(skipped) != len(set(skipped))
+            or set(completed) & set(skipped)):
+        raise ResumeMismatch(f"Stage {stage} completion lists are inconsistent")
+    manifests: dict[str, str] = {}
+    for sample_id in sorted(set(completed) | set(skipped)):
+        sample_status = stage_root / "samples" / sample_id / "status.json"
+        manifest = _load_json(sample_status)
+        hashes = manifest.get("artifact_sha256")
+        if manifest.get("status") != "success" or not isinstance(hashes, Mapping) or not hashes:
+            raise ResumeMismatch(f"Stage {stage} sample manifest is incomplete: {sample_id}")
+        manifests[sample_id] = sha256_file(sample_status)
+    sample_digest = hashlib.sha256(canonical_json(manifests).encode("utf-8")).hexdigest()
+    return {"run_status_sha256": sha256_file(status_path), "samples_manifest_sha256": sample_digest}
+
+
 def _prepare_c_source(source: dict[str, Any], run_root: Path) -> None:
     """Load B's six independent step-0 encoded-condition rays.
 
@@ -1134,6 +1161,19 @@ def _prepare_c_source(source: dict[str, Any], run_root: Path) -> None:
     if not gate_path.is_file():
         raise BlockedExecution("C requires analysis_gate.json from the independent analyzer")
     source["analysis_gate"] = _load_json(gate_path)
+    gate = source["analysis_gate"]
+    required_lineage = ("a_run_status_sha256", "a_samples_manifest_sha256",
+                        "b_run_status_sha256", "b_samples_manifest_sha256")
+    if not isinstance(gate, Mapping) or any(not isinstance(gate.get(key), str) or not gate[key] for key in required_lineage):
+        raise BlockedExecution("C analyzer gate lacks current A/B completion lineage")
+    a_digests = _stage_completion_digests(run_root, "A")
+    b_digests = _stage_completion_digests(run_root, "B")
+    expected_lineage = {"a_run_status_sha256": a_digests["run_status_sha256"],
+                        "a_samples_manifest_sha256": a_digests["samples_manifest_sha256"],
+                        "b_run_status_sha256": b_digests["run_status_sha256"],
+                        "b_samples_manifest_sha256": b_digests["samples_manifest_sha256"]}
+    if any(gate.get(key) != value for key, value in expected_lineage.items()):
+        raise ResumeMismatch("C analyzer gate is not bound to current A/B completion evidence")
     b_samples = run_root / "stages" / "B" / "samples"
     if not b_samples.is_dir():
         raise BlockedExecution("C requires completed Stage B samples")
@@ -1507,13 +1547,18 @@ def _default_factory(args: argparse.Namespace, source: Mapping[str, Any]) -> Any
 
 def _precheck_resume(root: Path, args: argparse.Namespace) -> int | None:
     """Reject terminal failures and reuse verified success before model load."""
-    if not args.resume:
-        return None
     root_status_path = root / "run_status.json"
     if root_status_path.is_file():
         root_status = _load_json(root_status_path)
         if root_status.get("status") in {"FAILED", "RESOURCE_STOP"}:
             raise ResumeMismatch("root run is terminal and cannot be reused")
+    smoke_status_path = root / "smoke" / "run_status.json"
+    if not args.resume:
+        if args.stage == "smoke" and smoke_status_path.is_file():
+            smoke_status = _load_json(smoke_status_path)
+            if smoke_status.get("status") == "SMOKE_COMPLETE":
+                raise ResumeMismatch("existing smoke success requires a new run directory")
+        return None
 
     def verify_identity(status: Mapping[str, Any], *, stage: str) -> None:
         binding = status.get("binding")
@@ -1530,12 +1575,19 @@ def _precheck_resume(root: Path, args: argparse.Namespace) -> int | None:
             raise ResumeMismatch("resume Task 7 code identity differs")
         contract = None
         stored_contract = binding.get("launch_contract_sha256")
-        if stored_contract is not None and not args.launch_contract:
+        if stored_contract is None or not args.launch_contract:
             raise ResumeMismatch("resume launch-contract binding is incomplete")
         if args.launch_contract:
             contract = _load_contract(args.launch_contract)
-            if stored_contract is not None and sha256_file(args.launch_contract) != stored_contract:
+            if sha256_file(args.launch_contract) != stored_contract:
                 raise ResumeMismatch("resume launch-contract identity differs")
+            stored_action = binding.get("action")
+            if stored_action:
+                if not args.action:
+                    raise ResumeMismatch("resume action binding is incomplete")
+                if current_source.get("metadata", {}).get("action") != stored_action:
+                    raise ResumeMismatch("resume action identity differs")
+                _validate_source_contract(current_source, contract, args.action)
             checkpoint = contract.get("checkpoint_identity", {}).get("sha256", "")
             if binding.get("model") not in (None, "") and binding.get("model") != checkpoint:
                 raise ResumeMismatch("resume checkpoint identity differs")
@@ -1543,8 +1595,22 @@ def _precheck_resume(root: Path, args: argparse.Namespace) -> int | None:
                 raise ResumeMismatch("resume VAE identity differs")
             if binding.get("framework") not in (None, "") and binding.get("framework") != contract.get("framework_commit", ""):
                 raise ResumeMismatch("resume framework identity differs")
-        elif any(binding.get(key) not in (None, "") for key in ("model", "vae", "framework")):
-            raise ResumeMismatch("resume model binding is incomplete")
+            if args.checkpoint:
+                try:
+                    from .umi_task6_operational import checkpoint_content_identity
+                except ImportError:
+                    from umi_task6_operational import checkpoint_content_identity
+                if checkpoint_content_identity(args.checkpoint) != checkpoint:
+                    raise ResumeMismatch("resume checkpoint path identity differs")
+            if args.vae and sha256_file(args.vae) != contract.get("vae_sha256", ""):
+                raise ResumeMismatch("resume VAE path identity differs")
+            if args.framework_root:
+                try:
+                    from .umi_task6_operational import _live_framework_commit
+                except ImportError:
+                    from umi_task6_operational import _live_framework_commit
+                if _live_framework_commit(Path(args.framework_root)) != contract.get("framework_commit", ""):
+                    raise ResumeMismatch("resume framework path identity differs")
         config = binding.get("config")
         expected_config = {"stage": stage} if stage == "smoke" else {
             "stage": stage, "plan": build_stage_plan(stage)}
@@ -1580,19 +1646,40 @@ def _precheck_resume(root: Path, args: argparse.Namespace) -> int | None:
     if status.get("status") == "COMPLETE":
         verify_identity(status, stage=str(args.stage).upper())
         plan_ids = {spec["sample_id"] for spec in build_stage_plan(args.stage)}
-        listed = set(status.get("completed_samples", [])) | set(status.get("skipped_samples", []))
+        completed_list, skipped_list = status.get("completed_samples", []), status.get("skipped_samples", [])
+        if (not isinstance(completed_list, list) or not isinstance(skipped_list, list)
+                or len(completed_list) != len(set(completed_list))
+                or len(skipped_list) != len(set(skipped_list))
+                or set(completed_list) & set(skipped_list)):
+            raise ResumeMismatch("complete stage sample lists contain duplicates or overlap")
+        listed = set(completed_list) | set(skipped_list)
         if listed != plan_ids:
             raise ResumeMismatch("existing complete stage has an incomplete sample set")
         if (status.get("planned_samples") != len(plan_ids) or status.get("failed_count") != 0
                 or status.get("formal_counts") != stage_counts(args.stage)
+                or status.get("failed_samples") or status.get("failed_attempts")
                 or status.get("attempt_counts") != status.get("observed_counts")):
             raise ResumeMismatch("existing complete stage counters are incomplete")
         store = Task7SampleStore(stage_root / "samples")
+        recomputed_attempts, recomputed_completed = _empty_counts(), _empty_counts()
         for sample_id in plan_ids:
             sample_path = store._path(sample_id)
-            store._verify(sample_path)
-            _validate_stage_payload(str(args.stage).upper(), _load_json(sample_path / "record.json"))
-        skipped = len(status.get("skipped_samples", []))
+            sample_status = store._verify(sample_path)
+            record = _load_json(sample_path / "record.json")
+            _validate_stage_payload(str(args.stage).upper(), record)
+            counts = sample_status.get("operation_counts")
+            if not isinstance(counts, Mapping):
+                raise ResumeMismatch("complete sample lacks observed operation counts")
+            _add_counts(recomputed_attempts, counts)
+            if sample_id in completed_list:
+                _add_counts(recomputed_completed, counts)
+            elif record.get("status") != "SKIPPED_C":
+                raise ResumeMismatch("skipped sample lacks explicit SKIPPED_C evidence")
+        if (status.get("attempt_counts") != recomputed_attempts
+                or status.get("observed_counts") != recomputed_attempts
+                or status.get("completed_counts") != recomputed_completed):
+            raise ResumeMismatch("complete stage counters do not match verified artifacts")
+        skipped = len(skipped_list)
         expected_completed = stage_counts(args.stage)
         if str(args.stage).upper() == "C":
             expected_completed = {key: max(0, value - skipped) for key, value in expected_completed.items()}
@@ -1604,21 +1691,31 @@ def _precheck_resume(root: Path, args: argparse.Namespace) -> int | None:
 
 def _record_live_failure(root: Path, error: BaseException, *, generation_started: bool = False,
                          binding: Mapping[str, Any] | None = None, source: Mapping[str, Any] | None = None,
-                         monitor: Any | None = None, cleanup_errors: list[BaseException] | None = None) -> None:
-    counts = _error_counts(error)
+                         monitor: Any | None = None, cleanup_errors: list[BaseException] | None = None,
+                         observed_counts: Mapping[str, Any] | None = None,
+                         setup_evidence: Mapping[str, Any] | None = None,
+                         stage_status: Mapping[str, Any] | None = None) -> None:
+    error_counts = _error_counts(error)
+    counts = _empty_counts()
+    if observed_counts is not None:
+        _add_counts(counts, observed_counts)
+    else:
+        _add_counts(counts, error_counts)
     _atomic_json(root / "run_status.json", {"schema_version": "umi-task7-run-v2",
         "status": "RESOURCE_STOP" if isinstance(error, ResourceStop) else "FAILED",
         "generation_started": bool(generation_started or counts.get("G", 0) > 0),
         "reason_code": type(error).__name__, "reason": str(error),
-        "operation_counts": counts, "binding": dict(binding or {}),
+        "operation_counts": counts, "error_operation_counts": error_counts,
+        "binding": dict(binding or {}), "stage_status": dict(stage_status or {}),
         "source": {key: source[key] for key in ("source_tree_sha256", "task7_code_sha256", "z0", "mask", "v0") if key in (source or {})},
         "last_resources": getattr(monitor, "last_resources", {}) or {},
         "cleanup_errors": [repr(item) for item in (cleanup_errors or [])],
-        "primary_error": repr(error)})
+        "setup_evidence": dict(setup_evidence or {}), "primary_error": repr(error)})
 
 
 def _mark_stage_cleanup_failure(root: Path, stage: str, cleanup_errors: list[BaseException]) -> None:
-    status_path = root / "stages" / str(stage).upper() / "run_status.json"
+    status_path = (root / "smoke" / "run_status.json" if str(stage).lower() == "smoke"
+                   else root / "stages" / str(stage).upper() / "run_status.json")
     if not status_path.is_file():
         return
     status = _load_json(status_path)
@@ -1726,6 +1823,63 @@ def _strict_gpu_sampler(base_sampler: Callable[[], Mapping[str, Any]], gpu_index
     return sample
 
 
+def _install_setup_encoder_observer(factory: Any) -> tuple[dict[str, Any], Callable[[], None]]:
+    """Observe loader-owned tokenizer encodes during factory setup only."""
+    evidence: dict[str, Any] = {"boundary": "factory.loader_payload_encoder.encode",
+                                "installed": False, "ownership_restored": False,
+                                "encode_calls": 0, "encode_failures": []}
+    loader = getattr(factory, "loader", None)
+    if not callable(loader):
+        evidence["reason"] = "factory_loader_unavailable"
+        return evidence, lambda: None
+    original_loader = loader
+    restore_owner: list[tuple[Any, Any]] = []
+
+    def observed_loader(*args: Any, **kwargs: Any) -> Any:
+        try:
+            payload = original_loader(*args, **kwargs)
+        except BaseException as error:
+            evidence["loader_error"] = repr(error)
+            raise
+        encoder = payload.get("encoder") if isinstance(payload, Mapping) else None
+        owner = getattr(encoder, "encoder", None)
+        method = getattr(owner, "encode", None)
+        if not callable(method):
+            evidence["reason"] = "loader_encoder_encode_unavailable"
+            return payload
+
+        def observed_encode(*encode_args: Any, **encode_kwargs: Any) -> Any:
+            evidence["encode_calls"] = int(evidence["encode_calls"]) + 1
+            try:
+                return method(*encode_args, **encode_kwargs)
+            except BaseException as error:
+                evidence["encode_failures"].append(repr(error))
+                raise
+
+        try:
+            setattr(owner, "encode", observed_encode)
+        except BaseException as error:
+            evidence["installation_error"] = repr(error)
+        else:
+            restore_owner.append((owner, method))
+            evidence["installed"] = True
+        return payload
+
+    try:
+        setattr(factory, "loader", observed_loader)
+    except BaseException as error:
+        evidence["installation_error"] = repr(error)
+        return evidence, lambda: None
+
+    def restore() -> None:
+        for owner, method in restore_owner:
+            setattr(owner, "encode", method)
+        setattr(factory, "loader", original_loader)
+        evidence["ownership_restored"] = True
+
+    return evidence, restore
+
+
 def _run_live(args: argparse.Namespace, root: Path, *, factory: Any | None, monitor: Any | None) -> int:
     """Run one live stage under the run-wide lock with exception-safe cleanup."""
     if args.gpu_index != 0:
@@ -1741,6 +1895,10 @@ def _run_live(args: argparse.Namespace, root: Path, *, factory: Any | None, moni
     smoke_staged: dict[str, Any] | None = None
     source: dict[str, Any] = {}
     binding: dict[str, Any] = {}
+    live_observed_counts = _empty_counts()
+    setup_evidence: dict[str, Any] = {}
+    setup_restore: Callable[[], None] | None = None
+    stage_status: dict[str, Any] = {}
     try:
         reused = _precheck_resume(root, args)
         if reused is not None:
@@ -1777,7 +1935,14 @@ def _run_live(args: argparse.Namespace, root: Path, *, factory: Any | None, moni
         require_resource_snapshot(getattr(monitor, "last_resources", {}), phase="preload")
         if factory is None:
             factory = _default_factory(args, source)
-        built = factory.build() if hasattr(factory, "build") else (factory(args, source) if callable(factory) else factory)
+        setup_evidence, setup_restore = _install_setup_encoder_observer(factory)
+        try:
+            built = factory.build() if hasattr(factory, "build") else (factory(args, source) if callable(factory) else factory)
+        finally:
+            if setup_restore is not None:
+                setup_restore()
+                setup_restore = None
+            _atomic_json(root / "setup_evidence.json", setup_evidence)
         if not isinstance(built, (tuple, list)) or len(built) < 3:
             raise BlockedExecution("factory must return (Task6RuntimeAdapter, inputs, encoder)")
         adapter, inputs, encoder = built[0], built[1], built[2]
@@ -1831,24 +1996,26 @@ def _run_live(args: argparse.Namespace, root: Path, *, factory: Any | None, moni
             _, consumed = _source_condition(source, "baseline_pre")
             try:
                 record = feedback.step(feedback.extract_condition(consumed), 0)
-            except BaseException:
+                live_observed_counts = _capture_counts(record)
+            except BaseException as error:
+                error.capture = {"operation_counts": dict(live_observed_counts), "stage_boundary": "smoke_feedback"}
                 raise
-            expected = _load_array(_source_sample_root(Path(source["raw_root"]), "baseline_pre") / "output_full.npy")
             try:
+                expected = _load_array(_source_sample_root(Path(source["raw_root"]), "baseline_pre") / "output_full.npy")
                 if record.get("full_latent") is None or not np.array_equal(np.asarray(record["full_latent"]), expected):
                     raise ResumeMismatch("smoke first-G output differs from historical baseline output_full")
+                post = _monitor_capture(monitor, sample_id="smoke_baseline", phase="post_call", remaining=0, run_dir=root)
+                post_snapshot = _monitor_peak_snapshot(monitor, post)
+                require_resource_snapshot(post_snapshot, phase="smoke")
+                if post_snapshot.get("gpu_peak_allocated_gib") is not None and float(post_snapshot["gpu_peak_allocated_gib"]) > 35:
+                    raise ResourceStop("GPU_SMOKE_PEAK_ALLOCATED_HIGH: accumulated allocated peak exceeds 35 GiB")
+                if post_snapshot.get("gpu_peak_nvml_used_gib") is not None and float(post_snapshot["gpu_peak_nvml_used_gib"]) > 45:
+                    raise ResourceStop("GPU_SMOKE_PEAK_USED_HIGH: accumulated NVML peak exceeds 45 GiB")
             except BaseException as error:
                 error.capture = dict(getattr(error, "capture", {}))
-                error.capture.setdefault("operation_counts", _capture_counts(record))
+                error.capture.setdefault("operation_counts", dict(live_observed_counts))
                 raise
-            post = _monitor_capture(monitor, sample_id="smoke_baseline", phase="post_call", remaining=0, run_dir=root)
-            post_snapshot = _monitor_peak_snapshot(monitor, post)
-            require_resource_snapshot(post_snapshot, phase="smoke")
-            if post_snapshot.get("gpu_peak_allocated_gib") is not None and float(post_snapshot["gpu_peak_allocated_gib"]) > 35:
-                raise ResourceStop("GPU_SMOKE_PEAK_ALLOCATED_HIGH: accumulated allocated peak exceeds 35 GiB")
-            if post_snapshot.get("gpu_peak_nvml_used_gib") is not None and float(post_snapshot["gpu_peak_nvml_used_gib"]) > 45:
-                raise ResourceStop("GPU_SMOKE_PEAK_USED_HIGH: accumulated NVML peak exceeds 45 GiB")
-            size = _capture_counts(record)
+            size = dict(live_observed_counts)
             try:
                 store = Task7SampleStore(root / "smoke" / "samples")
                 smoke_staged = store.stage_success("smoke_baseline", {"record": record, "engineering": True, "resource_pre": pre,
@@ -1868,6 +2035,7 @@ def _run_live(args: argparse.Namespace, root: Path, *, factory: Any | None, moni
                 "resource_cleanup": cleanup, "peak_snapshot": post_snapshot,
                 "binding": {"source": source.get("source_tree_sha256"),
                             "task7_code_sha256": source.get("task7_code_sha256"),
+                            "action": source.get("metadata", {}).get("action") if isinstance(source.get("metadata"), Mapping) else None,
                             "launch_contract_sha256": (sha256_file(args.launch_contract)
                                 if args.launch_contract and Path(args.launch_contract).is_file() else None),
                             "config": {"stage": "smoke"},
@@ -1879,7 +2047,9 @@ def _run_live(args: argparse.Namespace, root: Path, *, factory: Any | None, moni
             if args.stage == "C":
                 _prepare_c_source(source, root)
             binding = {"source": source.get("source_tree_sha256", "source-bound"), "task7_code_sha256": source["task7_code_sha256"],
+                       "action": source.get("metadata", {}).get("action") if isinstance(source.get("metadata"), Mapping) else None,
                        "config": {"stage": args.stage, "plan": build_stage_plan(args.stage)},
+                       "launch_contract_sha256": sha256_file(args.launch_contract),
                        "model": contract.get("checkpoint_identity", {}).get("sha256", ""), "vae": contract.get("vae_sha256", ""),
                        "framework": contract.get("framework_commit", ""), "mask": source["mask"], "z0": source["z0"],
                        "v0": source["v0"], "noise_policy": "prediction-region-seed-paired"}
@@ -1888,12 +2058,16 @@ def _run_live(args: argparse.Namespace, root: Path, *, factory: Any | None, moni
                                resume=args.resume, monitor=monitor, allowed_skips=args.stage == "C",
                                cleanup_sample=_release_sample_memory, reset_sample_peak=_reset_sample_peak_memory)
             result_code = 0 if result.get("status") == "COMPLETE" else 1
+            live_observed_counts = dict(result.get("attempt_counts") or _empty_counts())
+            stage_status = dict(result)
             if result_code:
                 terminal = ResourceStop(result.get("reason", result.get("status", "formal stage failed"))) \
                     if result.get("status") == "RESOURCE_STOP" else RuntimeError(result.get("reason", "formal stage failed"))
                 _record_live_failure(root, terminal,
                                      generation_started=bool((result.get("attempt_counts") or {}).get("G", 0)),
-                                     binding=binding, source=source, monitor=monitor)
+                                     binding=binding, source=source, monitor=monitor,
+                                     observed_counts=live_observed_counts, stage_status=stage_status,
+                                     setup_evidence=setup_evidence)
     except BaseException as error:
         primary = error
         if smoke_staged is not None:
@@ -1902,9 +2076,14 @@ def _run_live(args: argparse.Namespace, root: Path, *, factory: Any | None, moni
             except BaseException as staged_error:
                 primary.add_note("smoke staged publication cleanup failed: " + repr(staged_error))
         _record_live_failure(root, error, generation_started=bool(_error_counts(error).get("G", 0)),
-                             binding=binding, source=source, monitor=monitor)
+                             binding=binding, source=source, monitor=monitor,
+                             observed_counts=live_observed_counts, setup_evidence=setup_evidence,
+                             stage_status=stage_status)
     finally:
         cleanup_errors: list[BaseException] = []
+        if setup_restore is not None:
+            try: setup_restore()
+            except BaseException as error: cleanup_errors.append(error)
         if callable(getattr(factory, "unload", None)):
             try: factory.unload()
             except BaseException as error: cleanup_errors.append(error)
@@ -1919,9 +2098,11 @@ def _run_live(args: argparse.Namespace, root: Path, *, factory: Any | None, moni
             cleanup = RuntimeError("Task 7 cleanup failed")
             for error in cleanup_errors: cleanup.add_note(repr(error))
             _record_live_failure(root, primary or cleanup,
-                                 generation_started=bool(_error_counts(primary or cleanup).get("G", 0)),
+                                 generation_started=bool(live_observed_counts.get("G", 0)
+                                                        or _error_counts(primary or cleanup).get("G", 0)),
                                  binding=binding, source=source, monitor=monitor,
-                                 cleanup_errors=cleanup_errors)
+                                 cleanup_errors=cleanup_errors, observed_counts=live_observed_counts,
+                                 setup_evidence=setup_evidence, stage_status=stage_status)
             _mark_stage_cleanup_failure(root, args.stage, cleanup_errors)
             if primary is None: primary = cleanup
             else:

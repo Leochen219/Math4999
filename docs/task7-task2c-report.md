@@ -85,6 +85,31 @@ and final cleanup capture before `SMOKE_COMPLETE` is written. Owned monitor
 telemetry is stored under stage/attempt-specific directories so later stages or
 resumes do not overwrite earlier evidence.
 
+Failure accounting retains returned G/D/E counts through smoke parity/peak
+gates, publication, factory unload, and monitor shutdown. Root `run_status.json`
+stores those live counts separately from `error_operation_counts`, preserves
+the formal `stage_status`, and records setup-boundary evidence in
+`setup_evidence.json` (including observed loader-tokenizer encode calls and
+failures at the `factory.loader_payload_encoder.encode` boundary, with method
+ownership restored in `finally`). A smoke completion is changed to a terminal cleanup failure if
+shutdown/unload fails, so it cannot be reused.
+
+The C analyzer gate must contain these exact lineage fields in addition to the
+existing scientific/source/code fields:
+
+```text
+a_run_status_sha256
+a_samples_manifest_sha256
+b_run_status_sha256
+b_samples_manifest_sha256
+```
+
+`*_run_status_sha256` is the SHA-256 of `stages/{A,B}/run_status.json`.
+`*_samples_manifest_sha256` is the SHA-256 of canonical JSON (sorted keys,
+compact separators) mapping each listed completed/skipped sample ID to the
+SHA-256 of that sample's `status.json`. The runner recomputes both A and B
+values before loading C and rejects foreign or incomplete lineage.
+
 ## Verification
 
 Using the required bundled NumPy interpreter:
@@ -92,13 +117,13 @@ Using the required bundled NumPy interpreter:
 ```text
 python -m py_compile run_umi_task7_experiment.py
 python -m unittest test_run_umi_task7_experiment
-Ran 32 tests in 2.199s; OK
+Ran 38 tests in 2.768s; OK
 python -m unittest test_run_umi_task7_experiment test_umi_task7_runtime \
     test_umi_task7_encoder test_umi_task7_official_deferred
-Ran 45 tests in 2.271s; OK (skipped=2)
+Ran 51 tests in 2.851s; OK (skipped=2)
 ```
 
-The dependency aggregate is 45 tests with 2 existing optional real-Torch skips
+The dependency aggregate is 51 tests with 2 existing optional real-Torch skips
 (`test_run_umi_task7_experiment test_umi_task7_runtime test_umi_task7_encoder
 test_umi_task7_official_deferred`). No model, GPU, download, environment
 installation, or remote mutation was performed. Focused runner tests cover
@@ -109,7 +134,10 @@ and post-parity failure counts, B own-step resume, approved full-carrier
 feedback evidence, all-38 C ray/probe inputs, C skip resume accounting, real
 Task-6 `ResourceMonitor` fake samplers, strict Torch telemetry/peak reset,
 stage-scoped monitor paths, smoke cleanup failure status, and resume identity
-guards.
+guards. Round3 adds weak-reference output release, live smoke/formal root
+counter preservation, setup encoder observation/restoration, no-resume smoke
+lockout, strict COMPLETE counter reconstruction/duplicate rejection, and
+foreign A/B gate lineage rejection.
 
 The independent analyzer remains responsible for scientific A/B/C decisions;
 the runner only consumes an explicitly bound C gate.

@@ -2,6 +2,7 @@ import json
 import sys
 import tempfile
 import time
+import weakref
 import unittest
 from unittest import mock
 from contextlib import ExitStack
@@ -75,6 +76,24 @@ class Task7RunnerTests(unittest.TestCase):
             phases = [row["phase"] for row in monitor._sample_rows]
             self.assertEqual(phases[:3], ["pre_call", "post_call", "post_cleanup"])
             self.assertTrue((stage / "samples" / "A_baseline_pre_native" / "status.json").is_file())
+
+    def test_run_stage_releases_output_record_before_post_cleanup(self):
+        with tempfile.TemporaryDirectory() as temp:
+            observed = []
+            def execute(spec):
+                array = np.ones((4,), dtype=np.float32)
+                observed.append(weakref.ref(array))
+                return {"encoded_condition": array, "encoder": {"fixture": True},
+                        "evidence": {"operation_counts": {"G": 0, "D": 0, "E": 1}}}
+            def cleanup():
+                import gc
+                gc.collect()
+                self.assertIsNone(observed[-1]())
+                return {"released": True}
+            result = runner.run_stage("A", temp, execute=execute,
+                                      binding=runner.test_binding("A"), monitor=runner.StaticMonitor(_safe_snapshot()),
+                                      cleanup_sample=cleanup)
+            self.assertEqual(result["status"], "COMPLETE")
 
     def test_strict_gpu_sampler_fails_closed_and_preserves_reserved_peak(self):
         class Cuda:
@@ -168,6 +187,103 @@ class Task7RunnerTests(unittest.TestCase):
         root_status = json.loads((root / "run_status.json").read_text(encoding="utf-8"))
         self.assertEqual(root_status["status"], "FAILED")
         self.assertEqual(root_status["reason_code"], "RuntimeError")
+        self.assertEqual(root_status["operation_counts"], {"G": 1, "D": 1, "E": 1})
+        smoke_status = json.loads((root / "smoke" / "run_status.json").read_text(encoding="utf-8"))
+        self.assertNotEqual(smoke_status["status"], "SMOKE_COMPLETE")
+
+    def test_smoke_success_cannot_be_launched_again_without_resume(self):
+        root, factory, monitor, patches = self._main_fixture()
+        args = ["--stage", "smoke", "--run-dir", str(root), "--raw-root", str(root.parent / "source"),
+                "--decoder-root", str(root.parent / "source"), "--launch-contract", str(root / "contract")]
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(runner, "_code_digest", return_value="code"))
+            for patch in patches: stack.enter_context(patch)
+            self.assertEqual(runner.main(args, factory=factory, monitor=monitor), 0)
+            built = factory.built
+            with self.assertRaises(runner.ResumeMismatch):
+                runner.main(args, factory=factory, monitor=monitor)
+        self.assertEqual(factory.built, built)
+
+    def test_formal_failure_root_preserves_stage_attempt_counts(self):
+        root, factory, monitor, patches = self._main_fixture()
+        (root / "contract").write_text("contract", encoding="utf-8")
+        args = ["--stage", "A", "--run-dir", str(root), "--raw-root", str(root.parent / "source"),
+                "--decoder-root", str(root.parent / "source"), "--launch-contract", str(root / "contract")]
+        failed = {"status": "FAILED", "reason": "post validation", "attempt_counts": {"G": 2, "D": 1, "E": 1},
+                  "completed_counts": {"G": 0, "D": 0, "E": 0}}
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(runner, "_code_digest", return_value="code"))
+            stack.enter_context(mock.patch.object(runner, "run_stage", return_value=failed))
+            for patch in patches: stack.enter_context(patch)
+            self.assertEqual(runner.main(args, factory=factory, monitor=monitor), 1)
+        status = json.loads((root / "run_status.json").read_text(encoding="utf-8"))
+        self.assertEqual(status["operation_counts"], failed["attempt_counts"])
+        self.assertEqual(status["stage_status"]["attempt_counts"], failed["attempt_counts"])
+
+    def test_setup_encoder_observer_counts_failures_and_restores_method(self):
+        calls = []
+        class RawEncoder:
+            def encode(self, value):
+                calls.append(value)
+                if value == "bad": raise RuntimeError("setup encode failed")
+                return value
+        raw = RawEncoder()
+        adapter = type("Adapter", (), {"encoder": raw})()
+        original_loader = lambda **kwargs: {"encoder": adapter}
+        factory = type("Factory", (), {})()
+        factory.loader = original_loader
+        evidence, restore = runner._install_setup_encoder_observer(factory)
+        payload = factory.loader()
+        self.assertTrue(evidence["installed"])
+        self.assertEqual(payload["encoder"].encoder.encode("ok"), "ok")
+        with self.assertRaises(RuntimeError): payload["encoder"].encoder.encode("bad")
+        self.assertEqual(evidence["encode_calls"], 2)
+        self.assertEqual(len(evidence["encode_failures"]), 1)
+        restore()
+        self.assertIs(factory.loader, original_loader)
+        self.assertTrue(evidence["ownership_restored"])
+        self.assertEqual(raw.encode("ok2"), "ok2")
+
+    def _complete_resume_fixture(self, temp):
+        root = Path(temp); stage = root / "stages" / "A"
+        runner.run_stage("A", stage, execute=lambda spec: _a_record(),
+                         binding=runner.test_binding("A"), monitor=runner.StaticMonitor(_safe_snapshot()))
+        contract = root / "contract.json"
+        contract.write_text(json.dumps({"code_bundle_sha256": "c" * 64}), encoding="utf-8")
+        status_path = stage / "run_status.json"
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+        binding = dict(status["binding"])
+        binding.update({"config": {"stage": "A", "plan": runner.build_stage_plan("A")},
+                        "launch_contract_sha256": runner.sha256_file(contract), "model": "model",
+                        "vae": "vae", "framework": "framework"})
+        status["binding"] = binding
+        status_path.write_text(json.dumps(status), encoding="utf-8")
+        args = runner.parse_args(["--stage", "A", "--run-dir", str(root), "--resume",
+                                  "--raw-root", str(root / "raw"), "--decoder-root", str(root / "decoder"),
+                                  "--launch-contract", str(contract)])
+        return root, stage, contract, args, status
+
+    def test_complete_resume_rejects_contract_tamper_and_duplicate_sample_ids(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, stage, contract, args, status = self._complete_resume_fixture(temp)
+            source = {"source_tree_sha256": "fixture-source"}
+            patches = [mock.patch.object(runner, "validate_task7_sources", return_value=source),
+                       mock.patch.object(runner, "_code_digest", return_value="fixture-task7-code"),
+                       mock.patch.object(runner, "_load_contract", return_value={"code_bundle_sha256": "c" * 64,
+                           "checkpoint_identity": {"sha256": "model"}, "vae_sha256": "vae", "framework_commit": "framework"})]
+            with ExitStack() as stack:
+                for patch in patches: stack.enter_context(patch)
+                contract.write_text(json.dumps({"code_bundle_sha256": "d" * 64}), encoding="utf-8")
+                with self.assertRaises(runner.ResumeMismatch): runner._precheck_resume(root, args)
+            status["binding"]["launch_contract_sha256"] = runner.sha256_file(contract)
+            status["completed_samples"].append(status["completed_samples"][0])
+            stage_status = stage / "run_status.json"
+            stage_status.write_text(json.dumps(status), encoding="utf-8")
+            with mock.patch.object(runner, "validate_task7_sources", return_value=source), \
+                 mock.patch.object(runner, "_code_digest", return_value="fixture-task7-code"), \
+                 mock.patch.object(runner, "_load_contract", return_value={"code_bundle_sha256": "d" * 64,
+                     "checkpoint_identity": {"sha256": "model"}, "vae_sha256": "vae", "framework_commit": "framework"}):
+                with self.assertRaises(runner.ResumeMismatch): runner._precheck_resume(root, args)
 
     def test_c_baseline_encoded_z2_mismatch_is_counted_and_rejected(self):
         z1 = np.zeros((1, 1, 1, 1, 2), dtype=np.float32)
@@ -244,10 +360,13 @@ class Task7RunnerTests(unittest.TestCase):
             args = runner.parse_args(["--stage", "smoke", "--run-dir", str(root), "--resume"])
             with self.assertRaises(runner.ResumeMismatch):
                 runner._precheck_resume(root, args)
+            args_no_resume = runner.parse_args(["--stage", "smoke", "--run-dir", str(root)])
+            with self.assertRaises(runner.ResumeMismatch):
+                runner._precheck_resume(root, args_no_resume)
 
     def test_owned_monitor_paths_are_stage_scoped_and_not_reused(self):
         with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp) / "run"; root.mkdir(); created = []
+            root = Path(temp) / "run"; root.mkdir(); root_b = Path(temp) / "run-b"; root_b.mkdir(); created = []
             class FakeMonitor:
                 def __init__(self, monitor_root, **kwargs):
                     created.append(Path(monitor_root)); Path(monitor_root).mkdir(parents=True, exist_ok=True)
@@ -255,19 +374,19 @@ class Task7RunnerTests(unittest.TestCase):
                 def start(self): return self
                 def check(self, **kwargs): return {"status": "HARD_STOP", "reason_code": "TEST_STOP"}
                 def stop(self): pass
-            args_base = ["--run-dir", str(root), "--raw-root", str(root.parent / "raw"),
-                         "--decoder-root", str(root.parent / "decoder"), "--launch-contract", str(root / "contract")]
+            def args_for(run_root, stage):
+                return ["--stage", stage, "--run-dir", str(run_root), "--raw-root", str(run_root.parent / "raw"),
+                        "--decoder-root", str(run_root.parent / "decoder"), "--launch-contract", str(run_root / "contract")]
             with mock.patch.object(runner, "validate_task7_sources", return_value={"source_tree_sha256": "s"}), \
                  mock.patch.object(runner, "_load_contract", return_value={"code_bundle_sha256": "c" * 64}), \
                  mock.patch.object(runner, "_code_digest", return_value="code"), \
                  mock.patch.object(runner, "ResourceMonitor", FakeMonitor):
-                for stage in ("A", "B", "A"):
+                for stage, run_root in (("A", root), ("B", root_b)):
                     with self.assertRaises(runner.ResourceStop):
-                        runner.main(["--stage", stage, *args_base])
+                        runner.main(args_for(run_root, stage))
             self.assertEqual(created[0], root / "monitor" / "a")
-            self.assertEqual(created[1], root / "monitor" / "b")
-            self.assertEqual(created[2], root / "monitor" / "a-attempt-001")
-            self.assertEqual(len(set(created)), 3)
+            self.assertEqual(created[1], root_b / "monitor" / "b")
+            self.assertEqual(len(set(created)), 2)
 
     def test_cli_exposes_all_task7_bindings(self):
         args = runner.parse_args([
@@ -399,6 +518,7 @@ class Task7RunnerTests(unittest.TestCase):
 
     def _main_fixture(self, *, record_full=None, monitor=None):
         base = Path(tempfile.mkdtemp()); root = base / "run"; root.mkdir(); source_root = base / "source"; source_root.mkdir()
+        (root / "contract").write_text("fixture-contract", encoding="utf-8")
         z0 = np.zeros((1, 1, 1, 1, 4), dtype=np.float32)
         mask = np.zeros_like(z0, dtype=bool); mask[..., :2] = True
         v0 = np.zeros_like(z0); v0[..., 0] = 1.0
@@ -496,6 +616,8 @@ class Task7RunnerTests(unittest.TestCase):
             with self.assertRaises(runner.ResourceStop):
                 runner.main(["--stage", "smoke", "--run-dir", str(root), "--raw-root", str(root.parent / "source"), "--decoder-root", str(root.parent / "source"), "--launch-contract", str(root / "contract")], factory=factory, monitor=monitor)
         self.assertIn("post_call", monitor.captures)
+        root_status = json.loads((root / "run_status.json").read_text(encoding="utf-8"))
+        self.assertEqual(root_status["operation_counts"], {"G": 1, "D": 1, "E": 1})
 
     def test_preflight_without_production_bindings_is_not_complete(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -623,8 +745,22 @@ class Task7RunnerTests(unittest.TestCase):
             store.write_success(spec1["sample_id"], {"spec": spec1, "record": {"full_latent": z2,
                 "encoded_condition": np.full(shape, 3.0, dtype=np.float32),
                 "evidence": {"prediction_noise_hash": "seed1"}}}, operation_counts={"G": 1, "D": 1, "E": 1})
+            a_store = runner.Task7SampleStore(root / "stages" / "A" / "samples")
+            a_store.write_success("A_fixture", {"record": _a_record()}, operation_counts={"G": 0, "D": 0, "E": 1})
+            (root / "stages" / "A" / "run_status.json").parent.mkdir(parents=True, exist_ok=True)
+            (root / "stages" / "A" / "run_status.json").write_text(json.dumps({"status": "COMPLETE",
+                "completed_samples": ["A_fixture"], "skipped_samples": []}), encoding="utf-8")
+            b_ids = [path.name for path in (root / "stages" / "B" / "samples").iterdir() if path.is_dir()]
+            (root / "stages" / "B" / "run_status.json").write_text(json.dumps({"status": "COMPLETE",
+                "completed_samples": sorted(b_ids), "skipped_samples": []}), encoding="utf-8")
+            a_digest = runner._stage_completion_digests(root, "A")
+            b_digest = runner._stage_completion_digests(root, "B")
             (root / "analysis_gate.json").write_text(json.dumps({"a_scientific_pass": True, "b_engineering_pass": True,
-                "b_repeatability_pass": True, "source_sha256": "source", "code_sha256": "code"}), encoding="utf-8")
+                "b_repeatability_pass": True, "source_sha256": "source", "code_sha256": "code",
+                "a_run_status_sha256": a_digest["run_status_sha256"],
+                "a_samples_manifest_sha256": a_digest["samples_manifest_sha256"],
+                "b_run_status_sha256": b_digest["run_status_sha256"],
+                "b_samples_manifest_sha256": b_digest["samples_manifest_sha256"]}), encoding="utf-8")
             source = {"source_tree_sha256": "source", "task7_code_sha256": "code"}
             runner._prepare_c_source(source, root)
             np.testing.assert_array_equal(source["z1"], z1)
@@ -644,6 +780,26 @@ class Task7RunnerTests(unittest.TestCase):
             (path / "status.json").write_text(json.dumps(status), encoding="utf-8")
             with self.assertRaises(runner.ResumeMismatch):
                 store.prepare("sample", resume=True)
+
+    def test_c_gate_rejects_foreign_a_b_completion_evidence(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for stage in ("A", "B"):
+                stage_root = root / "stages" / stage
+                (stage_root / "samples").mkdir(parents=True)
+                (stage_root / "run_status.json").write_text(json.dumps({"status": "COMPLETE",
+                    "completed_samples": [], "skipped_samples": []}), encoding="utf-8")
+            a_digest = runner._stage_completion_digests(root, "A")
+            b_digest = runner._stage_completion_digests(root, "B")
+            (root / "analysis_gate.json").write_text(json.dumps({
+                "a_scientific_pass": True, "b_engineering_pass": True, "b_repeatability_pass": True,
+                "source_sha256": "source", "code_sha256": "code",
+                "a_run_status_sha256": a_digest["run_status_sha256"],
+                "a_samples_manifest_sha256": a_digest["samples_manifest_sha256"],
+                "b_run_status_sha256": b_digest["run_status_sha256"],
+                "b_samples_manifest_sha256": "foreign"}), encoding="utf-8")
+            with self.assertRaises(runner.ResumeMismatch):
+                runner._prepare_c_source({"source_tree_sha256": "source", "task7_code_sha256": "code"}, root)
 
     def test_source_contract_uses_historical_task6_action_hash(self):
         with tempfile.TemporaryDirectory() as temp:
