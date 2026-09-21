@@ -1,0 +1,24 @@
+# Task 4: gated Task7 execution and evidence handoff
+
+NOT RELEASED. Luna xhigh performs deployment and execution only after main approves integrated implementation, CPU regression and source identity. No new model/environment installation or source-data deletion.
+
+Worktree C:/Users/hongy/Desktop/Plan/.worktrees/task7-fp32-feedback; project cosmos_umi_capstone. SSH alias seetacloud-umi. Existing interpreter /root/autodl-tmp/cosmos-framework/.venv/bin/python must report torch 2.10.0+cu130. Framework /root/autodl-tmp/cosmos-framework-task6-clean; checkpoint /root/cosmos3-edge/cosmos3-edge-model; VAE /root/autodl-tmp/cosmos-framework/pretrained/tokenizers/video/wan2pt2/Wan2.2_VAE.pth. Existing Task6 code /root/autodl-tmp/task6-code-439e845/cosmos_umi_capstone. Assets /root/autodl-tmp/task6-code-61ddae0/cosmos_umi_capstone/assets/task6_bridge0/bridge_20260501_0.json and .mp4. Task5 root /root/autodl-tmp/cosmos-experiments/2026-09-14/umi_task5_directional_linearity_run01.
+
+Immutable raw root /root/autodl-tmp/cosmos-experiments/2026-09-16/umi_task6_cross_context_linearity_run07. FP32 decoder sibling ends _decoder_cleanup01, records named <sampleid>__temporary_fp32/record.json. Main independently validated eight samples and native feedback numbers in docs/task7-source-review.md; revalidate before execution. Preserve historical contract, create new current-code contract without pretending hashes equal old code.
+
+Upload frozen small code package into a new code directory, verify each SHA256 against local, never modify installed framework or Task6. Run focused and Task4-6 regressions using existing packages, CUDA_VISIBLE_DEVICES empty for CPU tests. No install to silence missing dependencies. Read actual runtime/runner/analyzer reports for commands and schema. Deployment must be the exact reviewed commit plus manifest.
+
+Use remote current date and lowest unused umi_task7_fp32_feedback_runNN directory under /root/autodl-tmp/cosmos-experiments/<date> and corresponding local Capstone/<date>/task7_fp32_feedback_runNN. Do not reuse CPU-check directory for scientific data. Monitor one runtime process only; no background process survives a resource hard stop.
+
+Execution releases are separate:
+1. Read-only/source preflight. Provide actual interpreter, framework/model/VAE/code/input identities, all eight sources, action/prompt/mask/v0 and current resources. No model generation.
+2. After main release run ONE engineering baseline full feedback smoke. Record setup encode separately, all attempted G/D/E counts, source G parity, FP32 G/D/E internals, actual condition/noise, peak/live resources and cleanup recovery. Stop for main inspection. No automatic retry after monitor failure/OOM.
+3. After main smoke release execute A only (16 encode, no new G/D). Analyze saved data, submit source/native parity/dtype/baseline/science evidence. Stop for main independent recomputation.
+4. After main A review execute B only (16 full feedback calls) regardless of A scientific PASS/FAIL, provided engineering/resource gates pass. Stop, analyze, submit. Main independently verifies all 16 counts/noise/source G parity and encoded-versus-consumed condition bytes and RMS propagation.
+5. C only after explicit main release binding A scientific PASS and B engineering/repeatability PASS; otherwise produce explicit SKIPPED_C. C is 38 calls, six actual delta1 rays, fixed beta .1 estimator. No third-step or extra diagnostic generation silently mixed into budget.
+
+Resource rules in approved plan binding: preload GPU<=1GiB, disk>=10GiB; engineering smoke peakalloc<=35GiB/NVML<=45GiB; live GPU used>75/free<20/reserved>65/OOM/growth hard stop; cgroup free<10 hard stop, <20 warning; preserve Task6 host available/RSS/swap/growth gates. Estimate remaining disk from measured successful sample sizes times remaining calls times1.3 plus5GiB reserve. Initial read-only snapshot 2026-09-21: GPU0 used0MiB, disk12995035136bytes available, cgroup max118111600640/current1561026560. These are NOT permanent gate approvals: resample live each stage.
+
+Save every stop including load/cleanup/monitor exceptions with identity, counts and last resources. All successful samples immutable; failed attempt retained. Fresh-process resume must verify artifacts and all bindings, not just config equality. No automatic retry on resource/monitor/OOM stop.
+
+Final deliverables: raw arrays remain remote; SHA-verified light archive local with code/config/CSVs/PNG+SVG/reports/resource logs/manifests/math and exact reproduction commands. Main will handle independent science conclusion, authorized GitHub light-code/results and Notion update. Do not claim actual model-error, global stability, Jacobian proof, low rank or continuous real actions. Use controlled repeated-action label and state exactly which A/B/C completed.
