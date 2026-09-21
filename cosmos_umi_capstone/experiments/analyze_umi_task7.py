@@ -1315,7 +1315,12 @@ def _b_stage_analysis(stage_data: Mapping[str, Any], source: Mapping[str, Any], 
                     engineering_reasons.append(f"B trajectory records are missing: {name}")
                     continue
                 d0 = fp32_difference(_array_from_record(first, "condition_input_fp32"), b0_in)
-                d1 = fp32_difference(_array_from_record(first, "encoded_condition"), b0_out)
+                first_encoded = _array_from_record(first, "encoded_condition")
+                second_input = _array_from_record(second, "condition_input_fp32")
+                if not byte_equal(second_input, first_encoded):
+                    engineering_reasons.append(
+                        f"B trajectory step-1 input differs from own step-0 encoded condition: {name}")
+                d1 = fp32_difference(first_encoded, b0_out)
                 d2 = fp32_difference(_array_from_record(second, "encoded_condition"), b1_out)
                 tensors[f"b_{name}_delta0"] = d0
                 tensors[f"b_{name}_delta1"] = d1

@@ -473,5 +473,92 @@ class Task7SavedEvidenceAOnlyTests(unittest.TestCase):
             self.assertEqual(result["A"]["scientific_status"], "NOT_RUN")
 
 
+class Task7SavedEvidenceBTests(unittest.TestCase):
+    """Synthetic B fixtures exercise only saved-evidence wiring contracts."""
+
+    _NAMES = ("baseline_pre", "v0_alpha_00_plus", "v0_alpha_00_minus",
+              "v0_alpha_01_plus", "v0_alpha_01_minus", "v0_alpha_02_plus",
+              "v0_alpha_02_minus", "baseline_post")
+
+    @classmethod
+    def _record(cls, condition, encoded, noise_hash, *, full_latent=None):
+        condition = np.asarray(condition, dtype=np.float32)
+        encoded = np.asarray(encoded, dtype=np.float32)
+        actual = {key: condition.copy() for key in (
+            "prepared_condition", "initial_condition", "reference_condition",
+            "first_condition", "last_condition")}
+        actual["condition_steps"] = np.stack([condition])
+        record = {
+            "condition_input_fp32": condition,
+            "encoded_condition": encoded,
+            "next_condition_fp32": encoded.copy(),
+            "actual": actual,
+            "evidence": {"operation_counts": {"G": 1, "D": 1, "E": 1},
+                         "prediction_noise_hash": noise_hash},
+        }
+        if full_latent is not None:
+            record["full_latent"] = np.asarray(full_latent, dtype=np.float32)
+        return record
+
+    @classmethod
+    def _fixture(cls, *, tamper_name=None):
+        base_input = np.array([1.0, -1.0], dtype=np.float32)
+        baseline_step0 = np.array([2.0, -2.0], dtype=np.float32)
+        baseline_step1 = np.array([3.0, -3.0], dtype=np.float32)
+        mask = np.ones(2, dtype=bool)
+        direction = np.array([1.0, 0.0], dtype=np.float32)
+        rows, records, a_records = {}, {}, {}
+        for name in cls._NAMES:
+            if name.startswith("baseline"):
+                delta = np.zeros(2, dtype=np.float32)
+            else:
+                alpha = 0.001 if "00" in name else (0.003 if "01" in name else 0.01)
+                sign = 1.0 if name.endswith("plus") else -1.0
+                delta = (np.float32(sign * alpha) * direction).astype(np.float32)
+            consumed = (base_input + delta).astype(np.float32)
+            rows[name] = {"consumed_condition": consumed, "mask": mask,
+                          "raw": Path("raw"), "decoder": Path("decoder")}
+            step0_encoded = (baseline_step0 + delta).astype(np.float32)
+            step1_input = step0_encoded.copy()
+            if name == tamper_name:
+                step1_input[0] = np.float32(step1_input[0] + 0.25)
+            step1_encoded = (baseline_step1 + delta).astype(np.float32)
+            records[f"B_{name}_step_0"] = cls._record(
+                consumed, step0_encoded, "noise0", full_latent=np.array([7.0, 7.0], np.float32))
+            records[f"B_{name}_step_1"] = cls._record(step1_input, step1_encoded, "noise1")
+            a_records[f"A_{name}_temporary_fp32"] = {"encoded_condition": step0_encoded}
+        binding = {"source": "fixture-source", "task7_code_sha256": "fixture-code",
+                   "config": {"stage": "B"}, "model": "fixture", "vae": "fixture",
+                   "framework": "fixture", "mask": "fixture-mask", "z0": "fixture-z0",
+                   "v0": "fixture-v0", "noise_policy": "fixed-seed-paired"}
+        stage = {"run_dir": Path("fixture-run"), "plan": runner.build_stage_plan("B"),
+                 "records": records, "config": {"binding": binding},
+                 "status": {"binding": binding}}
+        source = {"rows": rows, "condition_mask": mask,
+                  "source_tree_sha256": "fixture-source", "mask_sha256": "fixture-mask",
+                  "z0_sha256": "fixture-z0", "v0_sha256": "fixture-v0"}
+        return stage, source, a_records
+
+    def _analyze_fixture(self, *, tamper_name=None):
+        stage, source, a_records = self._fixture(tamper_name=tamper_name)
+        with mock.patch.object(api, "load_task7_stage", return_value={"records": a_records}), \
+             mock.patch.object(api, "_load_runner_array", return_value=np.array([7.0, 7.0], np.float32)):
+            return api._b_stage_analysis(stage, source, {}, tensors={})
+
+    def test_each_perturbed_step_one_input_matches_own_step_zero_output(self):
+        result = self._analyze_fixture()
+        self.assertTrue(result["engineering_pass"])
+        self.assertTrue(result["repeatability_pass"])
+
+    def test_perturbed_step_one_input_mismatch_is_engineering_failure(self):
+        result = self._analyze_fixture(tamper_name="v0_alpha_00_plus")
+        self.assertFalse(result["engineering_pass"])
+        self.assertFalse(result["repeatability_pass"])
+        self.assertIn(
+            "B trajectory step-1 input differs from own step-0 encoded condition: v0_alpha_00_plus",
+            result["engineering_reasons"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
