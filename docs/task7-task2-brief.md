@@ -12,6 +12,8 @@ Main source check: execute currently retains its FP32 working_net through decode
 
 Every call injects requested condition into clean carrier/reference/initial slots, keeping exterior canonical; no original-z0 fallback. Masks from real runtime and exact equality with Task6. Saved encoder output must equal next real consumed condition. Strictly distinguish full carrier [runtime shape] and condition-only [runtime mask shape]; no blindly flattened reshaping across temporal/channel positions.
 
+Boundary accounting: B z1 must exactly equal step2's actual prepared/first/last network-consumed condition. Final z2 is encoded feedback in the same coordinate system, not a claim of observed third-step denoising; no third generation or invented third seed. If validating a carrier mapping without generation, label it mapping/preparation-only and do not describe it as network consumption.
+
 FP32 Encoder/Decoder computational proof follows Task1. Restore hooks, flags, native dtypes and request caches even on failure; cleanup finally. Full quant arrays independent CPU copies, don't hold all outputs. First-step G output exact vs corresponding Task6 sample before declaring success; Task7 z0 frozen source rather than recomputed initial encoder result.
 
 ## Stage plans/runner
