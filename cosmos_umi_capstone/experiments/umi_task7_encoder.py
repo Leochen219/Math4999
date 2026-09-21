@@ -180,6 +180,12 @@ def _training_items(modules: list[Any]) -> list[tuple[Any, bool]]:
     return result
 
 
+def _readonly_attribute(owner: Any, name: str) -> bool:
+    """Identify derived properties that cannot accept an assignment."""
+    descriptor = inspect.getattr_static(type(owner), name, _MISSING)
+    return isinstance(descriptor, property) and descriptor.fset is None
+
+
 def _torch_tensor(torch: Any, value: Any) -> bool:
     try:
         return bool(torch.is_tensor(value))
@@ -332,9 +338,10 @@ class _PrecisionSnapshot:
         _call_to(targets[0], self.torch)
         for owner in self.owners:
             if hasattr(owner, "dtype"):
-                setattr(owner, "dtype", self.torch.float32)
+                if not _readonly_attribute(owner, "dtype"):
+                    setattr(owner, "dtype", self.torch.float32)
             for name in _CONSTANT_NAMES:
-                if hasattr(owner, name):
+                if hasattr(owner, name) and not _readonly_attribute(owner, name):
                     setattr(owner, name, _convert_value(getattr(owner, name), self.torch))
         # Fail closed if a floating parameter/buffer escaped conversion.
         for module, collection_name, name, tensor, _data in self.tensors:
@@ -342,6 +349,11 @@ class _PrecisionSnapshot:
             current = collection.get(name, tensor) if isinstance(collection, dict) else tensor
             if getattr(current, "is_floating_point", lambda: False)() and _dtype_name(current) != "float32":
                 raise EncoderPrecisionError("FP32 request left a floating parameter or buffer in non-FP32 dtype")
+        for owner, name, _value in self.attributes:
+            if name == "dtype" and _readonly_attribute(owner, name):
+                current = getattr(owner, name, _MISSING)
+                if current is _MISSING or current != self.torch.float32:
+                    raise EncoderPrecisionError("FP32 request left a read-only derived dtype unchanged")
 
     def restore(self) -> None:
         errors: list[BaseException] = []
@@ -355,7 +367,8 @@ class _PrecisionSnapshot:
                 errors.append(error)
         for owner, name, value in self.attributes:
             try:
-                setattr(owner, name, value)
+                if not _readonly_attribute(owner, name):
+                    setattr(owner, name, value)
             except BaseException as error:
                 errors.append(error)
         for module, training in self.training:

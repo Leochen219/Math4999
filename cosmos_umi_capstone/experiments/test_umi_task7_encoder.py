@@ -105,6 +105,36 @@ if torch is not None:
             self.training = bool(mode)
             return self
 
+    class PlainWan:
+        """Official-shaped plain wrapper beneath an outer interface."""
+
+        def __init__(self, inner):
+            self.model = inner
+            self.dtype = torch.bfloat16
+            self.mean = torch.tensor(0.5, dtype=torch.bfloat16)
+            self.std = torch.tensor(2.0, dtype=torch.bfloat16)
+            self.scale = (self.mean, torch.tensor(0.5, dtype=torch.bfloat16))
+
+        def encode(self, value):
+            value = value.to(self.dtype)
+            return self.model.encode(value, self.scale)
+
+    class ReadonlyDtypeWrapper:
+        """Outer interface whose dtype is derived from the plain Wan model."""
+
+        def __init__(self, plain_wan):
+            self.model = plain_wan
+
+        @property
+        def dtype(self):
+            return self.model.dtype
+
+        def encode(self, value):
+            return self.model.encode(value)
+
+        def clear_decoder_cache(self):
+            pass
+
     def setUp(self):
         self.frame = np.zeros((3, 8, 8), dtype=np.float32)
         self.frame[1] = 0.5
@@ -112,6 +142,9 @@ if torch is not None:
 
     def _encoder(self, **kwargs):
         return self.Tokenizer(self.Inner(**kwargs))
+
+    def _readonly_dtype_encoder(self, **kwargs):
+        return self.ReadonlyDtypeWrapper(self.PlainWan(self.Inner(**kwargs)))
 
     def test_actual_style_cache_clear_preserves_none_slot_structure_on_success_and_failure(self):
         tokenizer = self._encoder()
@@ -275,6 +308,37 @@ if torch is not None:
         self.assertIsNot(first["arrays"]["output"], second["arrays"]["output"])
         self.assertIs(inner.encode.__func__, inner.__class__.encode)
         self.assertNotIn("arrays", api.__dict__)
+
+    def test_readonly_derived_dtype_is_converted_and_restored(self):
+        wrapper = self._readonly_dtype_encoder()
+        inner = wrapper.model.model
+        original_weight = inner.weight
+        self.assertEqual(wrapper.dtype, torch.bfloat16)
+
+        with temporary_encoder_precision(wrapper, precision="temporary_fp32"):
+            self.assertEqual(wrapper.dtype, torch.float32)
+            self.assertEqual(wrapper.model.dtype, torch.float32)
+            self.assertEqual(inner.weight.dtype, torch.float32)
+
+        self.assertEqual(wrapper.dtype, torch.bfloat16)
+        self.assertEqual(wrapper.model.dtype, torch.bfloat16)
+        self.assertIs(inner.weight, original_weight)
+        self.assertEqual(inner.weight.dtype, torch.bfloat16)
+
+    def test_readonly_derived_dtype_restores_after_encoder_failure(self):
+        wrapper = self._readonly_dtype_encoder()
+        inner = wrapper.model.model
+        original_weight = inner.weight
+
+        with self.assertRaisesRegex(RuntimeError, "body failure"):
+            with temporary_encoder_precision(wrapper, precision="temporary_fp32"):
+                self.assertEqual(wrapper.dtype, torch.float32)
+                raise RuntimeError("body failure")
+
+        self.assertEqual(wrapper.dtype, torch.bfloat16)
+        self.assertEqual(wrapper.model.dtype, torch.bfloat16)
+        self.assertIs(inner.weight, original_weight)
+        self.assertEqual(inner.weight.dtype, torch.bfloat16)
 
 else:
     class Task7EncoderTests(unittest.TestCase):
