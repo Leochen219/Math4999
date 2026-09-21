@@ -22,3 +22,16 @@ Source validation review concerns:
 - Full tensor operation evidence may be summarized rather than storing every activation; retain key boundary arrays and per-step condition hashes.
 
 Preflight measured GPU0 used0 MiB/free97251 MiB; cgroup limit118111600640 bytes/current359919616; disk available12995616768 bytes; torch2.10.0+cu130. Snapshot only; must recheck before live execution.
+
+## Independent immutable-source audit
+
+Main executed docs/audit_task7_sources.py via SSH stdin, read-only, existing interpreter, no GPU. All artifact SHA256 in eight raw sample status files and eight matching temporary_fp32 decoder record files passed; each decoder_input_full_latent hash equals raw output_full hash. Same frozen z0/mask throughout; finite float32 RGB CHW256x256 in [0,1]; native encoded condition [1,48,1,16,16].
+
+- z0 file SHA256 a32e884f0cfc6575c4f3028fe981492d3f1eb7fbd188069a903f71417715063e
+- mask file SHA256 5affddf3ec28124623f916bfdc2d045655e831653967bb2107a6b24a2d887fc7
+- mask RMS(z0)=0.5908765512812604; frozen v0 RMS=0.9999999613461199 (float32 normalization roundoff; do not renormalize historical direction).
+- actual +/- input RMS: alpha .001 = .0005908766358475674 / .0005908766486948794; alpha .003 = .001772629432715335 / .0017726294218042506; alpha .01 = .0059087650697593665 / .0059087650451817315.
+- original baseline pre/post FP32 decoder frame hashes identical: 208a52c3b48d5f0da555e42bba1bf9669d20df27e837887dc5e0b1889bd40c8f.
+- original baseline native encoder hashes identical: 5f0c623a5528e0ed31de40161f36021b0fd7642a74ff11207007a7ff41baa4b9.
+
+These certify reusable historical sources, NOT new Task7 native parity or FP32 encoder results. Baseline direction.npy is zero; use v0 perturbation sample's frozen direction.
