@@ -186,8 +186,8 @@ def validate_run_roots(run_dir: str | Path, *, raw_root: str | Path | None = Non
     return roots
 
 
-def _artifact_status(root: Path, required: tuple[str, ...]) -> dict[str, Any]:
-    status_path = root / "status.json"
+def _artifact_status(root: Path, required: tuple[str, ...], *, status_filename: str = "status.json") -> dict[str, Any]:
+    status_path = root / status_filename
     if not status_path.is_file():
         raise ResumeMismatch(f"missing source status: {status_path}")
     status = _load_json(status_path)
@@ -206,6 +206,23 @@ def _artifact_status(root: Path, required: tuple[str, ...]) -> dict[str, Any]:
         if not path.is_file() or sha256_file(path) != expected:
             raise ResumeMismatch(f"source artifact hash mismatch: {path}")
     return dict(status)
+
+
+def _validate_decoder_record(record: Mapping[str, Any], *, sample_name: str, replay_id: str) -> None:
+    """Bind a real Decoder ``record.json`` to the requested Task 6 sample."""
+    spec = record.get("spec")
+    if not isinstance(spec, Mapping):
+        raise ResumeMismatch(f"decoder record lacks spec: {replay_id}")
+    expected = {
+        "decode_precision": "temporary_fp32",
+        "sample_id": f"bridge_0__seed_0__{sample_name}",
+        "replay_id": replay_id,
+        "seed": 0,
+        "state": "bridge_0",
+    }
+    for key, value in expected.items():
+        if canonical_json(spec.get(key)) != canonical_json(value):
+            raise ResumeMismatch(f"decoder record {key} differs: {replay_id}")
 
 
 def _source_sample_root(root: Path, name: str) -> Path:
@@ -282,7 +299,8 @@ def validate_task7_sources(raw_root: str | Path, decoder_root: str | Path) -> di
     for name in SOURCE_NAMES:
         sample, replay = _source_sample_root(raw, name), _decoder_sample_root(decoder, name)
         sample_status = _artifact_status(sample, REQUIRED_RAW_ARTIFACTS)
-        replay_status = _artifact_status(replay, REQUIRED_DECODER_ARTIFACTS)
+        replay_status = _artifact_status(replay, REQUIRED_DECODER_ARTIFACTS, status_filename="record.json")
+        _validate_decoder_record(replay_status, sample_name=name, replay_id=replay.name)
         if sample_status["artifact_sha256"].get("output_full.npy") != replay_status["artifact_sha256"].get("decoder_input_full_latent.npy"):
             raise ResumeMismatch(f"raw output_full and decoder input differ: {name}")
         z0 = _load_array(sample / "z_bar.npy")
@@ -348,7 +366,7 @@ def validate_task7_sources(raw_root: str | Path, decoder_root: str | Path) -> di
                 raise ResumeMismatch(f"source consumed input is not z0 +/- alpha*s_z*v0: {name}")
         rows.append({"name": name, "raw": str(sample), "decoder": str(replay),
                      "raw_status_sha256": sha256_file(sample / "status.json"),
-                     "decoder_record_sha256": sha256_file(replay / "record.json") if (replay / "record.json").is_file() else None,
+                     "decoder_record_sha256": sha256_file(replay / "record.json"),
                      "output_full_sha256": sample_status["artifact_sha256"]["output_full.npy"],
                      "decoder_input_sha256": replay_status["artifact_sha256"]["decoder_input_full_latent.npy"]})
     if frozen_z is None or frozen_mask is None or v0_direction is None:

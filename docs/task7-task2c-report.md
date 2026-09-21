@@ -124,6 +124,18 @@ compact separators) mapping each listed completed/skipped sample ID to the
 SHA-256 of that sample's `status.json`. The runner recomputes both A and B
 values before loading C and rejects foreign or incomplete lineage.
 
+## Follow-up: real Decoder record compatibility
+
+The immutable Decoder source format uses `record.json` (not `status.json`) at
+each temporary-FP32 replay directory. The runner now reads that file through
+the existing strict artifact-manifest checker, requiring top-level
+`status: "success"`, every required `.npy` artifact and every manifest hash to
+match. It also binds `spec.sample_id`, `spec.replay_id`, `spec.seed`,
+`spec.state`, and `spec.decode_precision` to the requested
+`bridge_0__seed_0__<name>` / `...__temporary_fp32` replay. Missing, non-success,
+hash-tampered, or precision-mismatched records fail closed; no fallback status
+is fabricated.
+
 ## Verification
 
 Using the required bundled NumPy interpreter:
@@ -131,7 +143,7 @@ Using the required bundled NumPy interpreter:
 ```text
 python -m py_compile run_umi_task7_experiment.py
 python -m unittest test_run_umi_task7_experiment
-Ran 43 tests; OK
+Ran 46 tests; OK
 python -m unittest test_run_umi_task7_experiment test_umi_task7_runtime \
     test_umi_task7_encoder test_umi_task7_official_deferred
 Ran 56 tests; OK (skipped=2)

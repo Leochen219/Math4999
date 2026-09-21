@@ -42,6 +42,58 @@ class StaticTestMonitor:
 
 
 class Task7RunnerTests(unittest.TestCase):
+    def _decoder_record_fixture(self, root, *, precision="temporary_fp32"):
+        sample_name = "baseline_pre"
+        replay_id = f"bridge_0__seed_0__{sample_name}__temporary_fp32"
+        sample = Path(root) / replay_id
+        sample.mkdir(parents=True)
+        arrays = {
+            "decoder_input_full_latent.npy": np.zeros((1,), dtype=np.float32),
+            "decoded_final_float32.npy": np.zeros((3, 2, 2), dtype=np.float32),
+            "direct_condition_latent_float32.npy": np.zeros((1,), dtype=np.float32),
+        }
+        hashes = {}
+        for name, value in arrays.items():
+            np.save(sample / name, value)
+            hashes[name] = runner.sha256_file(sample / name)
+        (sample / "record.json").write_text(json.dumps({
+            "status": "success",
+            "artifact_sha256": hashes,
+            "spec": {
+                "decode_precision": precision,
+                "sample_id": "bridge_0__seed_0__baseline_pre",
+                "replay_id": replay_id,
+                "seed": 0,
+                "state": "bridge_0",
+            },
+        }), encoding="utf-8")
+        return sample, replay_id
+
+    def test_real_decoder_record_fixture_is_accepted_and_bound(self):
+        with tempfile.TemporaryDirectory() as temp:
+            sample, replay_id = self._decoder_record_fixture(temp)
+            record = runner._artifact_status(sample, runner.REQUIRED_DECODER_ARTIFACTS,
+                                             status_filename="record.json")
+            runner._validate_decoder_record(record, sample_name="baseline_pre", replay_id=replay_id)
+            self.assertEqual(record["status"], "success")
+
+    def test_real_decoder_record_fixture_hash_tamper_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            sample, _ = self._decoder_record_fixture(temp)
+            with (sample / "decoded_final_float32.npy").open("ab") as handle:
+                handle.write(b"tampered")
+            with self.assertRaisesRegex(runner.ResumeMismatch, "hash mismatch"):
+                runner._artifact_status(sample, runner.REQUIRED_DECODER_ARTIFACTS,
+                                        status_filename="record.json")
+
+    def test_real_decoder_record_fixture_wrong_precision_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            sample, replay_id = self._decoder_record_fixture(temp, precision="native")
+            record = runner._artifact_status(sample, runner.REQUIRED_DECODER_ARTIFACTS,
+                                             status_filename="record.json")
+            with self.assertRaisesRegex(runner.ResumeMismatch, "decode_precision"):
+                runner._validate_decoder_record(record, sample_name="baseline_pre", replay_id=replay_id)
+
     def _real_monitor(self, root):
         gpu = {"gpu_used_gib": 0.0, "gpu_free_gib": 100.0, "gpu_reserved_gib": 1.0,
                "gpu_allocated_gib": 1.0, "gpu_peak_allocated_gib": 2.0,
