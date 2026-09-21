@@ -1,0 +1,15 @@
+# Task 1: actual FP32 feedback encoder
+
+Work in C:/Users/hongy/Desktop/Plan/.worktrees/task7-fp32-feedback/cosmos_umi_capstone. This task ONLY implements and tests reusable encoder seam, not full runner or GPU execution.
+
+Create experiments/umi_task7_encoder.py and test_umi_task7_encoder.py; preserve existing behavior. Existing reference ConditionEncoderAdapter in umi_task6_cosmos_loader.py receives [0,1] float32 CHW -> [1,3,1,H,W] [-1,1], but native VAE internally BF16. replay_decode in umi_task5_decoder.py demonstrates temporary VAE dtype conversion/restore. Read actual installed source remotely if needed (read-only SSH authorized), do not assume wrapper .float() controls inner math.
+
+Required behavior: encode supplied float RGB under native or temporary_fp32 precision; independent CPU copies of input preprocessing, actual encoder input/scaled latent/output and actual dtype evidence. FP32 path converts necessary inner parameters, floating buffers, wrapper dtype/mean/std/scale constants; integer buffers stay integer. eval/inference_mode; autocast/TF32 off, restore original flags, train state, tensors/dtype and cache in finally incl failure. Record critical layer native input/output dtype WITHOUT hiding casts through projection. Reject BF16 compute on requested FP32 path. Exact same loaded weights converted, no higher-precision recovery claim. Never uint8, PNG, MP4; only required normalized tensor layout/range transformation, no redundant resize if valid 256x256.
+
+Use official Wan encoder normalization: same output latent scaling as Task6 condition encoder, no channel/time hardcoding beyond validated input RGB layout. Expose a small documented function/class API to be consumed by StageA runner and feedback runtime. Return serializable evidence + arrays; no accumulating hooks/payloads over calls. Actual identities bound to weights/source not class names. Cleanup after every call.
+
+TDD: write red behavior tests then minimal implementation; tests must catch internal BF16 despite final float32, mean/std and buffers conversion, [0,1]->[-1,1], output shape/finite, invalid range/shape, cache and restoration on encoder exceptions, repeated calls no retained hooks, native regression path. Local bundled python has numpy, no torch assumed; use realistic doubles only around dependency and run real torch CPU tests remotely if available after review. No installing dependencies. Run full existing discover suite once; report failures/skips honestly. First verify baseline suite before implementation.
+
+Source server: ssh -o BatchMode=yes -o ConnectTimeout=15 seetacloud-umi. Framework /root/autodl-tmp/cosmos-framework-task6-clean; interpreter /root/autodl-tmp/cosmos-framework/.venv/bin/python. Current deployed code /root/autodl-tmp/task6-code-439e845/cosmos_umi_capstone. No GPU/model loads. No uploading before main review. No subagents.
+
+Commit scoped code/tests only. Report to docs/task7-task1-report.md: changes, exact red/green commands/output, full-suite summary, actual source consulted, API contract, caveats. Return concise status/commit/tests/path. Raise uncertainties rather than invent behavior.
