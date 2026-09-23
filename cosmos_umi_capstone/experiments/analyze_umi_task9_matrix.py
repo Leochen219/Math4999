@@ -71,6 +71,8 @@ def collate_scans(scan_dirs: Sequence[str | Path], output_dir: str | Path,
             residuals = result["heldout_relative_residual_by_k"]
             values = [] if k95 is None or residuals is None else [
                 value for value in residuals[k95 - 1] if value is not None]
+            full_rank_values = [] if not residuals else [
+                value for value in residuals[-1] if value is not None]
             rows.append({
                 "record_index": scene_id, "seed": seed, "space": space,
                 "interpretation": result["interpretation"],
@@ -80,7 +82,10 @@ def collate_scans(scan_dirs: Sequence[str | Path], output_dir: str | Path,
                 "k90": result["k90"], "k95": k95, "k99": result["k99"],
                 "effective_rank": result["effective_rank"],
                 "unresolved_energy_fraction": result["unresolved_energy_fraction"],
+                "mean_heldout_residual_at_k95": sum(values) / len(values) if values else None,
                 "max_heldout_residual_at_k95": max(values) if values else None,
+                "mean_heldout_residual_at_full_rank": (
+                    sum(full_rank_values) / len(full_rank_values) if full_rank_values else None),
             })
     output = Path(output_dir)
     if output.exists() and any(output.iterdir()):
@@ -98,12 +103,14 @@ def collate_scans(scan_dirs: Sequence[str | Path], output_dir: str | Path,
         writer.writerows(rows)
     lines = ["# Task 9: cross-scene and cross-seed response spectra", "",
              "Six spectra were validated separately; no response matrices were pooled.", "",
-             "| Episode record | Seed | Space | Half-step pass | k95 | Effective rank | Max held-out residual at k95 |",
-             "|---:|---:|---|---:|---:|---:|---:|"]
+             "| Episode record | Seed | Space | Half-step pass | k95 | Effective rank | Held-out mean at k95 / full rank | Max at k95 |",
+             "|---:|---:|---|---:|---:|---:|---:|---:|"]
     for row in rows:
         lines.append(f"| {row['record_index']} | {row['seed']} | {row['space']} | "
                      f"{row['half_step_pass_count']}/{row['half_step_total']} | {row['k95']} | "
-                     f"{row['effective_rank']} | {row['max_heldout_residual_at_k95']} |")
+                     f"{row['effective_rank']} | {row['mean_heldout_residual_at_k95']} / "
+                     f"{row['mean_heldout_residual_at_full_rank']} | "
+                     f"{row['max_heldout_residual_at_k95']} |")
     lines += ["", "Ranks describe only the 32 sampled training directions per stratum. "
               "Distinct episodes and two noise seeds are replication conditions, not a population estimate.", ""]
     (output / "matrix_report.md").write_text("\n".join(lines), encoding="utf-8")

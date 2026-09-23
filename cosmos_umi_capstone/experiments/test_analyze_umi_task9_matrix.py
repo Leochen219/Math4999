@@ -28,7 +28,7 @@ def _write_stratum(root: Path, scene: int, seed: int, *, action: str = "fixed") 
     space = {"interpretation": "LOCAL_JACOBIAN_CANDIDATE", "half_step_pass_count": 1,
              "half_step_total": 1, "observed_rank": 1, "k90": 1, "k95": 1, "k99": 1,
              "effective_rank": 1.0, "unresolved_energy_fraction": 0.0,
-             "heldout_relative_residual_by_k": [[0.1]]}
+             "heldout_relative_residual_by_k": [[0.1, 0.3]]}
     summary = {"status": "COMPLETE", "scene_identity": identity, "seed": seed,
                "spaces": {"predicted_latent": space, "feedback_condition": space,
                           "float_rgb_final": space}}
@@ -51,6 +51,8 @@ class MatrixSummaryTests(unittest.TestCase):
             self.assertEqual(result["strata"], 6)
             self.assertFalse(result["matrix_pooled"])
             self.assertEqual(len(result["rows"]), 18)
+            self.assertAlmostEqual(result["rows"][0]["mean_heldout_residual_at_k95"], 0.2)
+            self.assertAlmostEqual(result["rows"][0]["mean_heldout_residual_at_full_rank"], 0.2)
             self.assertTrue((root / "matrix" / "stratum_metrics.csv").is_file())
             with self.assertRaises(FileExistsError):
                 collate_scans(scans, root / "matrix")
