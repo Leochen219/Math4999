@@ -32,6 +32,23 @@ float RGB frame. No columns from different base scenes or noise seeds are pooled
 into a single purported Jacobian. The eight held-out responses test whether a
 truncated output subspace transfers to unseen input directions.
 
+For a fixed scene, seed, and output space, write the finite-amplitude map as
+`T(z)` and let `s_z = RMS(z[M])`. Each masked direction has `RMS(v_i[M]) = 1`.
+The primary response column uses the **realized** paired input step `h_i`
+(measured after float32 rounding):
+
+```text
+D_i = [T(z + alpha*s_z*v_i) - T(z - alpha*s_z*v_i)] / (2*h_i),
+D = [D_1 ... D_32] = U diag(sigma_1,...,sigma_32) V^T.
+```
+
+With resolved singular-value energy `p_i = sigma_i^2 / sum_j sigma_j^2`, the
+reported cumulative energy is `C_k = sum_{i<=k} p_i`, and the entropy effective
+rank is `exp(-sum_i p_i log p_i)`. The actual held-out test is separate:
+`r_j(k) = ||d_j - U_k U_k^T d_j||_2 / ||d_j||_2`. We report it both at the
+training-energy `k95` and at the full resolved training rank. A small entropy
+effective rank alone does **not** imply that `r_j(k)` is small.
+
 ## Analysis and interpretation
 
 The report gives squared-singular-value cumulative energy, `k90/k95/k99`,
@@ -48,6 +65,10 @@ or justify changing `alpha` after seeing the data. A passing check is empirical
 local-linearity evidence for the sampled directions, not a proof of Jacobian
 existence. Even a sharply concentrated spectrum is a claim only about the
 sampled input subspace and chosen output representation; rank is at most 32.
+The half-step comparison uses the same central response formula at `alpha/2`
+and checks its cosine and relative RMS change against the primary column. If
+any direction fails, the stratum's SVD remains a valid *finite-amplitude response*
+spectrum, but must not be presented as an established Jacobian spectrum.
 
 ## Reproduction entry points
 
