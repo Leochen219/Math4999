@@ -1,0 +1,26 @@
+{
+  "files": {
+    "endpoint_error.png": "207b32786e6db80bf18d0468f5b30dea9078c78d8b49ef785b3fb806112c94b5",
+    "endpoint_error.svg": "86f48fbdb0d8730950a40e06ddf58615252cbe10d99f1c706e66527357ecb3d1",
+    "figure_caption.md": "608d143876704d1e474326f8e836bd59ad0e756284b647098b0b871f0dd88bb4",
+    "figure_source_data.json": "9290a21548f9de2a6131a12b3b521d56ef90ba536b91dd72653ec6e762350602",
+    "mse_error_geometry.png": "f49e07195a65e499ae5382e381e32039873ce2afb9983dc5adeee314d0ec6d89",
+    "mse_error_geometry.svg": "1a72bacec19e294c3dee49c71f6fdcc27768db4dbbe5680202bc838b1a9aade4",
+    "paired_rmse_delta.png": "50431d2ee0ab9538dd3efae5ba48c68cd30bc391ee1b844ee00b2c9ecbc319cb",
+    "paired_rmse_delta.svg": "255babf137ed5f5f9f5d6febf8f3c11224ce66670db7ec773a4182eb33f876c3"
+  },
+  "renderer_sha256": "783434c69917dbabf0875a9a7553fce9a0b4da652e06a0066ff71a88e21eb990",
+  "schema": "umi-task11-horizon-figure-manifest-v1",
+  "scope": {
+    "claim": "one episode with two seed schedules; means are descriptive, not population estimates or confidence intervals",
+    "comparison": "endpoint prediction errors are relative to real trajectory frames under future-pose motion conditions",
+    "episode_count": 1,
+    "h1": "one G0 endpoint per schedule; TF and AR mode-specific endpoints start at h2",
+    "horizons": "five observed generated-chunk endpoints only; line segments are visual guides, not fitted growth laws",
+    "latent": "condition-mask RMS/error geometry uses image-condition latent mask slots; future poses are action conditions",
+    "mse_identity": "observed AR-minus-TF MSE difference equals the FP64 cross term plus feedback-change squared, up to the recorded identity residual",
+    "seed_schedule_count": 2
+  },
+  "source_analysis_sha256": "a4e1b3a3b0bb6dd12a5b61d2afde43b16340d4350bffba5baa73f7321c748dce",
+  "source_run_identity_sha256": "bb60d97e1ca86ac1b4ed1df36a36112c7ed83cef653fb6806f51317e7db78436"
+}

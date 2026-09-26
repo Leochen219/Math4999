@@ -1,0 +1,21 @@
+{
+  "chart_map": {
+    "cumulative_energy": "two-panel line-marker chart; separate masked latent and decoded RGB; twelve directions, six episodes by two seeds, 95% reference",
+    "loeo_episode_residuals": "3 by 2 small multiples; six episode points plus descriptive mean at fixed ranks; raw and centered denominators distinguished; adaptive ranks separate",
+    "truncation_norm_residual": "two-panel line-marker chart; relative Frobenius norm residual, explicitly not energy"
+  },
+  "figure_caption_sha256": "5e1bb1c6aa6c8f790a9c9f45e9a3b5963b58cd11a98d4d3b823afc1379c0736c",
+  "figure_source_data_sha256": "69e3bad44d4a781ac1daa252133c60e28df4555897f92fab72ed80bc4e4d4ee8",
+  "files": {
+    "cumulative_energy.png": "a285b99ddf0b5b60c25d19ec37756b2e16cb39fcf1ed30e1b01d3619b5dd7090",
+    "cumulative_energy.svg": "c9b0f51cee0e577f740105eb70f6bca07559a20dcbb67705d39e5d396050105e",
+    "loeo_episode_residuals.png": "db2e967ef380b05c0087e2254fb514cff9cb46e4e0e00e4c4ace8ab55595868c",
+    "loeo_episode_residuals.svg": "1982e1cf37a0dd2923ea286d44e9e45b7b54ec46f115add2b142c87cb8932356",
+    "truncation_norm_residual.png": "482af8c69c4a6174562f185d9db30f5f89199b4cc1987cdc6b50dd564281ec09",
+    "truncation_norm_residual.svg": "7fd94abdf47fc759eca5706db9186943aa66267084697f816c42e0a2ccef092a"
+  },
+  "renderer_sha256": "2178c4ef9f4bbf5d88a04a6df978bc0422212ae861e1ad8a02e63d7dbf620c66",
+  "schema": "umi-task11-figure-bundle-v2",
+  "source_analysis_sha256": "7a2773b31a165fef3eb358160f60e04b9f43aa82d6673429508186083d0ebe27",
+  "source_manifest_sha256": "e083aad1f0d6822424e10f50920faaacaf98f5a14acd0b7fd34a671264adba45"
+}

@@ -1,0 +1,1456 @@
+{
+  "adaptive_k95_reported_separately": {
+    "E1": {
+      "latent": {
+        "training_centered_k95_by_held_out_episode": [
+          8,
+          8,
+          8,
+          8,
+          8,
+          8
+        ],
+        "training_k95_by_held_out_episode": [
+          8,
+          8,
+          8,
+          8,
+          8,
+          8
+        ]
+      },
+      "rgb": {
+        "training_centered_k95_by_held_out_episode": [
+          7,
+          8,
+          7,
+          8,
+          7,
+          8
+        ],
+        "training_k95_by_held_out_episode": [
+          8,
+          8,
+          8,
+          9,
+          8,
+          8
+        ]
+      }
+    },
+    "EAR2": {
+      "latent": {
+        "training_centered_k95_by_held_out_episode": [
+          8,
+          8,
+          8,
+          8,
+          8,
+          8
+        ],
+        "training_k95_by_held_out_episode": [
+          8,
+          9,
+          9,
+          8,
+          8,
+          8
+        ]
+      },
+      "rgb": {
+        "training_centered_k95_by_held_out_episode": [
+          7,
+          8,
+          8,
+          7,
+          7,
+          7
+        ],
+        "training_k95_by_held_out_episode": [
+          8,
+          9,
+          8,
+          8,
+          8,
+          8
+        ]
+      }
+    },
+    "ETF2": {
+      "latent": {
+        "training_centered_k95_by_held_out_episode": [
+          8,
+          8,
+          8,
+          8,
+          8,
+          8
+        ],
+        "training_k95_by_held_out_episode": [
+          8,
+          8,
+          8,
+          8,
+          8,
+          8
+        ]
+      },
+      "rgb": {
+        "training_centered_k95_by_held_out_episode": [
+          7,
+          7,
+          7,
+          7,
+          7,
+          7
+        ],
+        "training_k95_by_held_out_episode": [
+          8,
+          8,
+          8,
+          8,
+          8,
+          8
+        ]
+      }
+    }
+  },
+  "loeo_fixed_ranks": {
+    "E1": {
+      "latent": [
+        {
+          "episode_points": [
+            {
+              "centered_relative_residual": 0.9920433379891035,
+              "held_out_episode": 1,
+              "raw_relative_residual": 0.9959356011689944
+            },
+            {
+              "centered_relative_residual": 0.9984651205191505,
+              "held_out_episode": 2,
+              "raw_relative_residual": 0.9907766490261969
+            },
+            {
+              "centered_relative_residual": 0.9892415264587084,
+              "held_out_episode": 3,
+              "raw_relative_residual": 0.9933571554991147
+            },
+            {
+              "centered_relative_residual": 0.9982182573108032,
+              "held_out_episode": 6,
+              "raw_relative_residual": 0.9943137947453833
+            },
+            {
+              "centered_relative_residual": 0.9979288025911164,
+              "held_out_episode": 7,
+              "raw_relative_residual": 0.9942633554812725
+            },
+            {
+              "centered_relative_residual": 0.9866883801731539,
+              "held_out_episode": 14,
+              "raw_relative_residual": 0.9959520737498273
+            }
+          ],
+          "requested_rank": 1,
+          "six_episode_mean_centered": 0.993764237507006,
+          "six_episode_mean_raw": 0.9940997716117982
+        },
+        {
+          "episode_points": [
+            {
+              "centered_relative_residual": 0.9869688869239548,
+              "held_out_episode": 1,
+              "raw_relative_residual": 0.9869069878396848
+            },
+            {
+              "centered_relative_residual": 0.9939714063961023,
+              "held_out_episode": 2,
+              "raw_relative_residual": 0.9889875390021332
+            },
+            {
+              "centered_relative_residual": 0.9888545275202731,
+              "held_out_episode": 3,
+              "raw_relative_residual": 0.9780662892144278
+            },
+            {
+              "centered_relative_residual": 0.9975849425908934,
+              "held_out_episode": 6,
+              "raw_relative_residual": 0.9911593097301264
+            },
+            {
+              "centered_relative_residual": 0.9885543726878889,
+              "held_out_episode": 7,
+              "raw_relative_residual": 0.993011623768205
+            },
+            {
+              "centered_relative_residual": 0.9836149249651532,
+              "held_out_episode": 14,
+              "raw_relative_residual": 0.9854164408666455
+            }
+          ],
+          "requested_rank": 2,
+          "six_episode_mean_centered": 0.9899248435140443,
+          "six_episode_mean_raw": 0.9872580317368705
+        },
+        {
+          "episode_points": [
+            {
+              "centered_relative_residual": 0.9842730909165576,
+              "held_out_episode": 1,
+              "raw_relative_residual": 0.9767574105644267
+            },
+            {
+              "centered_relative_residual": 0.9922585663456923,
+              "held_out_episode": 2,
+              "raw_relative_residual": 0.985472362789717
+            },
+            {
+              "centered_relative_residual": 0.9856338395093273,
+              "held_out_episode": 3,
+              "raw_relative_residual": 0.9763724708751568
+            },
+            {
+              "centered_relative_residual": 0.9961723758119172,
+              "held_out_episode": 6,
+              "raw_relative_residual": 0.9891317237812689
+            },
+            {
+              "centered_relative_residual": 0.9858535087246352,
+              "held_out_episode": 7,
+              "raw_relative_residual": 0.9868783508002463
+            },
+            {
+              "centered_relative_residual": 0.9819221857221192,
+              "held_out_episode": 14,
+              "raw_relative_residual": 0.980515882389138
+            }
+          ],
+          "requested_rank": 4,
+          "six_episode_mean_centered": 0.9876855945050415,
+          "six_episode_mean_raw": 0.9825213668666589
+        },
+        {
+          "episode_points": [
+            {
+              "centered_relative_residual": 0.9696714419068823,
+              "held_out_episode": 1,
+              "raw_relative_residual": 0.9620800066072597
+            },
+            {
+              "centered_relative_residual": 0.9809217694067457,
+              "held_out_episode": 2,
+              "raw_relative_residual": 0.9722956153013484
+            },
+            {
+              "centered_relative_residual": 0.965615298855298,
+              "held_out_episode": 3,
+              "raw_relative_residual": 0.9573866183015511
+            },
+            {
+              "centered_relative_residual": 0.9886470550486511,
+              "held_out_episode": 6,
+              "raw_relative_residual": 0.9822062284641286
+            },
+            {
+              "centered_relative_residual": 0.9752738708376663,
+              "held_out_episode": 7,
+              "raw_relative_residual": 0.9774401096265795
+            },
+            {
+              "centered_relative_residual": 0.9601541663135039,
+              "held_out_episode": 14,
+              "raw_relative_residual": 0.9593831986525113
+            }
+          ],
+          "requested_rank": 8,
+          "six_episode_mean_centered": 0.9733806003947912,
+          "six_episode_mean_raw": 0.9684652961588965
+        },
+        {
+          "episode_points": [
+            {
+              "centered_relative_residual": 0.9693577375054866,
+              "held_out_episode": 1,
+              "raw_relative_residual": 0.9617193458800424
+            },
+            {
+              "centered_relative_residual": 0.9806341024124332,
+              "held_out_episode": 2,
+              "raw_relative_residual": 0.9716974807851975
+            },
+            {
+              "centered_relative_residual": 0.9642665298689279,
+              "held_out_episode": 3,
+              "raw_relative_residual": 0.9512839795490418
+            },
+            {
+              "centered_relative_residual": 0.9881354828384838,
+              "held_out_episode": 6,
+              "raw_relative_residual": 0.980306374410703
+            },
+            {
+              "centered_relative_residual": 0.9751393949590532,
+              "held_out_episode": 7,
+              "raw_relative_residual": 0.9740816983064151
+            },
+            {
+              "centered_relative_residual": 0.9601087419627714,
+              "held_out_episode": 14,
+              "raw_relative_residual": 0.9550436220992642
+            }
+          ],
+          "requested_rank": 10,
+          "six_episode_mean_centered": 0.9729403315911926,
+          "six_episode_mean_raw": 0.9656887501717772
+        }
+      ],
+      "rgb": [
+        {
+          "episode_points": [
+            {
+              "centered_relative_residual": 0.9828856410092864,
+              "held_out_episode": 1,
+              "raw_relative_residual": 0.9998736465991646
+            },
+            {
+              "centered_relative_residual": 0.9997259876560338,
+              "held_out_episode": 2,
+              "raw_relative_residual": 0.9918628923130106
+            },
+            {
+              "centered_relative_residual": 0.978088917574793,
+              "held_out_episode": 3,
+              "raw_relative_residual": 0.9999962868186515
+            },
+            {
+              "centered_relative_residual": 0.9981823824812776,
+              "held_out_episode": 6,
+              "raw_relative_residual": 0.999502550574054
+            },
+            {
+              "centered_relative_residual": 0.9828151464005199,
+              "held_out_episode": 7,
+              "raw_relative_residual": 0.9984196734930588
+            },
+            {
+              "centered_relative_residual": 0.9633900745245385,
+              "held_out_episode": 14,
+              "raw_relative_residual": 0.9986961890172067
+            }
+          ],
+          "requested_rank": 1,
+          "six_episode_mean_centered": 0.9841813582744082,
+          "six_episode_mean_raw": 0.9980585398025243
+        },
+        {
+          "episode_points": [
+            {
+              "centered_relative_residual": 0.9805654050174495,
+              "held_out_episode": 1,
+              "raw_relative_residual": 0.9995486339372164
+            },
+            {
+              "centered_relative_residual": 0.9994243114323434,
+              "held_out_episode": 2,
+              "raw_relative_residual": 0.9916566931956529
+            },
+            {
+              "centered_relative_residual": 0.9779213336192634,
+              "held_out_episode": 3,
+              "raw_relative_residual": 0.99533993816666
+            },
+            {
+              "centered_relative_residual": 0.9891015027973524,
+              "held_out_episode": 6,
+              "raw_relative_residual": 0.9976931198431251
+            },
+            {
+              "centered_relative_residual": 0.9795395862612077,
+              "held_out_episode": 7,
+              "raw_relative_residual": 0.9975046301890045
+            },
+            {
+              "centered_relative_residual": 0.9624479945596518,
+              "held_out_episode": 14,
+              "raw_relative_residual": 0.9955608880169551
+            }
+          ],
+          "requested_rank": 2,
+          "six_episode_mean_centered": 0.9815000222812115,
+          "six_episode_mean_raw": 0.9962173172247689
+        },
+        {
+          "episode_points": [
+            {
+              "centered_relative_residual": 0.977102228116757,
+              "held_out_episode": 1,
+              "raw_relative_residual": 0.9981758969418002
+            },
+            {
+              "centered_relative_residual": 0.9901781775468524,
+              "held_out_episode": 2,
+              "raw_relative_residual": 0.9889270351720726
+            },
+            {
+              "centered_relative_residual": 0.9741769123292032,
+              "held_out_episode": 3,
+              "raw_relative_residual": 0.994946305445483
+            },
+            {
+              "centered_relative_residual": 0.9875968489400426,
+              "held_out_episode": 6,
+              "raw_relative_residual": 0.9919657937727822
+            },
+            {
+              "centered_relative_residual": 0.9748371598248211,
+              "held_out_episode": 7,
+              "raw_relative_residual": 0.9930443623206955
+            },
+            {
+              "centered_relative_residual": 0.9552341862409571,
+              "held_out_episode": 14,
+              "raw_relative_residual": 0.9948158048568256
+            }
+          ],
+          "requested_rank": 4,
+          "six_episode_mean_centered": 0.9765209188331055,
+          "six_episode_mean_raw": 0.9936458664182766
+        },
+        {
+          "episode_points": [
+            {
+              "centered_relative_residual": 0.9714273710999201,
+              "held_out_episode": 1,
+              "raw_relative_residual": 0.9895828107492182
+            },
+            {
+              "centered_relative_residual": 0.9800470532705648,
+              "held_out_episode": 2,
+              "raw_relative_residual": 0.9862127767120975
+            },
+            {
+              "centered_relative_residual": 0.9540331089164094,
+              "held_out_episode": 3,
+              "raw_relative_residual": 0.9860469807490467
+            },
+            {
+              "centered_relative_residual": 0.9849742191175026,
+              "held_out_episode": 6,
+              "raw_relative_residual": 0.9887043462401057
+            },
+            {
+              "centered_relative_residual": 0.9666518728515412,
+              "held_out_episode": 7,
+              "raw_relative_residual": 0.9913648083019965
+            },
+            {
+              "centered_relative_residual": 0.9392440241694557,
+              "held_out_episode": 14,
+              "raw_relative_residual": 0.9813439031617182
+            }
+          ],
+          "requested_rank": 8,
+          "six_episode_mean_centered": 0.966062941570899,
+          "six_episode_mean_raw": 0.9872092709856971
+        },
+        {
+          "episode_points": [
+            {
+              "centered_relative_residual": 0.9708705072873134,
+              "held_out_episode": 1,
+              "raw_relative_residual": 0.9889936472039964
+            },
+            {
+              "centered_relative_residual": 0.9751395981792145,
+              "held_out_episode": 2,
+              "raw_relative_residual": 0.9829510674814965
+            },
+            {
+              "centered_relative_residual": 0.9492667455423806,
+              "held_out_episode": 3,
+              "raw_relative_residual": 0.9797653455748051
+            },
+            {
+              "centered_relative_residual": 0.9846231164990087,
+              "held_out_episode": 6,
+              "raw_relative_residual": 0.9876599144800295
+            },
+            {
+              "centered_relative_residual": 0.9665704300743432,
+              "held_out_episode": 7,
+              "raw_relative_residual": 0.9891205525469122
+            },
+            {
+              "centered_relative_residual": 0.9390760901685058,
+              "held_out_episode": 14,
+              "raw_relative_residual": 0.9749315735075557
+            }
+          ],
+          "requested_rank": 10,
+          "six_episode_mean_centered": 0.964257747958461,
+          "six_episode_mean_raw": 0.9839036834657993
+        }
+      ]
+    },
+    "EAR2": {
+      "latent": [
+        {
+          "episode_points": [
+            {
+              "centered_relative_residual": 0.9984608550812597,
+              "held_out_episode": 1,
+              "raw_relative_residual": 0.9846225404098242
+            },
+            {
+              "centered_relative_residual": 0.9996127649827615,
+              "held_out_episode": 2,
+              "raw_relative_residual": 0.9855987227172543
+            },
+            {
+              "centered_relative_residual": 0.9992044695718421,
+              "held_out_episode": 3,
+              "raw_relative_residual": 0.9795260079790575
+            },
+            {
+              "centered_relative_residual": 0.9987835365680824,
+              "held_out_episode": 6,
+              "raw_relative_residual": 0.9901793270290057
+            },
+            {
+              "centered_relative_residual": 0.9974303074894642,
+              "held_out_episode": 7,
+              "raw_relative_residual": 0.9874127866516096
+            },
+            {
+              "centered_relative_residual": 0.9987655590745196,
+              "held_out_episode": 14,
+              "raw_relative_residual": 0.9849444683174855
+            }
+          ],
+          "requested_rank": 1,
+          "six_episode_mean_centered": 0.9987095821279882,
+          "six_episode_mean_raw": 0.9853806421840394
+        },
+        {
+          "episode_points": [
+            {
+              "centered_relative_residual": 0.9976388511062668,
+              "held_out_episode": 1,
+              "raw_relative_residual": 0.9830064984750718
+            },
+            {
+              "centered_relative_residual": 0.999576855168046,
+              "held_out_episode": 2,
+              "raw_relative_residual": 0.9851660315562358
+            },
+            {
+              "centered_relative_residual": 0.9984748163652544,
+              "held_out_episode": 3,
+              "raw_relative_residual": 0.9787708990554935
+            },
+            {
+              "centered_relative_residual": 0.9984686629685959,
+              "held_out_episode": 6,
+              "raw_relative_residual": 0.9898059677753339
+            },
+            {
+              "centered_relative_residual": 0.9973110700769452,
+              "held_out_episode": 7,
+              "raw_relative_residual": 0.984115978892191
+            },
+            {
+              "centered_relative_residual": 0.9987429895340264,
+              "held_out_episode": 14,
+              "raw_relative_residual": 0.9836877679945477
+            }
+          ],
+          "requested_rank": 2,
+          "six_episode_mean_centered": 0.9983688742031891,
+          "six_episode_mean_raw": 0.9840921906248123
+        },
+        {
+          "episode_points": [
+            {
+              "centered_relative_residual": 0.993106653672337,
+              "held_out_episode": 1,
+              "raw_relative_residual": 0.9819759053043327
+            },
+            {
+              "centered_relative_residual": 0.9916395343159573,
+              "held_out_episode": 2,
+              "raw_relative_residual": 0.9807127904018647
+            },
+            {
+              "centered_relative_residual": 0.9972337169425662,
+              "held_out_episode": 3,
+              "raw_relative_residual": 0.9777214831300175
+            },
+            {
+              "centered_relative_residual": 0.9941253325701156,
+              "held_out_episode": 6,
+              "raw_relative_residual": 0.9885208604546105
+            },
+            {
+              "centered_relative_residual": 0.9929911475775448,
+              "held_out_episode": 7,
+              "raw_relative_residual": 0.9800752535583017
+            },
+            {
+              "centered_relative_residual": 0.9975585127846822,
+              "held_out_episode": 14,
+              "raw_relative_residual": 0.9836106910482696
+            }
+          ],
+          "requested_rank": 4,
+          "six_episode_mean_centered": 0.9944424829772006,
+          "six_episode_mean_raw": 0.9821028306495662
+        },
+        {
+          "episode_points": [
+            {
+              "centered_relative_residual": 0.9818976588287888,
+              "held_out_episode": 1,
+              "raw_relative_residual": 0.9670232756383532
+            },
+            {
+              "centered_relative_residual": 0.9820692322507214,
+              "held_out_episode": 2,
+              "raw_relative_residual": 0.9702056634424057
+            },
+            {
+              "centered_relative_residual": 0.9845631582572503,
+              "held_out_episode": 3,
+              "raw_relative_residual": 0.9642433545194218
+            },
+            {
+              "centered_relative_residual": 0.9694836942682389,
+              "held_out_episode": 6,
+              "raw_relative_residual": 0.9668975783439733
+            },
+            {
+              "centered_relative_residual": 0.9825146582664356,
+              "held_out_episode": 7,
+              "raw_relative_residual": 0.9698923243512131
+            },
+            {
+              "centered_relative_residual": 0.9903396646768055,
+              "held_out_episode": 14,
+              "raw_relative_residual": 0.9767883632517612
+            }
+          ],
+          "requested_rank": 8,
+          "six_episode_mean_centered": 0.9818113444247066,
+          "six_episode_mean_raw": 0.9691750932578547
+        },
+        {
+          "episode_points": [
+            {
+              "centered_relative_residual": 0.9816542752430262,
+              "held_out_episode": 1,
+              "raw_relative_residual": 0.9666880518589324
+            },
+            {
+              "centered_relative_residual": 0.9790459469145132,
+              "held_out_episode": 2,
+              "raw_relative_residual": 0.9660935474912522
+            },
+            {
+              "centered_relative_residual": 0.9837723598550538,
+              "held_out_episode": 3,
+              "raw_relative_residual": 0.9622057529812527
+            },
+            {
+              "centered_relative_residual": 0.9693165773578616,
+              "held_out_episode": 6,
+              "raw_relative_residual": 0.9619456426950933
+            },
+            {
+              "centered_relative_residual": 0.9815694907459274,
+              "held_out_episode": 7,
+              "raw_relative_residual": 0.9689618587648119
+            },
+            {
+              "centered_relative_residual": 0.989766155039707,
+              "held_out_episode": 14,
+              "raw_relative_residual": 0.9749811363429512
+            }
+          ],
+          "requested_rank": 10,
+          "six_episode_mean_centered": 0.9808541341926814,
+          "six_episode_mean_raw": 0.9668126650223824
+        }
+      ],
+      "rgb": [
+        {
+          "episode_points": [
+            {
+              "centered_relative_residual": 0.9945520940962804,
+              "held_out_episode": 1,
+              "raw_relative_residual": 0.9941673225848158
+            },
+            {
+              "centered_relative_residual": 0.9783535761177689,
+              "held_out_episode": 2,
+              "raw_relative_residual": 0.9816813825001882
+            },
+            {
+              "centered_relative_residual": 0.9979936901635937,
+              "held_out_episode": 3,
+              "raw_relative_residual": 0.9993252518652974
+            },
+            {
+              "centered_relative_residual": 0.9949290311175935,
+              "held_out_episode": 6,
+              "raw_relative_residual": 0.9835167323753067
+            },
+            {
+              "centered_relative_residual": 0.9749744432593702,
+              "held_out_episode": 7,
+              "raw_relative_residual": 0.9788453612908031
+            },
+            {
+              "centered_relative_residual": 0.9977555482349765,
+              "held_out_episode": 14,
+              "raw_relative_residual": 0.9967235597264685
+            }
+          ],
+          "requested_rank": 1,
+          "six_episode_mean_centered": 0.9897597304982639,
+          "six_episode_mean_raw": 0.9890432683904798
+        },
+        {
+          "episode_points": [
+            {
+              "centered_relative_residual": 0.992723632546977,
+              "held_out_episode": 1,
+              "raw_relative_residual": 0.9941411751511824
+            },
+            {
+              "centered_relative_residual": 0.9557540909137822,
+              "held_out_episode": 2,
+              "raw_relative_residual": 0.9812603022298019
+            },
+            {
+              "centered_relative_residual": 0.995947950424128,
+              "held_out_episode": 3,
+              "raw_relative_residual": 0.9946369038327347
+            },
+            {
+              "centered_relative_residual": 0.9898972298994111,
+              "held_out_episode": 6,
+              "raw_relative_residual": 0.9829510230242968
+            },
+            {
+              "centered_relative_residual": 0.9501582892523464,
+              "held_out_episode": 7,
+              "raw_relative_residual": 0.9784196124266145
+            },
+            {
+              "centered_relative_residual": 0.9929053046242109,
+              "held_out_episode": 14,
+              "raw_relative_residual": 0.9960695710743116
+            }
+          ],
+          "requested_rank": 2,
+          "six_episode_mean_centered": 0.9795644162768092,
+          "six_episode_mean_raw": 0.9879130979564903
+        },
+        {
+          "episode_points": [
+            {
+              "centered_relative_residual": 0.9826588342233451,
+              "held_out_episode": 1,
+              "raw_relative_residual": 0.9898765205711533
+            },
+            {
+              "centered_relative_residual": 0.9409611228442303,
+              "held_out_episode": 2,
+              "raw_relative_residual": 0.9493743045737536
+            },
+            {
+              "centered_relative_residual": 0.9945479688400987,
+              "held_out_episode": 3,
+              "raw_relative_residual": 0.9928839014060291
+            },
+            {
+              "centered_relative_residual": 0.9151312153680282,
+              "held_out_episode": 6,
+              "raw_relative_residual": 0.9775271308260596
+            },
+            {
+              "centered_relative_residual": 0.9475465027139593,
+              "held_out_episode": 7,
+              "raw_relative_residual": 0.9484845902155268
+            },
+            {
+              "centered_relative_residual": 0.9848582060849571,
+              "held_out_episode": 14,
+              "raw_relative_residual": 0.9907416057171267
+            }
+          ],
+          "requested_rank": 4,
+          "six_episode_mean_centered": 0.9609506416791032,
+          "six_episode_mean_raw": 0.9748146755516082
+        },
+        {
+          "episode_points": [
+            {
+              "centered_relative_residual": 0.97086758106338,
+              "held_out_episode": 1,
+              "raw_relative_residual": 0.9808302518103575
+            },
+            {
+              "centered_relative_residual": 0.9298142769311614,
+              "held_out_episode": 2,
+              "raw_relative_residual": 0.9395907896828715
+            },
+            {
+              "centered_relative_residual": 0.9831005854828576,
+              "held_out_episode": 3,
+              "raw_relative_residual": 0.9762109116153115
+            },
+            {
+              "centered_relative_residual": 0.9028577000589761,
+              "held_out_episode": 6,
+              "raw_relative_residual": 0.9566521982165128
+            },
+            {
+              "centered_relative_residual": 0.9297556409331944,
+              "held_out_episode": 7,
+              "raw_relative_residual": 0.9364267663324222
+            },
+            {
+              "centered_relative_residual": 0.9815775168207945,
+              "held_out_episode": 14,
+              "raw_relative_residual": 0.9876738732251069
+            }
+          ],
+          "requested_rank": 8,
+          "six_episode_mean_centered": 0.9496622168817274,
+          "six_episode_mean_raw": 0.9628974651470971
+        },
+        {
+          "episode_points": [
+            {
+              "centered_relative_residual": 0.9703490217794678,
+              "held_out_episode": 1,
+              "raw_relative_residual": 0.9799745934666801
+            },
+            {
+              "centered_relative_residual": 0.9201243110814125,
+              "held_out_episode": 2,
+              "raw_relative_residual": 0.930138580434948
+            },
+            {
+              "centered_relative_residual": 0.9729516159299144,
+              "held_out_episode": 3,
+              "raw_relative_residual": 0.9679027875680373
+            },
+            {
+              "centered_relative_residual": 0.9024493934553437,
+              "held_out_episode": 6,
+              "raw_relative_residual": 0.9548204061244838
+            },
+            {
+              "centered_relative_residual": 0.9278208176504572,
+              "held_out_episode": 7,
+              "raw_relative_residual": 0.9295606530273648
+            },
+            {
+              "centered_relative_residual": 0.9809602705363133,
+              "held_out_episode": 14,
+              "raw_relative_residual": 0.9861166561572343
+            }
+          ],
+          "requested_rank": 10,
+          "six_episode_mean_centered": 0.9457759050721514,
+          "six_episode_mean_raw": 0.9580856127964581
+        }
+      ]
+    },
+    "ETF2": {
+      "latent": [
+        {
+          "episode_points": [
+            {
+              "centered_relative_residual": 0.9995580418664622,
+              "held_out_episode": 1,
+              "raw_relative_residual": 0.9936303083306137
+            },
+            {
+              "centered_relative_residual": 0.9999847540473904,
+              "held_out_episode": 2,
+              "raw_relative_residual": 0.9968844937787573
+            },
+            {
+              "centered_relative_residual": 0.9991058391482219,
+              "held_out_episode": 3,
+              "raw_relative_residual": 0.9921437825415761
+            },
+            {
+              "centered_relative_residual": 0.9999654252029543,
+              "held_out_episode": 6,
+              "raw_relative_residual": 0.9919978811083143
+            },
+            {
+              "centered_relative_residual": 0.9999663836376769,
+              "held_out_episode": 7,
+              "raw_relative_residual": 0.9955850814256857
+            },
+            {
+              "centered_relative_residual": 0.999544900540848,
+              "held_out_episode": 14,
+              "raw_relative_residual": 0.9931068509603118
+            }
+          ],
+          "requested_rank": 1,
+          "six_episode_mean_centered": 0.9996875574072589,
+          "six_episode_mean_raw": 0.9938913996908765
+        },
+        {
+          "episode_points": [
+            {
+              "centered_relative_residual": 0.999258460191983,
+              "held_out_episode": 1,
+              "raw_relative_residual": 0.9933914517110063
+            },
+            {
+              "centered_relative_residual": 0.9990373124486948,
+              "held_out_episode": 2,
+              "raw_relative_residual": 0.9968646873296361
+            },
+            {
+              "centered_relative_residual": 0.9928158254598947,
+              "held_out_episode": 3,
+              "raw_relative_residual": 0.9892881485391773
+            },
+            {
+              "centered_relative_residual": 0.9956023202017958,
+              "held_out_episode": 6,
+              "raw_relative_residual": 0.9919151103305012
+            },
+            {
+              "centered_relative_residual": 0.994339810044617,
+              "held_out_episode": 7,
+              "raw_relative_residual": 0.9953972901593984
+            },
+            {
+              "centered_relative_residual": 0.9989279957446312,
+              "held_out_episode": 14,
+              "raw_relative_residual": 0.9926463857906376
+            }
+          ],
+          "requested_rank": 2,
+          "six_episode_mean_centered": 0.996663620681936,
+          "six_episode_mean_raw": 0.9932505123100595
+        },
+        {
+          "episode_points": [
+            {
+              "centered_relative_residual": 0.9950554536976262,
+              "held_out_episode": 1,
+              "raw_relative_residual": 0.9916196038543801
+            },
+            {
+              "centered_relative_residual": 0.9964819903743374,
+              "held_out_episode": 2,
+              "raw_relative_residual": 0.9947323251899899
+            },
+            {
+              "centered_relative_residual": 0.9922891463838235,
+              "held_out_episode": 3,
+              "raw_relative_residual": 0.9827582553050214
+            },
+            {
+              "centered_relative_residual": 0.9930357205514277,
+              "held_out_episode": 6,
+              "raw_relative_residual": 0.9839399761320858
+            },
+            {
+              "centered_relative_residual": 0.987822623214786,
+              "held_out_episode": 7,
+              "raw_relative_residual": 0.9854504549439496
+            },
+            {
+              "centered_relative_residual": 0.9979172089110822,
+              "held_out_episode": 14,
+              "raw_relative_residual": 0.9919762065176476
+            }
+          ],
+          "requested_rank": 4,
+          "six_episode_mean_centered": 0.9937670238555137,
+          "six_episode_mean_raw": 0.988412803657179
+        },
+        {
+          "episode_points": [
+            {
+              "centered_relative_residual": 0.9859923908434182,
+              "held_out_episode": 1,
+              "raw_relative_residual": 0.9808541137050277
+            },
+            {
+              "centered_relative_residual": 0.9747162493871149,
+              "held_out_episode": 2,
+              "raw_relative_residual": 0.9775564351570468
+            },
+            {
+              "centered_relative_residual": 0.9751336793445344,
+              "held_out_episode": 3,
+              "raw_relative_residual": 0.9651125624227219
+            },
+            {
+              "centered_relative_residual": 0.9733010562815518,
+              "held_out_episode": 6,
+              "raw_relative_residual": 0.9617965063501648
+            },
+            {
+              "centered_relative_residual": 0.9660866284721333,
+              "held_out_episode": 7,
+              "raw_relative_residual": 0.9626522513508957
+            },
+            {
+              "centered_relative_residual": 0.9859853077302319,
+              "held_out_episode": 14,
+              "raw_relative_residual": 0.9803271069101605
+            }
+          ],
+          "requested_rank": 8,
+          "six_episode_mean_centered": 0.9768692186764975,
+          "six_episode_mean_raw": 0.9713831626493362
+        },
+        {
+          "episode_points": [
+            {
+              "centered_relative_residual": 0.9859714065408631,
+              "held_out_episode": 1,
+              "raw_relative_residual": 0.9805196203707491
+            },
+            {
+              "centered_relative_residual": 0.9739573552504642,
+              "held_out_episode": 2,
+              "raw_relative_residual": 0.975926713648879
+            },
+            {
+              "centered_relative_residual": 0.97409127186323,
+              "held_out_episode": 3,
+              "raw_relative_residual": 0.9635612589603244
+            },
+            {
+              "centered_relative_residual": 0.9731498355403887,
+              "held_out_episode": 6,
+              "raw_relative_residual": 0.9613907141731807
+            },
+            {
+              "centered_relative_residual": 0.965171704360011,
+              "held_out_episode": 7,
+              "raw_relative_residual": 0.9584472332556395
+            },
+            {
+              "centered_relative_residual": 0.9859847165404382,
+              "held_out_episode": 14,
+              "raw_relative_residual": 0.9790873642455988
+            }
+          ],
+          "requested_rank": 10,
+          "six_episode_mean_centered": 0.9763877150158992,
+          "six_episode_mean_raw": 0.9698221507757285
+        }
+      ],
+      "rgb": [
+        {
+          "episode_points": [
+            {
+              "centered_relative_residual": 0.998706203690539,
+              "held_out_episode": 1,
+              "raw_relative_residual": 0.9999148614914464
+            },
+            {
+              "centered_relative_residual": 0.9991602117817698,
+              "held_out_episode": 2,
+              "raw_relative_residual": 0.9997616423691847
+            },
+            {
+              "centered_relative_residual": 0.9599269935398252,
+              "held_out_episode": 3,
+              "raw_relative_residual": 0.9610818351817231
+            },
+            {
+              "centered_relative_residual": 0.9839521224466619,
+              "held_out_episode": 6,
+              "raw_relative_residual": 0.9936884929794412
+            },
+            {
+              "centered_relative_residual": 0.9638794772815198,
+              "held_out_episode": 7,
+              "raw_relative_residual": 0.9806870503833998
+            },
+            {
+              "centered_relative_residual": 0.998104739360746,
+              "held_out_episode": 14,
+              "raw_relative_residual": 0.997820950835906
+            }
+          ],
+          "requested_rank": 1,
+          "six_episode_mean_centered": 0.9839549580168435,
+          "six_episode_mean_raw": 0.9888258055401836
+        },
+        {
+          "episode_points": [
+            {
+              "centered_relative_residual": 0.9846568526825676,
+              "held_out_episode": 1,
+              "raw_relative_residual": 0.9954864085753587
+            },
+            {
+              "centered_relative_residual": 0.9842982428605117,
+              "held_out_episode": 2,
+              "raw_relative_residual": 0.9773556308856446
+            },
+            {
+              "centered_relative_residual": 0.9448691830541237,
+              "held_out_episode": 3,
+              "raw_relative_residual": 0.9604201647640713
+            },
+            {
+              "centered_relative_residual": 0.9741069512351226,
+              "held_out_episode": 6,
+              "raw_relative_residual": 0.9936373833833436
+            },
+            {
+              "centered_relative_residual": 0.953315972899101,
+              "held_out_episode": 7,
+              "raw_relative_residual": 0.9803428696178293
+            },
+            {
+              "centered_relative_residual": 0.9970505587924539,
+              "held_out_episode": 14,
+              "raw_relative_residual": 0.9960197644422982
+            }
+          ],
+          "requested_rank": 2,
+          "six_episode_mean_centered": 0.9730496269206467,
+          "six_episode_mean_raw": 0.9838770369447576
+        },
+        {
+          "episode_points": [
+            {
+              "centered_relative_residual": 0.9580604832031895,
+              "held_out_episode": 1,
+              "raw_relative_residual": 0.9949574189979495
+            },
+            {
+              "centered_relative_residual": 0.9764087097883838,
+              "held_out_episode": 2,
+              "raw_relative_residual": 0.9764025512410572
+            },
+            {
+              "centered_relative_residual": 0.9403540644613919,
+              "held_out_episode": 3,
+              "raw_relative_residual": 0.9561467994391115
+            },
+            {
+              "centered_relative_residual": 0.9603759012449169,
+              "held_out_episode": 6,
+              "raw_relative_residual": 0.9834139594454957
+            },
+            {
+              "centered_relative_residual": 0.9403991827600604,
+              "held_out_episode": 7,
+              "raw_relative_residual": 0.9743523368958437
+            },
+            {
+              "centered_relative_residual": 0.9883655406387475,
+              "held_out_episode": 14,
+              "raw_relative_residual": 0.9911819842522609
+            }
+          ],
+          "requested_rank": 4,
+          "six_episode_mean_centered": 0.9606606470161151,
+          "six_episode_mean_raw": 0.9794091750452864
+        },
+        {
+          "episode_points": [
+            {
+              "centered_relative_residual": 0.951057041627585,
+              "held_out_episode": 1,
+              "raw_relative_residual": 0.992451962009348
+            },
+            {
+              "centered_relative_residual": 0.8951578219405124,
+              "held_out_episode": 2,
+              "raw_relative_residual": 0.9103783450111145
+            },
+            {
+              "centered_relative_residual": 0.9246223085762939,
+              "held_out_episode": 3,
+              "raw_relative_residual": 0.9463626271788305
+            },
+            {
+              "centered_relative_residual": 0.9418927859391825,
+              "held_out_episode": 6,
+              "raw_relative_residual": 0.9588562471391074
+            },
+            {
+              "centered_relative_residual": 0.9206612258262376,
+              "held_out_episode": 7,
+              "raw_relative_residual": 0.9534851592687803
+            },
+            {
+              "centered_relative_residual": 0.977270394702819,
+              "held_out_episode": 14,
+              "raw_relative_residual": 0.9824371560769991
+            }
+          ],
+          "requested_rank": 8,
+          "six_episode_mean_centered": 0.935110263102105,
+          "six_episode_mean_raw": 0.9573285827806967
+        },
+        {
+          "episode_points": [
+            {
+              "centered_relative_residual": 0.9503731053756876,
+              "held_out_episode": 1,
+              "raw_relative_residual": 0.990387589805868
+            },
+            {
+              "centered_relative_residual": 0.8937297760182473,
+              "held_out_episode": 2,
+              "raw_relative_residual": 0.8953815993072036
+            },
+            {
+              "centered_relative_residual": 0.9225308255878703,
+              "held_out_episode": 3,
+              "raw_relative_residual": 0.9444598950699076
+            },
+            {
+              "centered_relative_residual": 0.9418736778325256,
+              "held_out_episode": 6,
+              "raw_relative_residual": 0.9553830268446422
+            },
+            {
+              "centered_relative_residual": 0.9206584424456996,
+              "held_out_episode": 7,
+              "raw_relative_residual": 0.9520249344680859
+            },
+            {
+              "centered_relative_residual": 0.9681435980814769,
+              "held_out_episode": 14,
+              "raw_relative_residual": 0.9760925296725778
+            }
+          ],
+          "requested_rank": 10,
+          "six_episode_mean_centered": 0.9328849042235845,
+          "six_episode_mean_raw": 0.9522882625280475
+        }
+      ]
+    }
+  },
+  "schema": "umi-task11-error-figure-source-v1",
+  "scope": {
+    "adaptive_k95": "fold-specific uncentered and centered training-only ranks are recorded separately, not mixed into fixed-rank curves",
+    "columns": "12 actual error columns from 6 episodes \u00d7 2 held-out seeds",
+    "loeo_centered_denominator": "norm of the held-out error vector minus training-only mean",
+    "loeo_episode_points": "each point is the mean of two held-out seed columns for one episode; six episodes are shown, with a descriptive six-episode mean and no population interval",
+    "loeo_raw_denominator": "norm of the held-out uncentered error vector",
+    "spaces": {
+      "latent": "masked condition-latent carrier",
+      "rgb": "decoded RGB endpoint"
+    }
+  },
+  "source_analysis_sha256": "7a2773b31a165fef3eb358160f60e04b9f43aa82d6673429508186083d0ebe27",
+  "source_manifest_sha256": "e083aad1f0d6822424e10f50920faaacaf98f5a14acd0b7fd34a671264adba45",
+  "spectral": {
+    "E1": {
+      "latent": {
+        "cumulative_squared_energy": [
+          0.2344941624073873,
+          0.3986711105526326,
+          0.5176414312468027,
+          0.6110403441167868,
+          0.6990593610099046,
+          0.7757702453355659,
+          0.8508926144375246,
+          0.9029174009259722,
+          0.9393024321231103,
+          0.9653400155443234,
+          0.9841798625593378,
+          0.9999999999999999
+        ],
+        "truncation_relative_frobenius_residual_by_rank": [
+          1.0,
+          0.8749319045460696,
+          0.7754539892523394,
+          0.6945203875720259,
+          0.6236663017056583,
+          0.5485805674557706,
+          0.4735290431055248,
+          0.38614425486141224,
+          0.31158080665218735,
+          0.24636876400406285,
+          0.18617192177038017,
+          0.1257781278309633,
+          0.0
+        ]
+      },
+      "rgb": {
+        "cumulative_squared_energy": [
+          0.28390885217182366,
+          0.4213255307353547,
+          0.5399170225393473,
+          0.6317765689557765,
+          0.71530821120626,
+          0.7919170500428222,
+          0.8480094799018922,
+          0.8964833799248418,
+          0.9386147078566175,
+          0.9664236177234966,
+          0.9855515831839589,
+          1.0
+        ],
+        "truncation_relative_frobenius_residual_by_rank": [
+          1.0,
+          0.846221689528327,
+          0.7607065592359812,
+          0.6782941673497221,
+          0.6068141651644461,
+          0.5335651682725739,
+          0.45616110088123246,
+          0.3898596158851386,
+          0.3217399883060205,
+          0.24776055405044317,
+          0.1832385938510319,
+          0.12020156744419416,
+          0.0
+        ]
+      }
+    },
+    "EAR2": {
+      "latent": {
+        "cumulative_squared_energy": [
+          0.20117983668345052,
+          0.3445302489245483,
+          0.4742060484471198,
+          0.6004644166827476,
+          0.7034704545017745,
+          0.786120702720657,
+          0.8560954611884076,
+          0.9009774137544602,
+          0.9352019163565741,
+          0.9627559779493903,
+          0.9832660556595367,
+          0.9999999999999998
+        ],
+        "truncation_relative_frobenius_residual_by_rank": [
+          1.0,
+          0.8937673988888549,
+          0.8096108639806234,
+          0.7251165089507203,
+          0.6320882717763812,
+          0.5445452648754053,
+          0.4624708610056884,
+          0.3793475172076288,
+          0.31467854430440545,
+          0.2545546771195252,
+          0.19298710332716412,
+          0.12935974775973785,
+          0.0
+        ]
+      },
+      "rgb": {
+        "cumulative_squared_energy": [
+          0.23288943776221954,
+          0.39404209820137776,
+          0.5486317661231511,
+          0.6748963897197985,
+          0.7678579758930327,
+          0.8290108701379008,
+          0.8753837977327388,
+          0.9106757387069926,
+          0.9431312171783555,
+          0.9726937436503656,
+          0.9884622103306663,
+          0.9999999999999999
+        ],
+        "truncation_relative_frobenius_residual_by_rank": [
+          1.0,
+          0.8758484813241275,
+          0.7784329783601297,
+          0.6718394405487437,
+          0.5701785775353204,
+          0.4818111913467424,
+          0.4135083189756878,
+          0.35301020136429656,
+          0.29887164685364076,
+          0.23847176525040542,
+          0.16524604790927452,
+          0.10741410367979458,
+          0.0
+        ]
+      }
+    },
+    "ETF2": {
+      "latent": {
+        "cumulative_squared_energy": [
+          0.19304827816921988,
+          0.3471263909456243,
+          0.49652203295454195,
+          0.6244585733329949,
+          0.7308931209594499,
+          0.8217000193175515,
+          0.8831956350781744,
+          0.9186182036651642,
+          0.94220579217358,
+          0.9644899988314468,
+          0.9827784743085014,
+          0.9999999999999999
+        ],
+        "truncation_relative_frobenius_residual_by_rank": [
+          1.0,
+          0.8983049158447146,
+          0.8080059461751353,
+          0.7095618134070195,
+          0.6128143492665662,
+          0.5187551243511238,
+          0.42225582374012127,
+          0.34176653569626364,
+          0.2852749486632775,
+          0.24040425916863423,
+          0.1884409752908138,
+          0.13123081075531948,
+          0.0
+        ]
+      },
+      "rgb": {
+        "cumulative_squared_energy": [
+          0.26101216010000494,
+          0.46120505605475204,
+          0.596485006784533,
+          0.7041302326883496,
+          0.8043121913505524,
+          0.8556116633527744,
+          0.8965681263768961,
+          0.9324502189799221,
+          0.9549697679719371,
+          0.9730154353425685,
+          0.9872242365202146,
+          1.0
+        ],
+        "truncation_relative_frobenius_residual_by_rank": [
+          1.0,
+          0.8596440192893772,
+          0.7340265280936704,
+          0.6352283000744432,
+          0.5439391209608391,
+          0.44236614772092075,
+          0.3799846531732901,
+          0.32160826112384594,
+          0.25990340709594,
+          0.21220327996537405,
+          0.1642697922852267,
+          0.1130299229398369,
+          0.0
+        ]
+      }
+    }
+  }
+}

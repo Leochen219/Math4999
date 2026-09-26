@@ -1,0 +1,75 @@
+% Verified Task 11 results fragment, 25 September 2026.
+% Intended for integration into the mathematical revision of main.tex.
+% Not a standalone document and not yet included in the eight-page draft.
+% Requires amsmath, booktabs and graphicx (already present in main.tex).
+\subsection{Five-chunk error under observed-motion conditions}
+We extend the horizon to five consecutive chunks on the preregistered Bridge
+record 15, using the first 81 real observations and 80 aligned transitions.
+Two noise schedules, $(0,1,2,3,4)$ and $(5,6,7,8,9)$, are paired between
+teacher-forced (TF) and autoregressive (AR) predictions at each horizon.
+TF uses the current real frame; AR uses its own preceding floating-point
+endpoint through the verified encoding interface. The initial chunk is shared.
+All 20 formal calls and the two exact-repeat gates passed. These are two
+noise schedules on one episode, not independent scene replicates.
+
+\begin{center}
+\small
+\begin{tabular}{rrrrrr}
+\toprule
+$h$ & TF RGB RMSE & AR RGB RMSE & $\Delta_h$ & TF latent RMS & AR latent RMS\\
+\midrule
+1 & 0.150713 & 0.150713 & 0         & 0.345743 & 0.345743\\
+2 & 0.141335 & 0.145739 & +0.004404 & 0.395109 & 0.426857\\
+3 & 0.171226 & 0.199290 & +0.028064 & 0.384676 & 0.451707\\
+4 & 0.244579 & 0.202720 & -0.041859 & 0.490345 & 0.517850\\
+5 & 0.168763 & 0.182999 & +0.014237 & 0.415005 & 0.491864\\
+\bottomrule
+\end{tabular}
+\end{center}
+Values are descriptive means of the two schedules; $\Delta_h$ is the paired
+AR-minus-TF RGB RMSE difference. Both schedules have positive differences at
+$h=2,3,5$ and negative differences at $h=4$. All eight condition-latent RMS
+differences are positive. Thus the choice of output space changes the comparison.
+The AR RGB error is nonmonotone, including a decrease from chunk 4 to 5.
+This does not contradict a Lipschitz upper bound: such a bound is not an
+observed growth law.
+
+For aligned vectors $b=f_{\rm TF}-x^\star$ and
+$p=f_{\rm AR}-f_{\rm TF}$ in either separately defined output space,
+\begin{equation}
+ \operatorname{MSE}_{\rm AR}-\operatorname{MSE}_{\rm TF}
+ =\frac{2\langle b,p\rangle}{n}+\frac{\|p\|_2^2}{n}.
+ \label{eq:task11-geometry}
+\end{equation}
+This follows by expanding $\|b+p\|_2^2$ and requires no differentiability.
+At chunk 4 in RGB space, the negative cross term outweighs the nonnegative
+feedback-change term. When the combined RMSE is nonzero, division of
+\eqref{eq:task11-geometry} by
+$\operatorname{RMSE}_{\rm AR}+\operatorname{RMSE}_{\rm TF}$ gives
+the RMSE difference. This explains how nonzero feedback displacement can
+reduce target-relative error, without identifying separate model and numerical
+causes. The action conditions include future observed poses; this is not
+control-only open-loop prediction. One episode and five chunks cannot establish
+population or long-term stability.
+
+\subsection{Actual prediction-error spectra and episode holdout}
+Using the six previously fixed episodes and two noise schedules per episode,
+we form separate 12-column matrices for $E_1$, $E_{{\rm TF},2}$ and
+$E_{{\rm AR},2}$. Columns are predictions minus aligned truth, not perturbation
+responses. In condition-latent space, all three uncentered matrices require
+$k_{95}=10$ of 12 modes. Their squared-energy entropy effective ranks are
+$9.2678$, $9.1630$ and $9.5396$.
+
+For each leave-one-episode-out fold, both seeds of the omitted episode are
+held out and the other ten columns determine the basis. Even retaining the
+entire training span, mean relative held-out residual norms are respectively
+$0.96569$, $0.96982$ and $0.96681$, averaging seeds within each episode first.
+These are residual norms, not residual energy fractions. The results do not
+support a very small transferable linear error subspace for this finite sample.
+Rank at most 12 is imposed by construction, not evidence of intrinsic low rank.
+Neither the full Jacobian nor nonlinear or spatially aligned representations
+are characterized by this experiment.
+
+Independent raw-tensor audits passed 1,182 comparisons for the error-matrix
+analysis and 1,074 for the five-chunk analysis. Full definitions, source hashes,
+centered sensitivity checks and figure data are retained in the review archive.

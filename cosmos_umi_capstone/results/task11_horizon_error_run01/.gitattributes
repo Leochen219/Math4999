@@ -1,0 +1,3 @@
+# Preserve audited artifact bytes and their SHA256 hashes on every platform.
+* -text
+**/* -text
