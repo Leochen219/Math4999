@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0c1116">
+  <meta name="description" content="An interactive lab for observed rollout error geometry, conditional bounds, and a separate synthetic scalar controller.">
+  <title>Bounded Rollout Lab</title>
+  <link rel="stylesheet" href="styles.css">
+  <script type="module" src="app.mjs"></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="wordmark" href="#top" aria-label="Bounded Rollout Lab home"><span class="wordmark-mark">B</span> BOUNDED ROLLOUT LAB</a>
+    <nav aria-label="Main navigation">
+      <a href="#observed">01&nbsp; Observed geometry</a>
+      <a href="#conditional">02&nbsp; Conditional bound</a>
+      <a href="#synthetic">03&nbsp; Scalar control</a>
+    </nav>
+    <span class="topbar-tag">MATH 4999 · INTERACTIVE NOTE</span>
+  </header>
+
+  <main id="top">
+    <section class="hero">
+      <div class="hero-copy">
+        <p class="eyebrow"><span class="live-dot"></span> A bounded, inspectable experiment</p>
+        <h1>What do rollout<br><em>errors let us say?</em></h1>
+        <p class="hero-lede">Explore the geometry of one observed autoregressive rollout, test a conditional lower bound against its premise, then compare it with a separate scalar control example.</p>
+        <div class="hero-actions"><a class="button button-primary" href="#observed">Open the lab <span aria-hidden="true">↓</span></a><a class="text-link" href="#scope">Read the scope notes <span aria-hidden="true">↗</span></a></div>
+      </div>
+      <div class="hero-art" aria-hidden="true">
+        <svg viewBox="0 0 470 330" role="presentation">
+          <defs><linearGradient id="glow" x1="0" x2="1"><stop stop-color="#7ee0c0" stop-opacity=".28"/><stop offset="1" stop-color="#7ee0c0" stop-opacity="0"/></linearGradient><marker id="heroArrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="none" stroke="#d7e5e2" stroke-width="1.4"/></marker></defs>
+          <circle cx="250" cy="163" r="124" fill="none" stroke="#28343a" stroke-dasharray="2 8"/><circle cx="250" cy="163" r="91" fill="none" stroke="#243138"/><circle cx="250" cy="163" r="58" fill="none" stroke="#253238"/>
+          <path d="M45 233C104 233 127 216 164 182S220 125 267 112 340 93 417 79" fill="none" stroke="url(#glow)" stroke-width="26"/>
+          <path d="M45 233C104 233 127 216 164 182S220 125 267 112 340 93 417 79" fill="none" stroke="#7ee0c0" stroke-width="2.4" marker-end="url(#heroArrow)"/>
+          <path d="M45 233H217" fill="none" stroke="#e6b875" stroke-width="2"/><path d="M217 233L267 112" fill="none" stroke="#84b8e8" stroke-width="2"/><path d="M45 233L267 112" fill="none" stroke="#d7e5e2" stroke-width="1.2" stroke-dasharray="4 6"/>
+          <circle cx="45" cy="233" r="5" fill="#0c1116" stroke="#e8f4ef" stroke-width="2"/><circle cx="267" cy="112" r="4" fill="#7ee0c0"/><text x="112" y="256">TF</text><text x="235" y="178">feedback</text><text x="136" y="170">AR</text><text x="348" y="61">observed horizon</text>
+          <circle cx="355" cy="214" r="2" fill="#7ee0c0"/><circle cx="373" cy="202" r="2" fill="#7ee0c0"/><circle cx="397" cy="216" r="2" fill="#7ee0c0"/><circle cx="422" cy="194" r="2" fill="#7ee0c0"/>
+        </svg>
+        <div class="art-caption"><span>ERROR GEOMETRY</span><span>FINITE HORIZON · h2–h5</span></div>
+      </div>
+    </section>
+
+    <section class="scope-strip" id="scope" aria-label="Persistent study scope">
+      <div class="scope-heading"><span class="section-index">SCOPE / 01</span><h2>One observed case.<br>Careful claims.</h2></div>
+      <div><span class="scope-label">EVIDENCE</span><p>One Bridge episode (record 15), two seed schedules, h2–h5. Future observed poses enter the motion conditions.</p></div>
+      <div><span class="scope-label">WHAT IT SHOWS</span><p>Observed scalar geometry and an MSE identity for these cases. RGB and condition-masked latent remain separate metrics.</p></div>
+      <div><span class="scope-label">WHAT IT DOESN’T</span><p>No global Lipschitz or stability certification. Shared teacher forcing and identity closure do not validate pairing or the correction mechanism.</p></div>
+    </section>
+
+    <section class="module" id="observed">
+      <div class="module-heading">
+        <div><p class="eyebrow">01 / OBSERVED TASK 11 SCALARS</p><h2>Build the error triangle</h2></div>
+        <p class="module-intro">In normalized RMS geometry, the autoregressive error vector is the teacher-forced error plus the feedback change. Switch among the observed endpoints to inspect their actual magnitudes and cross term.</p>
+      </div>
+      <div class="observed-layout">
+        <div class="panel controls-panel">
+          <div class="panel-topline"><span class="panel-kicker">CASE SELECTOR</span><span id="case-count" class="micro-label">16 PUBLIC SCALARS</span></div>
+          <label class="field-label" for="metric-select">Metric space</label>
+          <select id="metric-select"><option value="rgb">RGB endpoint errors</option><option value="condition_masked_latent">Condition-masked latent</option></select>
+          <div class="field-pair">
+            <div><label class="field-label" for="schedule-select">Seed schedule</label><select id="schedule-select"><option value="0">Schedule 0 · seeds 0–4</option><option value="1">Schedule 1 · seeds 5–9</option></select></div>
+            <div><label class="field-label" for="horizon-select">Endpoint</label><select id="horizon-select"><option value="2">h2 · 2 chunks</option><option value="3">h3 · 3 chunks</option><option value="4">h4 · 4 chunks</option><option value="5">h5 · 5 chunks</option></select></div>
+          </div>
+          <div class="case-chip"><span class="chip-dot"></span><div><strong id="case-name">RGB · schedule 0 · h2</strong><small id="case-seed">Observed seed 1 · one episode</small></div></div>
+          <div class="data-note"><span class="note-icon" aria-hidden="true">i</span><p>Each horizon uses its recorded seed from the selected schedule. These are two schedules on one episode, not independent episodes.</p></div>
+          <a id="source-link" class="source-link" href="https://github.com/Leochen219/Math4999" target="_blank" rel="noreferrer">View public scalar source <span aria-hidden="true">↗</span></a>
+        </div>
+
+        <div class="panel geometry-panel">
+          <div class="panel-topline"><span class="panel-kicker">VECTOR DECOMPOSITION</span><span class="micro-label">NORMALIZED RMS</span></div>
+          <div class="geometry-chart"><svg id="geometry-svg" viewBox="0 0 580 300" role="img" aria-label="Error vectors for the selected observed case"></svg></div>
+          <div class="geometry-legend"><span><i class="legend-mark tf"></i>TF error · B</span><span><i class="legend-mark feedback"></i>Feedback change · P</span><span><i class="legend-mark ar"></i>AR error · A</span></div>
+          <div class="triangle-status" id="triangle-status" role="status"><span class="status-mark"></span><span>Checking triangle interval…</span></div>
+        </div>
+
+        <div class="panel metrics-panel">
+          <div class="panel-topline"><span class="panel-kicker">DECOMPOSITION</span><span id="decomp-id" class="micro-label">h2 / s0</span></div>
+          <div class="metric-row"><div><span class="metric-symbol">A</span><span class="metric-name">AR error</span></div><strong id="metric-a">—</strong></div>
+          <div class="metric-row"><div><span class="metric-symbol symbol-tf">B</span><span class="metric-name">TF error</span></div><strong id="metric-b">—</strong></div>
+          <div class="metric-row"><div><span class="metric-symbol symbol-feedback">P</span><span class="metric-name">Feedback change</span></div><strong id="metric-p">—</strong></div>
+          <div class="formula-box"><span>Observed squared-error identity · normalized by n</span><strong>AR² − TF² <i>=</i> 2 dot + P²</strong><div class="formula-values"><span id="cross-value">2 dot —</span><b>+</b><span id="p2-value">P² —</span></div><div class="square-values"><span>TF² <strong id="tf-squared">—</strong></span><span>AR² <strong id="ar-squared">—</strong></span></div></div>
+          <div class="submetric"><span>Identity residual</span><strong id="identity-value">—</strong></div>
+          <p class="precision-note">Source precision metadata: unknown. Display rounding is for reading only.</p>
+        </div>
+      </div>
+
+      <div class="panel horizon-panel">
+        <div class="horizon-head"><div><div class="panel-topline"><span class="panel-kicker">HORIZON VIEW</span><span class="micro-label">SELECTED METRIC + SCHEDULE</span></div><h3>Three error scales across observed endpoints</h3></div><p>Four endpoint values per line. Connectors are visual guides, not fitted growth laws.</p></div>
+        <svg id="horizon-svg" viewBox="0 0 900 300" role="img" aria-label="Observed TF error, feedback change, and AR error across horizons h2 to h5"></svg>
+        <div class="geometry-legend horizon-legend"><span><i class="legend-mark tf"></i>TF error B</span><span><i class="legend-mark feedback"></i>Feedback change P</span><span><i class="legend-mark ar"></i>AR error A</span></div>
+      </div>
+      <p class="section-footnote">Standard norm bounds describe this algebra: <code>|B − P| ≤ A ≤ B + P</code>. The observed identity holds up to its recorded residual; it does not validate how TF and AR samples were paired.</p>
+    </section>
+
+    <section class="module conditional-module" id="conditional">
+      <div class="module-heading">
+        <div><p class="eyebrow">02 / A PREMISE YOU CAN CHECK</p><h2>Make the lower bound conditional</h2></div>
+        <p class="module-intro">For the observed normalized dot product <code>dot = (b·p)/n</code>, the candidate lower bound holds only when <code>dot ≥ −ρBP</code>. The app checks that premise on the selected aggregate at every ρ.</p>
+      </div>
+      <div class="conditional-layout">
+        <div class="panel rho-panel">
+          <div class="panel-topline"><span class="panel-kicker">CORRELATION FLOOR</span><span class="micro-label">ρ ∈ [0, 1]</span></div>
+          <label class="field-label" for="rho-slider">Choose ρ <strong id="rho-readout">0.50</strong></label>
+          <input id="rho-slider" type="range" min="0" max="1" step="0.01" value="0.5" aria-describedby="rho-explain">
+          <div class="range-ends"><span>0 · no negative-correlation allowance</span><span>1 · full allowance</span></div>
+          <div class="math-card">
+            <div class="math-line"><span>Candidate lower bound</span><strong>√(B² + P² − 2ρBP)</strong></div>
+            <div class="math-condition"><span>Required premise</span><strong>⟨b,p⟩ ≥ −ρBP</strong></div>
+          </div>
+          <div class="observed-dot"><span>Observed aggregate dot product</span><strong id="dot-readout">—</strong></div>
+          <p id="rho-explain" class="precision-note">Here dot = (b·p)/n for normalized RMS vectors, reconstructed as the recorded aggregate cross term (2 dot) ÷ 2. No hidden vectors are included.</p>
+        </div>
+        <div class="panel bound-panel">
+          <div class="panel-topline"><span class="panel-kicker">RETROSPECTIVE CHECK</span><span id="rho-case" class="micro-label">SELECTED CASE</span></div>
+          <div id="premise-status" class="premise-status" role="status" aria-live="polite"><span class="status-mark"></span><div><strong>Checking the observed premise…</strong><small>Condition applies to this aggregate only.</small></div></div>
+          <div class="bound-readout"><span>Lower bound for this case</span><strong id="bound-value">—</strong><small id="bound-subnote">Only shown if the condition holds</small></div>
+          <div class="slack-row"><span>Premise slack <code>dot + ρBP</code></span><strong id="slack-value">—</strong></div>
+          <div class="bound-foot"><span>Required ρ for this observed dot</span><strong id="required-rho">—</strong></div>
+        </div>
+      </div>
+      <div class="boundary-callout"><span class="callout-symbol">!</span><p>This is retrospective bookkeeping on the selected observed scalar case. A satisfied inequality does not establish a system-wide bound, future behavior, or a causal feedback benefit. A failed premise stays visible; the bound is not displayed as applicable.</p></div>
+    </section>
+
+    <section class="module synthetic-module" id="synthetic">
+      <div class="synthetic-banner"><span class="synthetic-stamp">SYNTHETIC · SEPARATE MODEL</span><p>This scalar controller is an illustration with configured parameters. It is not applied to Cosmos rollouts and does not certify a physical system.</p></div>
+      <div class="module-heading">
+        <div><p class="eyebrow">03 / BOUNDED DISTURBANCE CONTROL</p><h2>Watch an error envelope evolve</h2></div>
+        <p class="module-intro">Configure <code>e[t+1] = (a−k)e[t] + w[t]</code> with <code>|w[t]| ≤ ε</code>. The absolute envelope follows <code>E[t+1] = |a−k|E[t] + ε</code>, starting with <code>E₀ ≥ |e₀|</code>.</p>
+      </div>
+      <div class="synthetic-layout">
+        <div class="panel synthetic-controls">
+          <div class="panel-topline"><span class="panel-kicker">DETERMINISTIC CONFIGURATION</span><span class="micro-label">NO RANDOM DRAWS</span></div>
+          <div class="synthetic-fields">
+            <label><span>a · open-loop scalar</span><input id="control-a" type="number" value="1.20" step="0.05" min="-3" max="3"></label>
+            <label><span>k · correction gain</span><input id="control-k" type="number" value="0.50" step="0.05" min="-3" max="3"></label>
+            <label><span>ε · disturbance limit</span><input id="control-epsilon" type="number" value="0.10" step="0.01" min="0" max="2"></label>
+            <label><span>e₀ · signed initial error</span><input id="control-e0" type="number" value="-0.40" step="0.05" min="-5" max="5"></label>
+            <label><span>E₀ · envelope start</span><input id="control-E0" type="number" value="0.40" step="0.05" min="0" max="5"></label>
+            <label><span>Steps</span><input id="control-steps" type="number" value="12" step="1" min="0" max="40"></label>
+            <label class="field-wide"><span>Disturbance sequence</span><select id="control-disturbance"><option value="alternating">Alternating ±ε · starts +ε</option><option value="positive">Always +ε</option><option value="negative">Always −ε</option><option value="zero">Zero disturbance</option></select></label>
+          </div>
+          <p id="envelope-hint" class="control-hint">E₀ is at least |e₀|, so the initial state is inside the displayed envelope.</p>
+        </div>
+        <div class="panel synthetic-results">
+          <div class="panel-topline"><span class="panel-kicker">SIGNED ERROR + ENVELOPE</span><span id="regime-pill" class="regime-pill">STABLE</span></div>
+          <div class="control-summary"><div><span>q = |a − k|</span><strong id="q-value">0.70</strong></div><div><span>Conditional steady bound</span><strong id="steady-value">0.33</strong></div></div>
+          <svg id="control-svg" viewBox="0 0 800 310" role="img" aria-label="Synthetic signed error trajectory with upper and lower envelope"></svg>
+          <div class="geometry-legend"><span><i class="legend-mark trajectory"></i>Signed error e[t]</span><span><i class="legend-mark envelope"></i>Upper +E[t] / lower −E[t]</span></div>
+          <p id="regime-note" class="control-hint">Since q &lt; 1, the recurrence has a conditional steady envelope ε/(1−q).</p>
+        </div>
+      </div>
+      <div class="export-row">
+        <div><span class="panel-kicker">KEEP A REPRODUCIBLE SNAPSHOT</span><p>Exports include the selected observed row, source provenance, ρ check and synthetic configuration with calculated trajectory.</p></div>
+        <div class="export-buttons"><button class="button button-secondary" id="download-config" disabled>Download config JSON</button><button class="button button-primary" id="download-results" disabled>Download results JSON <span aria-hidden="true">↓</span></button></div>
+      </div>
+    </section>
+
+    <section class="final-caveats" aria-labelledby="caveats-title">
+      <div><p class="eyebrow">READ BEFORE GENERALIZING</p><h2 id="caveats-title">The boundaries travel with the numbers.</h2></div>
+      <ul>
+        <li>One episode and two seed schedules are limited cases, not population evidence.</li>
+        <li>Future observed poses are used in the motion conditions; the study does not show control-only open-loop accuracy.</li>
+        <li>The standard norm triangle and the conditional correlation bound are derived statements, not original results.</li>
+        <li>Shared teacher forcing and algebraic identity closure do not validate sample pairing or the proposed correction mechanism.</li>
+        <li>The synthetic scalar controller is separate from the Cosmos data and says nothing about model or physical safety.</li>
+      </ul>
+    </section>
+  </main>
+  <footer class="footer"><span>BOUNDED ROLLOUT LAB</span><a href="#top">Back to top ↑</a><span>MATH 4999 · LOCAL STATIC DEMO</span></footer>
+</body>
+</html>

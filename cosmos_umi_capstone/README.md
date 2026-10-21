@@ -10,6 +10,10 @@ does **not** include the Cosmos framework, model weights, checkpoints,
 datasets, generated videos, raw tensors, server configuration, SSH keys, or
 experiment archives.
 
+The [Bounded Rollout Lab](../bounded-rollout-lab/README.md) is a separate,
+static interactive demo for the reviewed Task 11 scalar error decomposition,
+conditional norm bounds, and a clearly labeled synthetic control example.
+
 ## What is included
 
 - experiments/umi_fd_post_vae_*.py: post-VAE condition-latent bridge,
