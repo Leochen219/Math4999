@@ -1,0 +1,14 @@
+{
+  "attempted": 87,
+  "elapsed_seconds": 0.07635420000042359,
+  "error": null,
+  "errors": 0,
+  "failed": 0,
+  "not_run": 0,
+  "passed": 87,
+  "planned": 87,
+  "status": "PASS",
+  "stopped": false,
+  "technical_failures": 0,
+  "written": 87
+}
