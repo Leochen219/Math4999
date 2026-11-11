@@ -1,0 +1,10 @@
+{
+  "status": "success",
+  "wall_limit_seconds": 600,
+  "memory_limit_bytes": 1610612736,
+  "peak_working_set_bytes": 499134464,
+  "peak_private_commit_bytes": 1293979648,
+  "exit_code": 0,
+  "elapsed_seconds": 108.7647041999735,
+  "output_bytes_before_receipt": 679188
+}

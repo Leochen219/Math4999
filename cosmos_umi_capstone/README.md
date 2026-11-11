@@ -1,5 +1,7 @@
 # Cosmos UMI Capstone Experiments
 
+[Latest capstone results and full report / 最新研究结果与报告](../README.md)
+
 Source-only companion code for Hongyu Chen's MATH 4999 Capstone,
 Numerical Stability and Error Propagation in Autoregressive World-Model
 Rollouts.

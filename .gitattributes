@@ -1,0 +1,4 @@
+# These archived inputs and outputs are checked against their original byte hashes.
+evidence/math4999_next_step_20261105_001/CPU_PROTOCOL_V1.md -text whitespace=-blank-at-eof,blank-at-eol,space-before-tab,cr-at-eol
+math4999_first_crossing/set_cpu_validation/*.py -text whitespace=trailing-space,space-before-tab,cr-at-eol
+math4999_first_crossing/results/cpu-examples/* -text whitespace=trailing-space,space-before-tab,cr-at-eol
